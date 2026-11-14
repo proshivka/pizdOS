@@ -28,22 +28,37 @@ PIZGET_BIN="$PIZGET_SRC/target/x86_64-unknown-linux-musl/release/piz-get"
 if [ ! -f "$PIZGET_BIN" ]; then
     echo "Sobirayu static musl piz-get..."
     cd "$PIZGET_SRC"
+    source "$HOME/.cargo/env" 2>/dev/null || true
     cargo build --release --target x86_64-unknown-linux-musl
 fi
 
-# Копируем piz-get в оверлей
+# 3. Собираем static musl pizsoft-ui если бинарника нет
+PIZUI_SRC="$BASE_DIR/pizsoft-ui"
+PIZUI_BIN="$PIZUI_SRC/target/x86_64-unknown-linux-musl/release/pizsoft"
+
+if [ ! -f "$PIZUI_BIN" ]; then
+    echo "Sobirayu static musl pizsoft-ui..."
+    cd "$PIZUI_SRC"
+    source "$HOME/.cargo/env" 2>/dev/null || true
+    cargo build --release --target x86_64-unknown-linux-musl
+fi
+
+# Копируем бинарники в оверлей
+mkdir -p "$OVERLAY_DIR/usr/bin"
+mkdir -p "$OVERLAY_DIR/bin"
 cp -f "$PIZGET_BIN" "$OVERLAY_DIR/usr/bin/piz-get"
-chmod +x "$OVERLAY_DIR/usr/bin/piz-get"
-chmod +x "$OVERLAY_DIR/bin/"*
-chmod +x "$OVERLAY_DIR/usr/bin/"*
+cp -f "$PIZUI_BIN" "$OVERLAY_DIR/usr/bin/pizsoft"
+chmod +x "$OVERLAY_DIR/usr/bin/piz-get" "$OVERLAY_DIR/usr/bin/pizsoft"
+chmod +x "$OVERLAY_DIR/bin/"* 2>/dev/null || true
+chmod +x "$OVERLAY_DIR/usr/bin/"* 2>/dev/null || true
 chmod +x "$OVERLAY_DIR/etc/local.d/"* 2>/dev/null || true
 
-# 3. Упаковываем apkovl оверлей
+# 4. Упаковываем apkovl оверлей
 echo "Upakovka apkovl..."
 cd "$OVERLAY_DIR"
 tar -czf "$BUILD_DIR/pizdos.apkovl.tar.gz" *
 
-# 4. Распаковываем базовый ISO
+# 5. Распаковываем базовый ISO
 echo "Podgotovka ISO struktury..."
 rm -rf "$ISO_WORK"
 mkdir -p "$ISO_WORK"
@@ -53,7 +68,7 @@ mkdir -p "$ISO_WORK"
 cp -f "$BUILD_DIR/pizdos.apkovl.tar.gz" "$ISO_WORK/pizdos.apkovl.tar.gz"
 cp -f "$BUILD_DIR/pizdos.apkovl.tar.gz" "$ISO_WORK/localhost.apkovl.tar.gz"
 
-# 5. Настройка мгновенной автозагрузки (без зависаний)
+# 6. Настройка мгновенной автозагрузки (без зависаний)
 mkdir -p "$ISO_WORK/boot/syslinux"
 mkdir -p "$ISO_WORK/isolinux"
 
@@ -77,7 +92,7 @@ if [ -f "$ISO_WORK/boot/grub/grub.cfg" ]; then
     sed -i 's/Alpine Linux/pizdOS 2.0 (PDOS 2)/g' "$ISO_WORK/boot/grub/grub.cfg"
 fi
 
-# 6. Сборка bootable ISO через xorriso
+# 7. Сборка bootable ISO через xorriso
 echo "Generatsiya $ISO_OUTPUT..."
 xorriso -as mkisofs \
   -r -V "PIZDOS2" \

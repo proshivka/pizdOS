@@ -2,6 +2,7 @@
            DOBRO POZHALOVAT V pizdOS 2.0, BRATUKHA!
 ================================================================
  * Komanda razrabotki : proshivka, Lowyk, KiryxaTipa & Antigravity AI
+ * Interfeys (TUI)    : pizsoft (ili ui)
  * Paketny menedzher  : piz-get (ebash <pkg>, snosi <pkg>, obnovi)
  * Poyasnit za sistemu : pizfetch (ili poyasni)
  * Ochistit ekran     : nahuy
