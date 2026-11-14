@@ -571,66 +571,135 @@ impl ThemePreset {
         if w == 0 || h == 0 {
             return;
         }
-        let (top_c, mid_c, bot_c, ridge1_c, ridge2_c, orb_c) = match self {
-            ThemePreset::AuroraPeaks => (0x0A1024, 0x162447, 0x1F4068, 0x111C33, 0x0B1220, 0x2DD4BF),
-            ThemePreset::CrimsonSunset => (0x1B0B1E, 0x4A152B, 0x8F2D36, 0x28101C, 0x14080F, 0xF59E0B),
-            ThemePreset::MatrixGlow => (0x040E08, 0x082013, 0x0E3B21, 0x07190E, 0x030B06, 0x3FB950),
-            ThemePreset::OceanGlass => (0x081C2E, 0x0E3A53, 0x155E75, 0x0B2538, 0x061522, 0x38BDF8),
-        };
-
-        let h_u32 = h as u32;
-        let w_i32 = w as i32;
-        let h_i32 = h as i32;
-        let orb_x = (w_i32 * 2) / 3;
-        let orb_y = h_i32 / 3;
-        let orb_r = (h_i32 / 2).max(80);
-        let orb_r2 = orb_r * orb_r;
-
-        for y in 0..h {
-            let y_u32 = y as u32;
-            let base = if y * 2 < h {
-                lerp_rgb(top_c, mid_c, y_u32 * 2, h_u32)
-            } else {
-                lerp_rgb(mid_c, bot_c, (y_u32 - h_u32 / 2) * 2, h_u32)
+        let (top_c, mid_c, bot_c, ridge0_c, ridge1_c, ridge2_c, orb_c, aurora_c1, aurora_c2) =
+            match self {
+                ThemePreset::AuroraPeaks => (
+                    0x070B1A, 0x111E3A, 0x1C3B5C, 0x182B4B, 0x101C32, 0x09101E, 0x7DD3FC,
+                    0x2DD4BF, 0x6366F1,
+                ),
+                ThemePreset::CrimsonSunset => (
+                    0x150818, 0x3D132B, 0x99323B, 0x3B1829, 0x240E1A, 0x12070E, 0xFBBF24,
+                    0xF43F5E, 0xF59E0B,
+                ),
+                ThemePreset::MatrixGlow => (
+                    0x030B06, 0x061D11, 0x0E3B22, 0x0A2616, 0x06180E, 0x020905, 0x4ADE80,
+                    0x22C55E, 0x10B981,
+                ),
+                ThemePreset::OceanGlass => (
+                    0x061424, 0x0C344D, 0x16647B, 0x0F354C, 0x092336, 0x051420, 0x7DD3FC,
+                    0x38BDF8, 0x2DD4BF,
+                ),
             };
 
-            // Mountain ridge profiles
-            let y_i = y as i32;
-            let row_off = y * w;
-            for x in 0..w {
-                let x_i = x as i32;
+        let wf = w as f32;
+        let hf = h as f32;
+        let orb_x = wf * 0.72;
+        let orb_y = hf * 0.28;
+        let orb_r = (hf * 0.52).max(90.0);
+        let orb_r2 = orb_r * orb_r;
+        let disc_r = (hf * 0.065).max(16.0);
+        let disc_r2 = disc_r * disc_r;
 
-                // Soft glowing sun/aurora orb
-                let dx = x_i - orb_x;
-                let dy = y_i - orb_y;
+        for x in 0..w {
+            let xf = x as f32;
+            let nx = xf / wf;
+
+            // Smooth multi-harmonic mountain profiles
+            let m0 = hf * 0.63
+                - (xf * 0.0085).sin() * (hf * 0.10)
+                - (xf * 0.023 + 1.2).cos() * (hf * 0.045)
+                - (xf * 0.061).sin() * (hf * 0.014);
+            let m1 = hf * 0.73
+                - (xf * 0.012 + 2.1).sin() * (hf * 0.095)
+                - (xf * 0.031 + 0.4).cos() * (hf * 0.038)
+                - (xf * 0.085).sin() * (hf * 0.012);
+            let mut m2 = hf * 0.85
+                - (xf * 0.016 + 0.7).sin() * (hf * 0.065)
+                - (xf * 0.045 + 1.8).cos() * (hf * 0.026);
+
+            // Stylized pine silhouettes along foreground ridge
+            if self != ThemePreset::OceanGlass {
+                let period = x % 14;
+                let tree_hash = ((x / 14) as u32).wrapping_mul(2654435761);
+                if (tree_hash & 3) != 0 {
+                    let dist = (period as f32 - 6.5).abs();
+                    let spire = (1.0 - dist / 4.2).max(0.0) * (10.0 + ((tree_hash >> 4) % 8) as f32);
+                    m2 -= spire;
+                }
+            } else {
+                // Ocean water ripple silhouette
+                m2 += (xf * 0.09).sin() * 2.5;
+            }
+
+            // Aurora / Sunset Cloud ribbon center & thickness
+            let aur_center = hf * (0.28 + 0.09 * (nx * 5.2 + 0.4).sin() + 0.04 * (nx * 11.5).cos());
+            let aur_band = hf * (0.11 + 0.03 * (nx * 7.0).sin());
+            let aur_mix = ((nx * 4.2).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let aur_col = lerp_rgb(aurora_c1, aurora_c2, (aur_mix * 255.0) as u32, 255);
+
+            for y in 0..h {
+                let yf = y as f32;
+                let base = if y * 2 < h {
+                    lerp_rgb(top_c, mid_c, (y * 2) as u32, h as u32)
+                } else {
+                    lerp_rgb(mid_c, bot_c, ((y * 2) - h) as u32, h as u32)
+                };
+
+                // Soft glowing sun/moon bloom + subtle core disc in upper sky
+                let dx = xf - orb_x;
+                let dy = yf - orb_y;
                 let d2 = dx * dx + dy * dy;
                 let mut px = if d2 < orb_r2 {
-                    let strength = ((orb_r2 - d2) * 110 / orb_r2) as u32;
-                    lerp_rgb(base, orb_c, strength, 255)
+                    let k = 1.0 - d2 / orb_r2;
+                    let strength = (k * k * 135.0) as u32;
+                    let mut c = lerp_rgb(base, orb_c, strength, 255);
+                    if d2 < disc_r2 && yf < m0 {
+                        let edge = ((1.0 - d2 / disc_r2) * 2.5).clamp(0.0, 1.0);
+                        c = lerp_rgb(c, 0xFFFBEB, (edge * 175.0) as u32, 255);
+                    }
+                    c
                 } else {
                     base
                 };
 
-                // Layered mountain silhouettes
-                let m1_h = h_i32 - 80 - ((x_i * 37 / 60 - 10).abs() % 90) - ((x_i / 13) % 18);
-                let m2_h = h_i32 - 42 - ((x_i * 53 / 80 + 25).abs() % 70);
-                if y_i >= m2_h {
-                    px = ridge2_c;
-                } else if y_i >= m1_h {
-                    px = ridge1_c;
-                } else {
-                    // Subtle stars in upper sky
-                    let hash = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
-                    if y * 2 < h && (hash & 0x3FF) == 0 {
-                        px = lerp_rgb(px, 0xFFFFFF, 160, 255);
+                // Shimmering aurora / sunset veil in upper/mid sky
+                if yf < m1 {
+                    let dist = (yf - aur_center).abs();
+                    if dist < aur_band {
+                        let bell = 1.0 - dist / aur_band;
+                        let curtain = 0.68 + 0.32 * (xf * 0.055 + yf * 0.025).sin();
+                        let a = (bell * bell * curtain * 105.0) as u32;
+                        px = lerp_rgb(px, aur_col, a, 255);
                     }
                 }
 
-                if show_grid && (x % 40 == 0 || y % 40 == 0) {
-                    px = lerp_rgb(px, 0xFFFFFF, 14, 255);
+                // Distant atmospheric haze before mountain ridges
+                if yf < m0 {
+                    let hash =
+                        (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
+                    if y * 3 < h * 2 && (hash & 0x2FF) == 0 {
+                        let bright = 110 + ((hash >> 10) & 0x7F);
+                        px = lerp_rgb(px, 0xFFFFFF, bright.min(230), 255);
+                    }
+                    let fog = (1.0 - ((m0 - yf) / (hf * 0.14)).clamp(0.0, 1.0)) * 50.0;
+                    if fog > 1.0 {
+                        px = lerp_rgb(px, orb_c, fog as u32, 255);
+                    }
+                } else if yf >= m2 {
+                    px = ridge2_c;
+                } else if yf >= m1 {
+                    let depth = ((yf - m1) / (m2 - m1).max(1.0)).clamp(0.0, 1.0);
+                    px = lerp_rgb(ridge1_c, ridge2_c, (depth * 140.0) as u32, 255);
+                } else {
+                    let depth = ((yf - m0) / (m1 - m0).max(1.0)).clamp(0.0, 1.0);
+                    px = lerp_rgb(ridge0_c, lerp_rgb(ridge0_c, bot_c, 75, 255), (depth * 160.0) as u32, 255);
                 }
 
-                buf[row_off + x] = px;
+                if show_grid && (x % 40 == 0 || y % 40 == 0) {
+                    px = lerp_rgb(px, 0xFFFFFF, 16, 255);
+                }
+
+                buf[y * w + x] = px;
             }
         }
     }
@@ -755,10 +824,22 @@ impl SettingsState {
         for (i, (p, label)) in tabs.iter().enumerate() {
             let ty = sb_y + 6 + (i as i32) * 30;
             let active = self.page == *p;
-            let bg = if active { accent } else { 0x161B22 };
+            if active {
+                canvas.fill_hgradient_rounded_rect(
+                    sb_x + 5,
+                    ty,
+                    sb_w - 10,
+                    24,
+                    5,
+                    accent,
+                    lerp_rgb(accent, 0xFFFFFF, 40, 255),
+                );
+                canvas.fill_rounded_rect(sb_x + 7, ty + 4, 3, 16, 1, 0xFFFFFF);
+            } else {
+                canvas.fill_rounded_rect(sb_x + 5, ty, sb_w - 10, 24, 5, 0x161B22);
+            }
             let fg = if active { 0xFFFFFF } else { 0xC9D1D9 };
-            canvas.fill_rounded_rect(sb_x + 5, ty, sb_w - 10, 24, 5, bg);
-            canvas.draw_text_clipped(sb_x + 12, ty + 6, sb_w - 20, label, fg, 1);
+            canvas.draw_text_clipped(sb_x + 15, ty + 6, sb_w - 22, label, fg, 1);
         }
 
         let x = wx + 146;
@@ -890,16 +971,18 @@ impl SettingsState {
                 );
             }
             SettingsPage::About => {
-                // ColorOS-style Hero Banner Card
-                canvas.fill_rounded_rect(x, y, iw, 78, 8, 0x162436);
+                // ColorOS-style Gradient Hero Banner Card
+                let card_right = lerp_rgb(0x162436, accent, 110, 255);
+                canvas.fill_hgradient_rounded_rect(x, y, iw, 78, 8, 0x121D2C, card_right);
+                canvas.blend_rect(x + 8, y + 1, iw - 16, 1, 0xFFFFFF, 48);
                 canvas.fill_rounded_rect(x, y, 6, 78, 3, accent);
                 canvas.draw_rounded_rect(x, y, iw, 78, 8, accent);
 
-                canvas.draw_text_clipped(x + 16, y + 10, iw - 24, "pizdOS 2.0", 0xFFFFFF, 2);
+                canvas.draw_text_clipped(x + 16, y + 10, iw - 110, "pizdOS 2.0", 0xFFFFFF, 2);
                 canvas.draw_text_clipped(
                     x + 16,
                     y + 38,
-                    iw - 24,
+                    iw - 110,
                     "Bratukha Edition | Pizsoft UI",
                     0x79C0FF,
                     1,
@@ -907,25 +990,35 @@ impl SettingsState {
                 canvas.draw_text_clipped(
                     x + 16,
                     y + 56,
-                    iw - 24,
+                    iw - 110,
                     "by prosh1vka, Lowyk, KiryxaTipa",
                     0x3FB950,
                     1,
                 );
 
+                // Emblem badge on right of Hero Card
+                if iw > 260 {
+                    let bx = x + iw - 84;
+                    let by = y + 14;
+                    canvas.blend_rounded_rect(bx, by, 72, 50, 8, 0x090C10, 145);
+                    canvas.draw_rounded_rect(bx, by, 72, 50, 8, lerp_rgb(accent, 0xFFFFFF, 65, 255));
+                    canvas.draw_text_clipped(bx + 14, by + 10, 56, "NO", 0xFFFFFF, 1);
+                    canvas.draw_text_clipped(bx + 14, by + 26, 56, "GNU", 0x3FB950, 1);
+                }
+
                 // 2-Column ColorOS Info Tiles
                 let col_w = (iw - 8) / 2;
                 let ram_str = format!("{} MB Total", mem.total_mb);
                 let tiles = [
-                    (tr(lang, "Стек", "Stack"), "musl + BusyBox"),
-                    (tr(lang, "Принцип", "Policy"), "NO GNU / 0 Deps"),
-                    (tr(lang, "Лицензия", "License"), "MIT (GNU Nahuy)"),
-                    (tr(lang, "Ядро", "Kernel"), kernel),
-                    ("RAM", ram_str.as_str()),
-                    (tr(lang, "Пакеты", "Pkg Mgr"), "piz-get 0.1.0"),
+                    (tr(lang, "Стек", "Stack"), "musl + BusyBox", 0x58A6FF),
+                    (tr(lang, "Принцип", "Policy"), "NO GNU / 0 Deps", 0x3FB950),
+                    (tr(lang, "Лицензия", "License"), "MIT (GNU Nahuy)", 0xF59E0B),
+                    (tr(lang, "Ядро", "Kernel"), kernel, 0xA855F7),
+                    ("RAM", ram_str.as_str(), 0x38BDF8),
+                    (tr(lang, "Пакеты", "Pkg Mgr"), "piz-get 0.1.0", 0xF43F5E),
                 ];
 
-                for (idx, (label, val)) in tiles.iter().enumerate() {
+                for (idx, (label, val, dot_col)) in tiles.iter().enumerate() {
                     let col = (idx % 2) as i32;
                     let row = (idx / 2) as i32;
                     let tx = x + col * (col_w + 8);
@@ -933,10 +1026,11 @@ impl SettingsState {
                     if ty + 44 > wy + wh - 10 {
                         break;
                     }
-                    canvas.fill_rounded_rect(tx, ty, col_w, 44, 6, 0x21262D);
-                    canvas.draw_rounded_rect(tx, ty, col_w, 44, 6, 0x30363D);
-                    canvas.draw_text_clipped(tx + 10, ty + 6, col_w - 18, label, 0x8B949E, 1);
-                    canvas.draw_text_clipped(tx + 10, ty + 23, col_w - 18, val, 0xE6EDF3, 1);
+                    canvas.fill_vgradient_rounded_rect(tx, ty, col_w, 44, 6, 0x222933, 0x181E27);
+                    canvas.draw_rounded_rect(tx, ty, col_w, 44, 6, 0x343D4B);
+                    canvas.fill_rounded_rect(tx + 9, ty + 10, 5, 5, 2, *dot_col);
+                    canvas.draw_text_clipped(tx + 18, ty + 6, col_w - 26, label, 0x94A3B8, 1);
+                    canvas.draw_text_clipped(tx + 10, ty + 23, col_w - 18, val, 0xF0F6FC, 1);
                 }
             }
         }
@@ -1065,9 +1159,13 @@ impl CalcState {
         let x = wx + 12;
         let y = wy + 34;
         let iw = ww - 24;
-        canvas.fill_rounded_rect(x, y, iw, 40, 6, 0x090C10);
-        canvas.draw_rounded_rect(x, y, iw, 40, 6, 0x30363D);
-        canvas.draw_text_clipped(x + 12, y + 10, iw - 24, &self.display, 0xFFFFFF, 2);
+        canvas.fill_vgradient_rounded_rect(x, y, iw, 42, 6, 0x0A1017, 0x0F1722);
+        canvas.blend_rect(x + 6, y + 1, iw - 12, 1, 0xFFFFFF, 32);
+        canvas.draw_rounded_rect(x, y, iw, 42, 6, 0x30363D);
+        if let (Some(a), Some(op)) = (self.acc, self.op) {
+            canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
+        }
+        canvas.draw_text_clipped(x + 12, y + 15, iw - 24, &self.display, 0xFFFFFF, 2);
 
         let gy = wy + 82;
         let gh = wh - 94;

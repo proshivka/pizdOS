@@ -107,6 +107,25 @@ impl Canvas {
         self.fill_rect(x + w - 1, y, 1, h, color);
     }
 
+    #[inline]
+    fn corner_cov(ox: i32, oy: i32, r: i32) -> u8 {
+        // 2x-subpixel distance approximation for smooth anti-aliased rounded corners.
+        let fx = 2 * ox + 1;
+        let fy = 2 * oy + 1;
+        let d2 = fx * fx + fy * fy;
+        let outer = 4 * r * r;
+        if d2 >= outer {
+            return 0;
+        }
+        let inner = (2 * r - 2).max(0);
+        let inner2 = inner * inner;
+        if d2 <= inner2 {
+            255
+        } else {
+            (((outer - d2) * 255) / (outer - inner2).max(1)) as u8
+        }
+    }
+
     pub fn fill_rounded_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
         if w <= 0 || h <= 0 {
             return;
@@ -120,16 +139,87 @@ impl Canvas {
         self.fill_rect(x, y + r, r, h - 2 * r, color);
         self.fill_rect(x + w - r, y + r, r, h - 2 * r, color);
 
-        let r2 = r * r;
         for dy in 0..r {
             for dx in 0..r {
-                let ox = r - 1 - dx;
-                let oy = r - 1 - dy;
-                if ox * ox + oy * oy <= r2 {
+                let cov = Self::corner_cov(r - 1 - dx, r - 1 - dy, r);
+                if cov == 255 {
                     self.set_pixel(x + dx, y + dy, color);
                     self.set_pixel(x + w - 1 - dx, y + dy, color);
                     self.set_pixel(x + dx, y + h - 1 - dy, color);
                     self.set_pixel(x + w - 1 - dx, y + h - 1 - dy, color);
+                } else if cov > 0 {
+                    self.blend_pixel(x + dx, y + dy, color, cov);
+                    self.blend_pixel(x + w - 1 - dx, y + dy, color, cov);
+                    self.blend_pixel(x + dx, y + h - 1 - dy, color, cov);
+                    self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, cov);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_vgradient_rounded_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        r: i32,
+        top_col: u32,
+        bot_col: u32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let r = r.min(w / 2).min(h / 2).max(0);
+        let max_t = (h - 1).max(1) as u32;
+        for dy in 0..h {
+            let col = lerp_rgb(top_col, bot_col, dy as u32, max_t);
+            if dy >= r && dy < h - r {
+                self.fill_rect(x, y + dy, w, 1, col);
+            } else {
+                let cy = if dy < r { r - 1 - dy } else { dy - (h - r) };
+                self.fill_rect(x + r, y + dy, w - 2 * r, 1, col);
+                for dx in 0..r {
+                    let cov = Self::corner_cov(r - 1 - dx, cy, r);
+                    if cov > 0 {
+                        self.blend_pixel(x + dx, y + dy, col, cov);
+                        self.blend_pixel(x + w - 1 - dx, y + dy, col, cov);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_hgradient_rounded_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        r: i32,
+        left_col: u32,
+        right_col: u32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let r = r.min(w / 2).min(h / 2).max(0);
+        let max_t = (w - 1).max(1) as u32;
+        for dx in 0..w {
+            let col = lerp_rgb(left_col, right_col, dx as u32, max_t);
+            if dx >= r && dx < w - r {
+                self.fill_rect(x + dx, y, 1, h, col);
+            } else {
+                let cx = if dx < r { r - 1 - dx } else { dx - (w - r) };
+                self.fill_rect(x + dx, y + r, 1, h - 2 * r, col);
+                for dy in 0..r {
+                    let cov = Self::corner_cov(cx, r - 1 - dy, r);
+                    if cov > 0 {
+                        self.blend_pixel(x + dx, y + dy, col, cov);
+                        self.blend_pixel(x + dx, y + h - 1 - dy, col, cov);
+                    }
                 }
             }
         }
@@ -154,16 +244,17 @@ impl Canvas {
         self.blend_rect(x, y + r, r, h - 2 * r, color, alpha);
         self.blend_rect(x + w - r, y + r, r, h - 2 * r, color, alpha);
 
-        let r2 = r * r;
         for dy in 0..r {
             for dx in 0..r {
-                let ox = r - 1 - dx;
-                let oy = r - 1 - dy;
-                if ox * ox + oy * oy <= r2 {
-                    self.blend_pixel(x + dx, y + dy, color, alpha);
-                    self.blend_pixel(x + w - 1 - dx, y + dy, color, alpha);
-                    self.blend_pixel(x + dx, y + h - 1 - dy, color, alpha);
-                    self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, alpha);
+                let cov = Self::corner_cov(r - 1 - dx, r - 1 - dy, r);
+                if cov > 0 {
+                    let a = ((alpha as u32 * cov as u32) / 255) as u8;
+                    if a > 0 {
+                        self.blend_pixel(x + dx, y + dy, color, a);
+                        self.blend_pixel(x + w - 1 - dx, y + dy, color, a);
+                        self.blend_pixel(x + dx, y + h - 1 - dy, color, a);
+                        self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, a);
+                    }
                 }
             }
         }
@@ -201,8 +292,9 @@ impl Canvas {
     }
 
     pub fn draw_soft_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32) {
-        self.blend_rounded_rect(x + 2, y + 4, w + 4, h + 4, r + 2, 0x000000, 75);
-        self.blend_rounded_rect(x + 4, y + 6, w, h, r, 0x000000, 95);
+        self.blend_rounded_rect(x - 2, y + 2, w + 4, h + 6, r + 4, 0x000000, 32);
+        self.blend_rounded_rect(x + 1, y + 4, w + 2, h + 3, r + 2, 0x000000, 56);
+        self.blend_rounded_rect(x + 3, y + 6, w - 2, h, r, 0x000000, 82);
     }
 
     pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: u32, scale: i32) -> i32 {
@@ -276,7 +368,10 @@ impl Canvas {
         let inner_w = (w - 2).max(0);
         let fill_w = (inner_w * pct) / 100;
         if fill_w > 2 {
-            self.fill_rounded_rect(x + 1, y + 1, fill_w, (h - 2).max(0), r.min(fill_w / 2), fill_color);
+            let hi = lerp_rgb(fill_color, 0xFFFFFF, 75, 255);
+            let fr = r.min(fill_w / 2);
+            self.fill_hgradient_rounded_rect(x + 1, y + 1, fill_w, (h - 2).max(0), fr, fill_color, hi);
+            self.blend_rect(x + 2, y + 2, (fill_w - 2).max(0), ((h - 4) / 2).max(1), 0xFFFFFF, 42);
         }
         self.draw_rounded_rect(x, y, w, h, r, border_color);
     }
@@ -293,8 +388,13 @@ impl Canvas {
         fg_color: u32,
         border_color: u32,
     ) {
-        let r = 5.min(w / 2).min(h / 2);
-        self.fill_rounded_rect(x, y, w, h, r, bg_color);
+        let r = 6.min(w / 2).min(h / 2);
+        let top_col = lerp_rgb(bg_color, 0xFFFFFF, 26, 255);
+        let bot_col = lerp_rgb(bg_color, 0x000000, 18, 255);
+        self.fill_vgradient_rounded_rect(x, y, w, h, r, top_col, bot_col);
+        if w > 2 * r + 2 {
+            self.blend_rect(x + r, y + 1, w - 2 * r, 1, 0xFFFFFF, 38);
+        }
         self.draw_rounded_rect(x, y, w, h, r, border_color);
         let tw = measure_text(label, 1);
         let tx = x + ((w - tw) / 2).max(4);
@@ -304,9 +404,12 @@ impl Canvas {
 
     pub fn draw_toggle(&mut self, x: i32, y: i32, on: bool, accent: u32) {
         let track = if on { accent } else { 0x30363D };
-        self.fill_rounded_rect(x, y, 36, 18, 9, track);
-        let knob_x = if on { x + 20 } else { x + 3 };
-        self.fill_rounded_rect(knob_x, y + 2, 14, 14, 7, 0xFFFFFF);
+        let track_bot = lerp_rgb(track, 0x000000, 32, 255);
+        self.fill_vgradient_rounded_rect(x, y, 36, 18, 9, track_bot, track);
+        self.draw_rounded_rect(x, y, 36, 18, 9, lerp_rgb(track, 0xFFFFFF, 45, 255));
+        let knob_x = if on { x + 20 } else { x + 2 };
+        self.blend_rounded_rect(knob_x, y + 3, 14, 14, 7, 0x000000, 75);
+        self.fill_vgradient_rounded_rect(knob_x, y + 2, 14, 14, 7, 0xFFFFFF, 0xD8DEE9);
     }
 
     pub fn draw_cursor(&mut self, mx: i32, my: i32) {
@@ -326,11 +429,22 @@ impl Canvas {
             "XX...XWX....",
             "X.....X.....",
         ];
+        // Soft drop shadow beneath pointer
+        for (dy, row) in CURSOR.iter().enumerate() {
+            for (dx, ch) in row.bytes().enumerate() {
+                if ch != b'.' {
+                    self.blend_pixel(mx + dx as i32 + 2, my + dy as i32 + 2, 0x000000, 85);
+                }
+            }
+        }
         for (dy, row) in CURSOR.iter().enumerate() {
             for (dx, ch) in row.bytes().enumerate() {
                 match ch {
                     b'X' => self.set_pixel(mx + dx as i32, my + dy as i32, 0x0B0F17),
-                    b'W' => self.set_pixel(mx + dx as i32, my + dy as i32, 0xFFFFFF),
+                    b'W' => {
+                        let col = if dx < 4 { 0xFFFFFF } else { 0xE2E8F0 };
+                        self.set_pixel(mx + dx as i32, my + dy as i32, col);
+                    }
                     _ => {}
                 }
             }

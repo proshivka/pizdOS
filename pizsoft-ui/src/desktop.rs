@@ -8,7 +8,7 @@ use crate::apps::{
     CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsState, SnakeState,
     TerminalState, ThemePreset, tr,
 };
-use crate::gfx::Canvas;
+use crate::gfx::{Canvas, lerp_rgb};
 use crate::sys::{
     CpuSample, MemInfo, PkgSummary, ProcInfo, list_processes, load_packages, read_cpu_sample,
     read_kernel_version, read_loadavg, read_meminfo, read_uptime_str,
@@ -51,6 +51,21 @@ impl AppId {
             (AppId::Calc, Lang::En) => "Calculator",
             (AppId::Matrix, Lang::Ru) => "Матрица",
             (AppId::Matrix, Lang::En) => "Matrix",
+        }
+    }
+
+    pub fn color(self) -> u32 {
+        match self {
+            AppId::System => 0x3FB950,
+            AppId::PizGet => 0xD29922,
+            AppId::Files => 0x58A6FF,
+            AppId::Terminal => 0x3FB950,
+            AppId::Paint => 0xBC8CFF,
+            AppId::Snake => 0x2EA043,
+            AppId::Notepad => 0x58A6FF,
+            AppId::Settings => 0xF85149,
+            AppId::Calc => 0x38BDF8,
+            AppId::Matrix => 0x22C55E,
         }
     }
 }
@@ -432,7 +447,7 @@ impl Desktop {
         // 0. Right-click context menu hit test
         if let Some((cx, cy)) = self.ctx_menu {
             self.ctx_menu = None;
-            if x >= cx && x <= cx + 180 && y >= cy && y <= cy + 130 {
+            if x >= cx && x <= cx + 184 && y >= cy && y <= cy + 134 {
                 let row = (y - cy - 4) / 25;
                 match row {
                     0 => self.focus_or_open(AppId::Terminal),
@@ -457,14 +472,14 @@ impl Desktop {
 
         // 1. Start Menu popup hit test
         if self.start_menu_open {
-            let menu_h = (START_ITEMS.len() as i32) * 24 + 36;
+            let menu_h = (START_ITEMS.len() as i32) * 24 + 42;
             let menu_y = if self.settings.taskbar_top {
                 38
             } else {
                 task_y - menu_h - 4
             };
-            if (8..=228).contains(&x) && y >= menu_y && y < menu_y + menu_h {
-                let rel_y = y - (menu_y + 30);
+            if (8..=236).contains(&x) && y >= menu_y && y < menu_y + menu_h {
+                let rel_y = y - (menu_y + 34);
                 if rel_y >= 0 {
                     let idx = (rel_y / 24) as usize;
                     if let Some(app_opt) = START_ITEMS.get(idx) {
@@ -694,20 +709,28 @@ impl Desktop {
 
         // 4. Frosted-glass Taskbar (ONLY open windows)
         let task_y = if self.settings.taskbar_top { 0 } else { h - 36 };
-        canvas.blend_rect(0, task_y, w, 36, 0x0D1117, 215);
-        canvas.fill_rect(0, task_y, w, 1, 0x38424F);
+        canvas.blend_rect(0, task_y, w, 36, 0x090D14, 222);
+        let rim_y = if self.settings.taskbar_top { task_y + 35 } else { task_y };
+        canvas.fill_rect(0, rim_y, w, 1, lerp_rgb(0x283240, accent, 55, 255));
+        canvas.blend_rect(0, task_y + 1, w, 1, 0xFFFFFF, 26);
 
-        let start_bg = if self.start_menu_open { 0xDA3633 } else { 0xB62324 };
-        canvas.draw_button(
-            8,
-            task_y + 6,
-            86,
-            24,
-            tr(lang, "Пуск", "Start"),
-            start_bg,
-            0xFFFFFF,
-            0xFF7B72,
-        );
+        let start_hovered =
+            self.mouse_x >= 8 && self.mouse_x <= 94 && self.mouse_y >= task_y + 6 && self.mouse_y <= task_y + 30;
+        let start_top = if self.start_menu_open {
+            0xF85149
+        } else if start_hovered {
+            0xE03E3B
+        } else {
+            0xCF222E
+        };
+        canvas.fill_vgradient_rounded_rect(8, task_y + 6, 86, 24, 6, start_top, 0x991B1B);
+        canvas.draw_rounded_rect(8, task_y + 6, 86, 24, 6, 0xFF7B72);
+        // 4-pane PizdOS Start emblem
+        canvas.fill_rect(17, task_y + 13, 4, 4, 0xFFFFFF);
+        canvas.fill_rect(22, task_y + 13, 4, 4, 0xFFE4E6);
+        canvas.fill_rect(17, task_y + 18, 4, 4, 0xFFE4E6);
+        canvas.fill_rect(22, task_y + 18, 4, 4, 0xFCA5A5);
+        canvas.draw_text_clipped(32, task_y + 12, 58, tr(lang, "Пуск", "Start"), 0xFFFFFF, 1);
 
         let open_wins: Vec<(usize, &Window)> = self
             .windows
@@ -719,26 +742,49 @@ impl Desktop {
         let mut bx = 102;
         for (orig_idx, win) in open_wins {
             let is_top = Some(orig_idx) == top_vis;
-            let bg = if is_top {
-                accent
+            let pill_hovered = self.mouse_x >= bx
+                && self.mouse_x <= bx + pill_w
+                && self.mouse_y >= task_y + 6
+                && self.mouse_y <= task_y + 30;
+            let (top_c, bot_c, border) = if is_top {
+                (lerp_rgb(accent, 0xFFFFFF, 35, 255), accent, 0x79C0FF)
             } else if win.minimized {
-                0x161B22
+                (0x161B22, 0x11151B, 0x262C36)
+            } else if pill_hovered {
+                (0x2D3542, 0x21262D, 0x484F58)
             } else {
-                0x21262D
+                (0x232A35, 0x1A2029, 0x333B48)
             };
-            let border = if is_top { 0x79C0FF } else { 0x30363D };
+            canvas.fill_vgradient_rounded_rect(bx, task_y + 6, pill_w, 24, 6, top_c, bot_c);
+            canvas.draw_rounded_rect(bx, task_y + 6, pill_w, 24, 6, border);
+
             let fg = if win.minimized { 0x8B949E } else { 0xFFFFFF };
-            canvas.draw_button(bx, task_y + 6, pill_w, 24, win.id.title(lang), bg, fg, border);
+            if pill_w > 34 {
+                let dot_col = if is_top { 0xFFFFFF } else { win.id.color() };
+                canvas.fill_rounded_rect(bx + 7, task_y + 15, 5, 5, 2, dot_col);
+                canvas.draw_text_clipped(bx + 15, task_y + 12, pill_w - 20, win.id.title(lang), fg, 1);
+            } else {
+                canvas.draw_text_clipped(bx + 5, task_y + 12, pill_w - 8, win.id.title(lang), fg, 1);
+            }
+            if is_top {
+                canvas.fill_rounded_rect(bx + 10, task_y + 27, (pill_w - 20).max(8), 2, 1, 0xFFFFFF);
+            }
             bx += pill_w + 4;
         }
 
         let lang_x = (w - 144).max(bx + 8);
+        // System Tray pill
+        let tray_w = (w - lang_x - 4).max(40);
+        canvas.fill_rounded_rect(lang_x - 4, task_y + 4, tray_w + 2, 28, 7, 0x151B24);
+        canvas.draw_rounded_rect(lang_x - 4, task_y + 4, tray_w + 2, 28, 7, 0x2C3545);
+
         let lang_lbl = match lang {
             Lang::Ru => "RU",
             Lang::En => "EN",
         };
         canvas.draw_button(lang_x, task_y + 6, 36, 24, lang_lbl, 0x21262D, 0xFFFFFF, accent);
-        canvas.draw_text_clipped(lang_x + 44, task_y + 12, 96, &self.uptime, 0xC9D1D9, 1);
+        canvas.fill_rounded_rect(lang_x + 43, task_y + 15, 5, 5, 2, 0x3FB950);
+        canvas.draw_text_clipped(lang_x + 52, task_y + 12, (w - lang_x - 58).max(20), &self.uptime, 0xE6EDF3, 1);
 
         // 5. Start Menu popup
         if self.start_menu_open {
@@ -762,33 +808,46 @@ impl Desktop {
     fn draw_context_menu(&self, canvas: &mut Canvas, cx: i32, cy: i32, accent: u32) {
         let lang = self.settings.lang;
         let items = [
-            tr(lang, "Открыть Терминал", "Open Terminal"),
-            tr(lang, "Сменить обои", "Next Wallpaper"),
-            tr(lang, "Настройки", "Settings"),
-            tr(lang, "Обновить", "Refresh"),
-            tr(lang, "Выход", "Exit"),
+            (tr(lang, "Открыть Терминал", "Open Terminal"), 0x3FB950),
+            (tr(lang, "Сменить обои", "Next Wallpaper"), accent),
+            (tr(lang, "Настройки", "Settings"), 0x58A6FF),
+            (tr(lang, "Обновить", "Refresh"), 0xD29922),
+            (tr(lang, "Выход", "Exit"), 0xF85149),
         ];
-        canvas.draw_soft_shadow(cx, cy, 180, 132, 6);
-        canvas.blend_rounded_rect(cx, cy, 180, 132, 6, 0x161B22, 240);
-        canvas.draw_rounded_rect(cx, cy, 180, 132, 6, accent);
-        for (i, label) in items.iter().enumerate() {
+        canvas.draw_soft_shadow(cx, cy, 184, 134, 7);
+        canvas.blend_rounded_rect(cx, cy, 184, 134, 7, 0x131922, 242);
+        canvas.blend_rect(cx + 8, cy + 1, 168, 1, 0xFFFFFF, 32);
+        canvas.draw_rounded_rect(cx, cy, 184, 134, 7, lerp_rgb(accent, 0xFFFFFF, 35, 255));
+        for (i, (label, dot_col)) in items.iter().enumerate() {
             let iy = cy + 4 + (i as i32) * 25;
+            if i == 4 {
+                canvas.fill_rect(cx + 10, iy - 1, 164, 1, 0x2D3542);
+            }
             if self.mouse_x >= cx
-                && self.mouse_x <= cx + 180
+                && self.mouse_x <= cx + 184
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 23
             {
-                canvas.fill_rounded_rect(cx + 4, iy, 172, 23, 4, accent);
+                canvas.fill_hgradient_rounded_rect(
+                    cx + 4,
+                    iy,
+                    176,
+                    23,
+                    5,
+                    accent,
+                    lerp_rgb(accent, 0xFFFFFF, 35, 255),
+                );
             }
-            let col = if i == 4 { 0xFF7B72 } else { 0xE6EDF3 };
-            canvas.draw_text_clipped(cx + 12, iy + 5, 156, label, col, 1);
+            canvas.fill_rounded_rect(cx + 11, iy + 9, 5, 5, 2, *dot_col);
+            let col = if i == 4 { 0xFF7B72 } else { 0xF0F6FC };
+            canvas.draw_text_clipped(cx + 22, iy + 5, 152, label, col, 1);
         }
     }
 
     fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32, accent: u32) {
         let lang = self.settings.lang;
-        let menu_w = 220;
-        let menu_h = (START_ITEMS.len() as i32) * 24 + 36;
+        let menu_w = 228;
+        let menu_h = (START_ITEMS.len() as i32) * 24 + 42;
         let menu_x = 8;
         let menu_y = if self.settings.taskbar_top {
             38
@@ -796,34 +855,49 @@ impl Desktop {
             task_y - menu_h - 4
         };
 
-        canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 8);
-        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 8, 0x161B22, 238);
-        canvas.draw_rounded_rect(menu_x, menu_y, menu_w, menu_h, 8, accent);
+        canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 9);
+        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 9, 0x131922, 240);
+        canvas.draw_rounded_rect(menu_x, menu_y, menu_w, menu_h, 9, accent);
 
-        canvas.fill_rounded_rect(menu_x + 2, menu_y + 2, menu_w - 4, 24, 6, accent);
+        canvas.fill_hgradient_rounded_rect(
+            menu_x + 2,
+            menu_y + 2,
+            menu_w - 4,
+            28,
+            7,
+            lerp_rgb(accent, 0x0B0F17, 45, 255),
+            accent,
+        );
+        canvas.blend_rect(menu_x + 8, menu_y + 3, menu_w - 16, 1, 0xFFFFFF, 45);
         canvas.draw_text_clipped(
             menu_x + 12,
-            menu_y + 8,
-            menu_w - 24,
+            menu_y + 9,
+            menu_w - 76,
             tr(lang, "pizdOS 2.0 • Пуск", "pizdOS 2.0 • Start"),
             0xFFFFFF,
             1,
         );
+        canvas.draw_text_clipped(menu_x + menu_w - 58, menu_y + 9, 50, "NO GNU", 0xDCE6F2, 1);
 
         for (i, app_opt) in START_ITEMS.iter().enumerate() {
-            let iy = menu_y + 30 + (i as i32) * 24;
+            let iy = menu_y + 34 + (i as i32) * 24;
+            if app_opt.is_none() {
+                canvas.fill_rect(menu_x + 10, iy - 1, menu_w - 20, 1, 0x2D3542);
+            }
             let hovered = self.mouse_x >= menu_x
                 && self.mouse_x <= menu_x + menu_w
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 22;
             if hovered {
-                canvas.fill_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 5, 0x262D38);
+                canvas.fill_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 5, 0x26303E);
+                canvas.fill_rounded_rect(menu_x + 6, iy + 4, 3, 14, 1, accent);
             }
-            let (label, col) = match app_opt {
-                Some(id) => (id.title(lang), 0xE6EDF3),
-                None => (tr(lang, "Выход", "Exit"), 0xFF7B72),
+            let (label, col, dot_col) = match app_opt {
+                Some(id) => (id.title(lang), 0xE6EDF3, id.color()),
+                None => (tr(lang, "Выход", "Exit"), 0xFF7B72, 0xF85149),
             };
-            canvas.draw_text_clipped(menu_x + 14, iy + 5, menu_w - 28, label, col, 1);
+            canvas.fill_rounded_rect(menu_x + 15, iy + 8, 6, 6, 3, dot_col);
+            canvas.draw_text_clipped(menu_x + 28, iy + 5, menu_w - 38, label, col, 1);
         }
     }
 
@@ -841,45 +915,66 @@ impl Desktop {
             && self.mouse_y >= y - 2
             && self.mouse_y <= y + 58;
         if hovered {
-            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 8, 0xFFFFFF, 28);
+            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 9, 0xFFFFFF, 34);
+            canvas.draw_rounded_rect(x - 2, y - 4, 72, 62, 9, lerp_rgb(accent, 0xFFFFFF, 90, 255));
         }
-        canvas.draw_soft_shadow(x + 12, y, 42, 38, 8);
-        canvas.blend_rounded_rect(x + 12, y, 42, 38, 8, 0x1B222C, 225);
-        canvas.draw_rounded_rect(x + 12, y, 42, 38, 8, accent);
+        canvas.draw_soft_shadow(x + 12, y, 42, 38, 9);
+        canvas.fill_vgradient_rounded_rect(
+            x + 12,
+            y,
+            42,
+            38,
+            9,
+            lerp_rgb(0x1E2836, accent, 42, 255),
+            0x111720,
+        );
+        canvas.blend_rounded_rect(x + 14, y + 2, 38, 16, 6, 0xFFFFFF, 22);
+        canvas.draw_rounded_rect(x + 12, y, 42, 38, 9, lerp_rgb(accent, 0xFFFFFF, 45, 255));
 
         // Mini pixel-art glyph inside icon
         let ix = x + 22;
         let iy = y + 9;
         match id {
             AppId::Terminal => {
-                canvas.fill_rect(ix, iy, 22, 18, 0x090C10);
-                canvas.draw_text(ix + 3, iy + 3, ">_", accent, 1);
+                canvas.fill_rounded_rect(ix, iy, 22, 18, 3, 0x090C10);
+                canvas.fill_rect(ix + 2, iy + 2, 2, 2, 0xF85149);
+                canvas.fill_rect(ix + 5, iy + 2, 2, 2, 0xF59E0B);
+                canvas.fill_rect(ix + 8, iy + 2, 2, 2, 0x3FB950);
+                canvas.draw_text(ix + 3, iy + 5, ">_", accent, 1);
             }
             AppId::PizGet => {
                 canvas.fill_rounded_rect(ix + 2, iy + 2, 18, 16, 3, accent);
-                canvas.fill_rect(ix + 2, iy + 7, 18, 2, 0x161B22);
+                canvas.fill_rect(ix + 2, iy + 2, 18, 4, lerp_rgb(accent, 0xFFFFFF, 65, 255));
+                canvas.fill_rect(ix + 2, iy + 8, 18, 2, 0x161B22);
                 canvas.fill_rect(ix + 10, iy + 2, 2, 16, 0x161B22);
             }
             AppId::Paint => {
-                canvas.fill_rounded_rect(ix + 2, iy + 2, 18, 16, 6, 0x30363D);
+                canvas.fill_rounded_rect(ix + 2, iy + 2, 18, 16, 7, 0x38414E);
                 canvas.fill_rect(ix + 5, iy + 5, 4, 4, 0xF85149);
                 canvas.fill_rect(ix + 12, iy + 5, 4, 4, 0x3FB950);
-                canvas.fill_rect(ix + 8, iy + 11, 5, 4, 0x58A6FF);
+                canvas.fill_rect(ix + 6, iy + 11, 4, 4, 0x58A6FF);
+                canvas.fill_rect(ix + 13, iy + 12, 3, 3, 0x0D1117);
             }
             AppId::Snake => {
                 canvas.fill_rect(ix + 2, iy + 12, 12, 4, accent);
                 canvas.fill_rect(ix + 10, iy + 6, 4, 8, accent);
                 canvas.fill_rect(ix + 10, iy + 4, 8, 4, 0x56D364);
+                canvas.fill_rect(ix + 16, iy + 5, 1, 1, 0x090C10);
                 canvas.fill_rect(ix + 17, iy + 12, 3, 3, 0xF85149);
             }
             AppId::Notepad => {
                 canvas.fill_rounded_rect(ix + 3, iy + 1, 16, 18, 2, 0xE6EDF3);
-                canvas.fill_rect(ix + 6, iy + 5, 10, 2, 0x1F6FEB);
-                canvas.fill_rect(ix + 6, iy + 9, 10, 2, 0x6E7681);
-                canvas.fill_rect(ix + 6, iy + 13, 7, 2, 0x6E7681);
+                canvas.fill_rect(ix + 14, iy + 1, 5, 5, 0x94A3B8);
+                canvas.fill_rect(ix + 6, iy + 6, 9, 2, 0x1F6FEB);
+                canvas.fill_rect(ix + 6, iy + 10, 10, 2, 0x6E7681);
+                canvas.fill_rect(ix + 6, iy + 14, 7, 2, 0x6E7681);
             }
             AppId::Settings => {
                 canvas.fill_rounded_rect(ix + 3, iy + 1, 16, 16, 8, accent);
+                canvas.fill_rect(ix + 9, iy - 1, 4, 2, accent);
+                canvas.fill_rect(ix + 9, iy + 17, 4, 2, accent);
+                canvas.fill_rect(ix + 1, iy + 7, 2, 4, accent);
+                canvas.fill_rect(ix + 19, iy + 7, 2, 4, accent);
                 canvas.fill_rounded_rect(ix + 7, iy + 5, 8, 8, 4, 0x1B222C);
             }
             AppId::Calc => {
@@ -887,17 +982,22 @@ impl Desktop {
                 canvas.fill_rect(ix + 5, iy + 3, 12, 4, accent);
                 canvas.fill_rect(ix + 5, iy + 9, 3, 3, 0xE6EDF3);
                 canvas.fill_rect(ix + 10, iy + 9, 3, 3, 0xE6EDF3);
-                canvas.fill_rect(ix + 14, iy + 9, 3, 7, 0xF59E0B);
+                canvas.fill_rect(ix + 5, iy + 14, 3, 3, 0xE6EDF3);
+                canvas.fill_rect(ix + 10, iy + 14, 3, 3, 0xE6EDF3);
+                canvas.fill_rect(ix + 14, iy + 9, 3, 8, 0xF59E0B);
             }
             AppId::Matrix => {
-                canvas.fill_rect(ix + 4, iy + 2, 2, 14, 0x2EA043);
-                canvas.fill_rect(ix + 10, iy + 5, 2, 12, 0x56D364);
-                canvas.fill_rect(ix + 16, iy + 1, 2, 11, 0xFFFFFF);
+                canvas.fill_rect(ix + 4, iy + 2, 2, 13, 0x2EA043);
+                canvas.fill_rect(ix + 4, iy + 15, 2, 2, 0xBBF7D0);
+                canvas.fill_rect(ix + 10, iy + 4, 2, 11, 0x56D364);
+                canvas.fill_rect(ix + 10, iy + 15, 2, 2, 0xFFFFFF);
+                canvas.fill_rect(ix + 16, iy + 1, 2, 10, 0x3FB950);
+                canvas.fill_rect(ix + 16, iy + 11, 2, 2, 0xFFFFFF);
             }
             _ => {}
         }
 
-        canvas.draw_text_clipped(x + 3, y + 43, 76, label, 0x090C10, 1);
+        canvas.draw_text_clipped(x + 3, y + 43, 76, label, 0x05080D, 1);
         canvas.draw_text_clipped(x + 2, y + 42, 76, label, 0xF0F6FC, 1);
     }
 
@@ -906,25 +1006,55 @@ impl Desktop {
         let accent = self.settings.theme.accent();
 
         canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 8);
-        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 8, 0x161B22);
-        let border = if focused { accent } else { 0x30363D };
+        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 8, 0x151B23);
+        let border = if focused {
+            lerp_rgb(accent, 0xFFFFFF, 45, 255)
+        } else {
+            0x2C3542
+        };
         canvas.draw_rounded_rect(win.x, win.y, win.w, win.h, 8, border);
 
-        let title_bg = if focused { accent } else { 0x21262D };
-        canvas.fill_rounded_rect(win.x + 2, win.y + 2, win.w - 4, 24, 6, title_bg);
+        let (tb_left, tb_right) = if focused {
+            (lerp_rgb(accent, 0x0D1117, 50, 255), accent)
+        } else {
+            (0x212731, 0x191E26)
+        };
+        canvas.fill_hgradient_rounded_rect(win.x + 2, win.y + 2, win.w - 4, 24, 6, tb_left, tb_right);
+        canvas.blend_rect(win.x + 8, win.y + 3, win.w - 16, 1, 0xFFFFFF, if focused { 52 } else { 22 });
+        canvas.fill_rounded_rect(win.x + 10, win.y + 10, 7, 7, 3, win.id.color());
         canvas.draw_text_clipped(
-            win.x + 12,
+            win.x + 22,
             win.y + 8,
-            win.w - 92,
+            win.w - 102,
             win.id.title(lang),
-            0xFFFFFF,
+            if focused { 0xFFFFFF } else { 0x9CA3AF },
             1,
         );
 
-        // Minimize [_], Maximize [□], Close [×]
-        canvas.draw_button(win.x + win.w - 72, win.y + 5, 20, 18, "_", 0x21262D, 0xFFFFFF, 0x484F58);
-        canvas.draw_button(win.x + win.w - 49, win.y + 5, 20, 18, "+", 0x21262D, 0xFFFFFF, 0x484F58);
-        canvas.draw_button(win.x + win.w - 26, win.y + 5, 20, 18, "×", 0xDA3633, 0xFFFFFF, 0xFF7B72);
+        // Minimize [_], Maximize [+], Close [×] with hover highlights
+        let btn_y = win.y + 5;
+        let hover_y = self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
+        let min_x = win.x + win.w - 72;
+        let max_x = win.x + win.w - 49;
+        let cls_x = win.x + win.w - 26;
+        let min_bg = if hover_y && (min_x..=min_x + 20).contains(&self.mouse_x) {
+            0x384252
+        } else {
+            0x21262D
+        };
+        let max_bg = if hover_y && (max_x..=max_x + 20).contains(&self.mouse_x) {
+            0x384252
+        } else {
+            0x21262D
+        };
+        let cls_bg = if hover_y && (cls_x..=cls_x + 20).contains(&self.mouse_x) {
+            0xF85149
+        } else {
+            0xDA3633
+        };
+        canvas.draw_button(min_x, btn_y, 20, 18, "_", min_bg, 0xFFFFFF, 0x484F58);
+        canvas.draw_button(max_x, btn_y, 20, 18, "+", max_bg, 0xFFFFFF, 0x484F58);
+        canvas.draw_button(cls_x, btn_y, 20, 18, "×", cls_bg, 0xFFFFFF, 0xFF7B72);
 
         match win.id {
             AppId::System => self.draw_system_contents(canvas, win),
@@ -980,14 +1110,33 @@ impl Desktop {
         let gx = x;
         let gy = y + 72;
         let gh = 42;
-        canvas.fill_rounded_rect(gx, gy, iw, gh, 4, 0x0D1117);
-        canvas.draw_rounded_rect(gx, gy, iw, gh, 4, 0x30363D);
+        canvas.fill_rounded_rect(gx, gy, iw, gh, 5, 0x0A0F16);
+        for pct_line in [1, 2, 3] {
+            let ly = gy + (gh * pct_line) / 4;
+            canvas.fill_rect(gx + 2, ly, iw - 4, 1, 0x1A222D);
+        }
+        canvas.draw_rounded_rect(gx, gy, iw, gh, 5, 0x30363D);
         let bar_w = (iw / 32).max(2);
         for (i, &val) in self.cpu_history.iter().enumerate() {
-            let bh = ((val as i32) * (gh - 6)) / 100;
+            let bh = (((val as i32) * (gh - 6)) / 100).max(2);
             let bx = gx + 2 + (i as i32) * bar_w;
             if bx + bar_w < gx + iw {
-                canvas.fill_rect(bx, gy + gh - 3 - bh, bar_w - 1, bh.max(1), 0x2EA043);
+                let (top_c, bot_c) = if val > 75 {
+                    (0xFF7B72, 0xB62324)
+                } else if val > 45 {
+                    (0xFBBF24, 0xD97706)
+                } else {
+                    (0x56D364, 0x1B4332)
+                };
+                canvas.fill_vgradient_rounded_rect(
+                    bx,
+                    gy + gh - 3 - bh,
+                    (bar_w - 1).max(1),
+                    bh,
+                    1,
+                    top_c,
+                    bot_c,
+                );
             }
         }
 
