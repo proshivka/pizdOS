@@ -31,7 +31,7 @@
 Наша философия простая:
 - **Чужие зависимости = чужие баги.** У нас багов нет — у нас только фичи.
 - **v1.0.0 (Bratukha Edition):** чистый 16-битный ассемблер x86, прямое общение с BIOS и железом, старт с загрузочного сектора за `0.0001` секунды.
-- **v2.0 (В разработке):** лёгкий GNU-free стек (`musl` + `BusyBox`), собственный бинарный формат пакетов `.piz` и пакетный менеджер **`piz-get`** на чистом Rust без единого стороннего крейта.
+- **v2.0 (Alpine GNU-Free Edition):** лёгкий GNU-free стек (`musl` + `BusyBox`), собственный бинарный формат пакетов `.piz` и пакетный менеджер **`piz-get`** на чистом Rust без единого стороннего крейта.
 
 ---
 
@@ -42,6 +42,10 @@ pizdOS/
 ├── src/
 │   ├── bootloader.asm   # 512-байтный MBR-загрузчик (читает ядро через int 13h)
 │   └── kernel.asm       # 16-битное ядро, шелл, матрица, CMOS RTC, PC Speaker, BSOD
+├── os2/
+│   └── overlay/         # Системный оверлей pizdOS 2.0 (MOTD, inittab, сеть udhcpc, /bin команды)
+├── scripts/
+│   └── build_iso.sh     # Скрипт сборки загрузочного Live ISO (Alpine minirootfs + piz-get)
 ├── piz-get/
 │   ├── Cargo.toml       # [dependencies] абсолютно пустой
 │   └── src/
@@ -50,8 +54,9 @@ pizdOS/
 │       ├── db.rs        # Индекс репозитория (index.db) и база установленного (installed.db)
 │       ├── net.rs       # Локальные/file:// репо, HTTP/1.1 на голом TcpStream и HTTPS
 │       └── sha256.rs    # Свой SHA-256 с нуля на чистом std
-├── Makefile             # Сборка образа pizdos.img и запуск в QEMU
-├── run.bat              # Быстрый запуск через WSL на Windows
+├── Makefile             # Сборка pizdos.img, сборка ISO и запуск в QEMU
+├── run.bat              # Запуск pizdOS 1.0 (ASM) через WSL на Windows
+├── run2.bat             # Запуск pizdOS 2.0 (Alpine Live ISO) через WSL на Windows
 └── LICENSE              # MIT License
 ```
 
@@ -63,41 +68,30 @@ pizdOS/
 - **Настоящий MBR Bootloader (512 байт):** читает ядро напрямую с секторов диска через `int 13h` в `0x1000:0x0000`.
 - **Интерактивный шелл (`pizdOS>`):** ввод с клавиатуры через `int 16h`, Backspace, защита от переполнения буфера, эхо-вывод.
 - **Поддержка мастей (16 цветов VGA):** меняй цвет текста под настроение командой `color` / `mast`.
+- **Настройка разрешения экрана (`res`):** переключение между 80x25, 80x50 и 80x28 строками.
 - **Матрица нахуй (`matrix` / `matrica`):** рандомизированный дождь из символов на портах таймера 8254 PIT.
 - **Экран критического пиздеца (`panic` / `pizdec`):** собственный аналог BSOD.
 - **Прямой опрос CMOS RTC (`time` / `vremya`):** реальное аппаратное время из чипа материнки.
 - **PC Speaker Synth (`beep` / `pikni`):** генерация звука через порт `0x61`.
 - **Жесткий аппаратный ребут (`reboot` / `vpizdu`):** сброс через контроллер клавиатуры 8042.
 
-### Команды шелла
+---
 
-| Команда (Eng) | По-пацански | Описание |
-| :--- | :--- | :--- |
-| `help` | `huelp` | Вывести список всех доступных команд |
-| `clear` | `nahuy` | Нахуй очистить весь экран |
-| `echo <текст>` | `pizdi <текст>` | Вывести введённый базар в консоль |
-| `info` | `poyasni` | Пояснить за систему и проверить размер RAM |
-| `time` | `vremya` | Показать точное аппаратное время из CMOS |
-| `beep` | `pikni` | Издать громкий писк через спикер |
-| `color <0-F>` | `mast <0-F>` | Сменить цвет шрифта (`1`=Синий, `2`=Зелёный, `4`=Красный, `E`=Жёлтый) |
-| `matrix` | `matrica` | Запустить бесконечную матрицу (выход — любая клавиша) |
-| `panic` | `pizdec` | Вызвать Kernel Panic / экран критического пиздеца |
-| `reboot` | `vpizdu` | Перезагрузить ПК через контроллер 8042 |
+## 🏔️ pizdOS 2.0 (Alpine GNU-Free Live Edition)
+
+### Особенности редакции
+- **100% GNU-free:** Ядро Linux + `musl libc` + `BusyBox`. Никакого glibc и coreutils.
+- **Вшитый пакетный менеджер `piz-get`:** скомпилирован статически под `x86_64-unknown-linux-musl`, лежит в `/usr/bin/piz-get`.
+- **Автоматическая сеть:** фоновый `udhcpc` поднимает сетевой интерфейс по DHCP.
+- **Автологин:** мгновенный вход под пользователем `root` без ввода паролей.
+- **Пацанские бинарники в `/bin`:** `nahuy` (clear), `vpizdu` (poweroff), `poyasni` (pizfetch), `ebash` (piz-get install), `snosi` (piz-get remove), `obnovi` (piz-get update).
+- **Информатор `pizfetch`:** отображение системных характеристик и ASCII-баннера.
 
 ---
 
 ## 📦 Пакетный менеджер `piz-get` (Pure Rust, 0 Dependencies)
 
 `piz-get` — штатный пакетный менеджер для **pizdOS 2.0**. Написан полностью на `std`: **никаких `serde`, `reqwest`, `tar`, `sha2` и прочего стороннего хлама**.
-
-### Что умеет из коробки
-- **Свой бинарный формат `.piz` (`PIZ1`):** хранит манифест (`piz.manifest`), права доступа Unix и файлы с проверкой путей (блокирует `..` и абсолютные пути).
-- **Свой SHA-256:** каждый скачанный пакет проверяется по контрольной сумме перед распаковкой.
-- **Граф зависимостей:** автоматический резолв зависимостей при установке, детекция циклов и защита от сноса нужных другим пакетам библиотек (если не указан `--force`).
-- **Транспорт без крейтов:** локальные директории и `file://`, чистый **HTTP/1.1** поверх `std::net::TcpStream` (включая `chunked` и редиректы) + фолбэк на `wget`/`curl` для `https://`.
-- **Чистое удаление:** `installed.db` помнит каждый файл пакета и подчищает пустые директории при удалении.
-
-### Команды `piz-get`
 
 | Команда (Eng) | По-пацански | Что делает |
 | :--- | :--- | :--- |
@@ -111,76 +105,32 @@ pizdOS/
 | `pack <dir> [out]` | `pakuy` | Упаковать директорию с `piz.manifest` в `.piz` архив |
 | `index <dir>` | — | Сгенерировать `index.db` для папки с `.piz` пакетами |
 
-### Пример: собрать свой `.piz` пакет и поднять локальный репо
-
-```bash
-# 1. Собрать piz-get в release (оптимизирован по размеру)
-cd piz-get
-cargo build --release
-
-# 2. Создать структуру пакета
-mkdir -p mypkg/usr/bin
-cat << 'EOF' > mypkg/piz.manifest
-name=pizfetch
-version=0.1.0
-arch=x86_64
-desc=Show pizdOS system info
-depends=
-EOF
-echo -e '#!/bin/sh\necho "pizdOS 2.0!"' > mypkg/usr/bin/pizfetch
-chmod +x mypkg/usr/bin/pizfetch
-
-# 3. Запаковать и проиндексировать репозиторий
-mkdir -p repo rootfs
-./target/release/piz-get pack mypkg repo/pizfetch-0.1.0-x86_64.piz
-./target/release/piz-get index repo
-
-# 4. Обновить индекс и поставить пакет в rootfs
-./target/release/piz-get --root rootfs --repo repo update
-./target/release/piz-get --root rootfs --repo repo stav pizfetch
-```
-
 ---
 
 ## 🚀 Запуск и сборка
 
-### 1. Сборка и запуск ОС (pizdOS 1.0.0)
-Требуются `nasm`, `qemu-system-x86_64`, `make`.
-
-**На Windows (через WSL):**
-```cmd
-run.bat
-```
-
-**В терминале / Linux / WSL:**
+### 1. pizdOS 1.0 (16-bit ASM)
 ```bash
-# Собрать образ build/pizdos.img
-make all
-
-# Запустить в QEMU
-make run
-
-# Запустить прямо в терминале (curses)
-make run-curses
+make all        # Собрать образ build/pizdos.img
+make run        # Запустить в QEMU
 ```
+Или на Windows: `run.bat`
 
-### 2. Сборка и тесты `piz-get`
-Требуется только Rust (`rustc` / `cargo`).
-
+### 2. pizdOS 2.0 (Alpine Live ISO)
 ```bash
-cd piz-get
-cargo test
-cargo build --release
+make os2-iso    # Собрать образ build/pizdos2.iso
+make run-os2    # Запустить pizdOS 2.0 в QEMU
 ```
+Или на Windows: `run2.bat`
 
 ---
 
-## 🗺️ Roadmap: pizdOS 2.0 (PDOS 2)
+## 👥 Команда разработчиков (Pizsoft)
 
-- [x] 📦 Кастомный пакетный менеджер **`piz-get`** (pure Rust, 0 dependencies, формат `.piz`, SHA-256, резолв зависимостей).
-- [ ] 🏔️ Базирование на **Alpine Linux** (чистый **GNU-free** стек: `musl` + `BusyBox`).
-- [ ] ⚡ Легковесный Live-образ / дистрибутив с предустановленным `piz-get`.
-- [ ] 🖼️ Интеграция **Pizsoft UI**.
+- **proshivka** — идеолог, лид, низкоуровневая архитектура
+- **Lowyk** — автор пакетного менеджера `piz-get` на чистом Rust
+- **KiryxaTipa** — архитектор, разработка системных компонентов
+- **Antigravity AI** — ИИ-соавтор и вайбкодер на подхвате
 
 ---
 
