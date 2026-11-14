@@ -1,6 +1,7 @@
 mod apps;
 mod config;
 mod desktop;
+mod display_srv;
 mod font;
 mod gfx;
 mod platform;
@@ -897,5 +898,196 @@ mod tests {
         assert!(!desktop.settings.macos_buttons);
         assert_eq!(desktop.settings.theme, apps::ThemePreset::AuroraPeaks);
         desktop.render(&mut canvas);
+    }
+
+    #[test]
+    fn test_x11_display_server_guest_wm_and_files_icon() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut canvas = Canvas::new(1160, 720);
+        let mut desktop = Desktop::new(1160, 720);
+        assert_eq!(desktop.icon_hover.len(), 12);
+
+        // Minimize all open windows and test clicking the new desktop "Файлы / Files" icon
+        for w in &mut desktop.windows {
+            w.open = false;
+        }
+        desktop.on_mouse_down(102 + 20, 402 + 20, 1160, 720);
+        desktop.on_mouse_up();
+        assert_eq!(desktop.windows.last().unwrap().id, desktop::AppId::Files);
+        assert!(desktop.windows.last().unwrap().open);
+
+        // Verify x11demo builtin & autocomplete in Terminal
+        desktop.terminal.input = String::from("x11d");
+        desktop.terminal.on_key(apps::KeyEvent::Tab, &desktop.kernel, &desktop.mem);
+        assert_eq!(desktop.terminal.input, "x11demo");
+        let act = desktop.terminal.on_key(apps::KeyEvent::Enter, &desktop.kernel, &desktop.mem);
+        assert!(matches!(act, apps::TermAction::LaunchX11Demo));
+
+        // Start real loopback X11 TCP server and attach it to Desktop
+        let srv = display_srv::DisplayServer::new_tcp_test(0).expect("bind test x11 tcp");
+        let port = srv.tcp_port.expect("x11 tcp port");
+        desktop.display_srv = srv;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect x11");
+        stream.set_nonblocking(true).unwrap();
+
+        // X11 setup handshake (LSB first, protocol 11.0)
+        let mut setup = [0u8; 12];
+        setup[0] = b'l';
+        setup[2..4].copy_from_slice(&11u16.to_le_bytes());
+        stream.write_all(&setup).unwrap();
+
+        let mut setup_rep = vec![0u8; 256];
+        let mut got_setup = 0usize;
+        for _ in 0..40 {
+            desktop.poll_display_server();
+            if let Ok(n) = stream.read(&mut setup_rep[got_setup..]) {
+                got_setup += n;
+                if got_setup >= 140 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_setup >= 32, "expected X11 setup reply");
+        assert_eq!(setup_rep[0], 1, "expected X11 Setup Success");
+
+        let wid: u32 = 0x0040_0001;
+        let gc: u32 = 0x0040_0002;
+        let root = u32::from_le_bytes(setup_rep[68..72].try_into().unwrap());
+        assert_eq!(root, 0x0000_0100);
+
+        // CreateWindow (wid, 160x120)
+        let mut cw = [0u8; 32];
+        cw[0] = 1;
+        cw[1] = 24;
+        cw[2..4].copy_from_slice(&8u16.to_le_bytes());
+        cw[4..8].copy_from_slice(&wid.to_le_bytes());
+        cw[8..12].copy_from_slice(&root.to_le_bytes());
+        cw[16..18].copy_from_slice(&160u16.to_le_bytes());
+        cw[18..20].copy_from_slice(&120u16.to_le_bytes());
+        cw[24..26].copy_from_slice(&1u16.to_le_bytes());
+        stream.write_all(&cw).unwrap();
+
+        // ChangeProperty WM_NAME = "TestX11Win"
+        let title = b"TestX11Win";
+        let words = 6 + title.len().div_ceil(4);
+        let mut cp = vec![0u8; words * 4];
+        cp[0] = 18;
+        cp[2..4].copy_from_slice(&(words as u16).to_le_bytes());
+        cp[4..8].copy_from_slice(&wid.to_le_bytes());
+        cp[8..12].copy_from_slice(&39u32.to_le_bytes());
+        cp[12..16].copy_from_slice(&31u32.to_le_bytes());
+        cp[16] = 8;
+        cp[20..24].copy_from_slice(&(title.len() as u32).to_le_bytes());
+        cp[24..24 + title.len()].copy_from_slice(title);
+        stream.write_all(&cp).unwrap();
+
+        // CreateGC
+        let mut cg = [0u8; 16];
+        cg[0] = 55;
+        cg[2..4].copy_from_slice(&4u16.to_le_bytes());
+        cg[4..8].copy_from_slice(&gc.to_le_bytes());
+        cg[8..12].copy_from_slice(&wid.to_le_bytes());
+        stream.write_all(&cg).unwrap();
+
+        // ChangeGC Foreground = 0x0038BDF8
+        let mut chg = [0u8; 16];
+        chg[0] = 56;
+        chg[2..4].copy_from_slice(&4u16.to_le_bytes());
+        chg[4..8].copy_from_slice(&gc.to_le_bytes());
+        chg[8..12].copy_from_slice(&4u32.to_le_bytes());
+        chg[12..16].copy_from_slice(&0x0038_BDF8u32.to_le_bytes());
+        stream.write_all(&chg).unwrap();
+
+        // MapWindow
+        let mut mw = [0u8; 8];
+        mw[0] = 8;
+        mw[2..4].copy_from_slice(&2u16.to_le_bytes());
+        mw[4..8].copy_from_slice(&wid.to_le_bytes());
+        stream.write_all(&mw).unwrap();
+
+        // PolyFillRectangle (10,10,40,30)
+        let mut pfr = [0u8; 20];
+        pfr[0] = 70;
+        pfr[2..4].copy_from_slice(&5u16.to_le_bytes());
+        pfr[4..8].copy_from_slice(&wid.to_le_bytes());
+        pfr[8..12].copy_from_slice(&gc.to_le_bytes());
+        pfr[12..14].copy_from_slice(&10u16.to_le_bytes());
+        pfr[14..16].copy_from_slice(&10u16.to_le_bytes());
+        pfr[16..18].copy_from_slice(&40u16.to_le_bytes());
+        pfr[18..20].copy_from_slice(&30u16.to_le_bytes());
+        stream.write_all(&pfr).unwrap();
+
+        // PutImage ZPixmap 2x2 at (2, 2) with pixel 0x00FF00AA
+        let mut pi = vec![0u8; 24 + 16];
+        pi[0] = 72;
+        pi[1] = 2; // ZPixmap
+        pi[2..4].copy_from_slice(&10u16.to_le_bytes());
+        pi[4..8].copy_from_slice(&wid.to_le_bytes());
+        pi[8..12].copy_from_slice(&gc.to_le_bytes());
+        pi[12..14].copy_from_slice(&2u16.to_le_bytes());
+        pi[14..16].copy_from_slice(&2u16.to_le_bytes());
+        pi[16..18].copy_from_slice(&2u16.to_le_bytes());
+        pi[18..20].copy_from_slice(&2u16.to_le_bytes());
+        pi[21] = 24;
+        for chunk in pi[24..].as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0x00FF_00AAu32.to_le_bytes());
+        }
+        stream.write_all(&pi).unwrap();
+
+        let mut gid = None;
+        for _ in 0..40 {
+            desktop.poll_display_server();
+            if let Some(w) = desktop.windows.iter().find(|w| matches!(w.id, desktop::AppId::Guest(_))) {
+                gid = Some(w.id);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let guest_id = gid.expect("Guest window should map into Desktop WM");
+        assert_eq!(desktop.win_title(guest_id), "TestX11Win");
+        let desktop::AppId::Guest(raw_gid) = guest_id else {
+            unreachable!();
+        };
+        let surf = desktop.display_srv.window(raw_gid).expect("guest surface");
+        assert_eq!(surf.pixels[2 * 160 + 2], 0x00FF_00AA);
+        assert_eq!(surf.pixels[12 * 160 + 12], 0x0038_BDF8);
+        desktop.render(&mut canvas);
+
+        // Drain Expose event then test pointer click + close [×] -> WM_DELETE_WINDOW
+        let mut ev = [0u8; 256];
+        let mut seen_expose = false;
+        for _ in 0..10 {
+            if let Ok(n) = stream.read(&mut ev)
+                && ev[..n].as_chunks::<32>().0.iter().any(|e| e[0] == 12)
+            {
+                seen_expose = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(seen_expose, "expected X11 Expose event");
+
+        let gw = desktop.windows.iter().find(|w| w.id == guest_id).unwrap().clone();
+        desktop.on_mouse_down(gw.x + gw.w - 16, gw.y + 12, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(!desktop.windows.iter().any(|w| w.id == guest_id));
+
+        let mut seen_delete = false;
+        for _ in 0..20 {
+            desktop.poll_display_server();
+            if let Ok(n) = stream.read(&mut ev)
+                && ev[..n].as_chunks::<32>().0.iter().any(|e| e[0] == 33)
+            {
+                seen_delete = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(seen_delete, "expected WM_DELETE_WINDOW ClientMessage");
     }
 }

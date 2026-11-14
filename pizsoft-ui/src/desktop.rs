@@ -9,6 +9,7 @@ use crate::apps::{
     PaintAction, PaintState, PizViewState, SettingsAction, SettingsState, SnakeEvent, SnakeState,
     TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
 };
+use crate::display_srv::{DisplayServer, GuestProto};
 use crate::gfx::Canvas;
 use crate::sys::{
     CpuSample, MemInfo, PkgSummary, ProcInfo, list_processes, load_packages, read_cpu_sample,
@@ -30,6 +31,7 @@ pub enum AppId {
     Game2048,
     PizView,
     Minesweeper,
+    Guest(u32),
 }
 
 impl AppId {
@@ -60,6 +62,7 @@ impl AppId {
             (AppId::PizView, Lang::En) => "PizView",
             (AppId::Minesweeper, Lang::Ru) => "Сапёр",
             (AppId::Minesweeper, Lang::En) => "Sweeper",
+            (AppId::Guest(_), _) => "X11 / Wayland",
         }
     }
 
@@ -78,6 +81,7 @@ impl AppId {
             AppId::Game2048 => 0xF59E0B,
             AppId::PizView => 0x06B6D4,
             AppId::Minesweeper => 0xF43F5E,
+            AppId::Guest(_) => 0x0EA5E9,
         }
     }
 
@@ -267,7 +271,7 @@ const START_ITEMS: [Option<AppId>; 14] = [
     None,
 ];
 
-const DESKTOP_ICONS: [(AppId, i32, i32, u32); 11] = [
+const DESKTOP_ICONS: [(AppId, i32, i32, u32); 12] = [
     (AppId::Terminal, 18, 42, 0x3FB950),
     (AppId::PizGet, 18, 114, 0xD29922),
     (AppId::Paint, 18, 186, 0xBC8CFF),
@@ -279,6 +283,7 @@ const DESKTOP_ICONS: [(AppId, i32, i32, u32); 11] = [
     (AppId::Game2048, 102, 186, 0xF59E0B),
     (AppId::PizView, 102, 258, 0x06B6D4),
     (AppId::Minesweeper, 102, 330, 0xF43F5E),
+    (AppId::Files, 102, 402, 0x58A6FF),
 ];
 
 struct WallpaperCache {
@@ -344,7 +349,8 @@ pub struct Desktop {
     pub dock_float_anim: f32,
     pub dock_float_vel: f32,
     pub last_canvas_size: (i32, i32),
-    pub icon_hover: [f32; 11],
+    pub icon_hover: [f32; 12],
+    pub display_srv: DisplayServer,
     pub mouse_x: i32,
     pub mouse_y: i32,
     pub mouse_down: bool,
@@ -569,7 +575,12 @@ impl Desktop {
             dock_float_anim: 0.0,
             dock_float_vel: 0.0,
             last_canvas_size: (width.max(320), height.max(240)),
-            icon_hover: [0.0; 11],
+            icon_hover: [0.0; 12],
+            display_srv: if cfg!(test) {
+                DisplayServer::disabled()
+            } else {
+                DisplayServer::start_live()
+            },
             mouse_x: width / 2,
             mouse_y: height / 2,
             mouse_down: false,
@@ -634,9 +645,49 @@ impl Desktop {
             sys.min_anim = 0.0;
         }
         d.snake.best_score = persisted.best_snake;
+        d.terminal.display_env = d.display_srv.runtime_env();
         d.reload_packages();
         d.reload_files();
         d
+    }
+
+    pub fn win_title(&self, id: AppId) -> String {
+        if let AppId::Guest(gid) = id
+            && let Some(surf) = self.display_srv.window(gid)
+        {
+            return surf.title.clone();
+        }
+        String::from(id.title(self.settings.lang))
+    }
+
+    pub fn poll_display_server(&mut self) {
+        let (mapped, unmapped) = self.display_srv.poll();
+        for gid in unmapped {
+            self.windows.retain(|w| w.id != AppId::Guest(gid));
+        }
+        let (cw, ch) = self.last_canvas_size;
+        for gid in mapped {
+            if self.windows.iter().any(|w| w.id == AppId::Guest(gid)) {
+                continue;
+            }
+            if let Some(surf) = self.display_srv.window(gid) {
+                let ww = (surf.w + 8).clamp(240, (cw - 32).max(240));
+                let wh = (surf.h + 36).clamp(180, (ch - 56).max(180));
+                let wx = 190 + ((gid as i32 * 28) % 120);
+                let wy = 56 + ((gid as i32 * 22) % 90);
+                let mut win = Window::new(AppId::Guest(gid), wx, wy, ww, wh, true);
+                win.workspace = self.active_workspace;
+                win.open_anim = if self.settings.animations { 0.0 } else { 1.0 };
+                win.sync_vis_rect();
+                let proto = match surf.proto {
+                    GuestProto::X11 => "X11",
+                    GuestProto::Wayland => "Wayland",
+                };
+                let title = surf.title.clone();
+                self.windows.push(win);
+                self.push_toast(format!("{proto}: {title}"), AppId::Guest(gid).color());
+            }
+        }
     }
 
     pub fn push_toast(&mut self, text: impl Into<String>, color: u32) {
@@ -1141,6 +1192,7 @@ impl Desktop {
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.poll_display_server();
         self.settings.step_anim();
         self.calc.step_anim();
 
@@ -1444,6 +1496,10 @@ impl Desktop {
             win.w = canvas_w;
             win.h = (canvas_h - reserve).max(160);
             win.maximized = true;
+        }
+        if let AppId::Guest(gid) = self.windows[idx].id {
+            let (gw, gh) = (self.windows[idx].w - 8, self.windows[idx].h - 36);
+            self.display_srv.resize_guest(gid, gw, gh);
         }
     }
 
@@ -1754,6 +1810,13 @@ impl Desktop {
                     self.rescale_viewport(old_scale, cw, ch);
                     crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
                 }
+                TermAction::LaunchX11Demo => {
+                    if !self.display_srv.spawn_x11_demo() {
+                        self.terminal.push_line(String::from("X11 TCP socket unavailable (disabled in test/occupied port)"));
+                    } else {
+                        self.push_toast("X11 Demo launching...", 0x0EA5E9);
+                    }
+                }
             },
             AppId::Snake => self.snake.on_key(key),
             AppId::Game2048 => self.game2048.on_key(key),
@@ -1771,6 +1834,14 @@ impl Desktop {
                 }
             }
             AppId::Settings => self.settings.on_key(key),
+            AppId::Guest(gid) => {
+                let ch = match key {
+                    KeyEvent::Char(c) => Some(c),
+                    _ => None,
+                };
+                self.display_srv.send_key(gid, ch, true);
+                self.display_srv.send_key(gid, ch, false);
+            }
             _ => {}
         }
     }
@@ -1844,8 +1915,7 @@ impl Desktop {
             return;
         }
 
-        if self.mouse_down
-            && !self.launcher_open
+        if !self.launcher_open
             && !self.cc_open
             && !self.start_menu_open
             && !self.cal_open
@@ -1854,10 +1924,20 @@ impl Desktop {
                 .iter()
                 .rev()
                 .find(|w| w.open && !w.minimized && w.workspace == self.active_workspace)
-            && top.id == AppId::Paint
+                .cloned()
         {
-            self.paint
-                .paint_at(self.mouse_x - top.x, self.mouse_y - top.y);
+            if self.mouse_down && top.id == AppId::Paint {
+                self.paint
+                    .paint_at(self.mouse_x - top.x, self.mouse_y - top.y);
+            } else if let AppId::Guest(gid) = top.id
+                && self.mouse_x >= top.x + 4
+                && self.mouse_x < top.x + top.w - 4
+                && self.mouse_y >= top.y + 32
+                && self.mouse_y < top.y + top.h - 4
+            {
+                self.display_srv
+                    .send_pointer(gid, self.mouse_x - top.x - 4, self.mouse_y - top.y - 32, None);
+            }
         }
     }
 
@@ -2284,7 +2364,12 @@ impl Desktop {
             if y >= win.y + 5 && y <= win.y + 23 {
                 if self.settings.macos_buttons {
                     if x >= win.x + 6 && x <= win.x + 20 {
-                        self.windows[top_idx].open = false;
+                        if let AppId::Guest(gid) = win.id {
+                            self.display_srv.close_guest(gid);
+                            self.windows.remove(top_idx);
+                        } else {
+                            self.windows[top_idx].open = false;
+                        }
                         self.dragging = None;
                         self.resizing = None;
                         return;
@@ -2304,7 +2389,12 @@ impl Desktop {
                 } else {
                     // Close [×]
                     if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 {
-                        self.windows[top_idx].open = false;
+                        if let AppId::Guest(gid) = win.id {
+                            self.display_srv.close_guest(gid);
+                            self.windows.remove(top_idx);
+                        } else {
+                            self.windows[top_idx].open = false;
+                        }
                         self.dragging = None;
                         self.resizing = None;
                         return;
@@ -2385,10 +2475,17 @@ impl Desktop {
 
     pub fn on_mouse_up(&mut self) {
         self.mouse_down = false;
-        self.resizing = None;
+        let ended_rz = self.resizing.take();
+        if let Some(rz) = ended_rz
+            && let AppId::Guest(gid) = rz.id
+            && let Some(win) = self.windows.iter().find(|w| w.id == AppId::Guest(gid))
+        {
+            self.display_srv.resize_guest(gid, win.w - 8, win.h - 36);
+        }
         self.paint.end_stroke();
 
-        if let Some((id, _, _)) = self.dragging.take()
+        let was_dragging = self.dragging.take();
+        if let Some((id, _, _)) = was_dragging
             && let Some(zone) = self.snap_zone.take()
         {
             let (cw, ch) = self.last_canvas_size;
@@ -2408,12 +2505,27 @@ impl Desktop {
                     win.sync_vis_rect();
                 }
             }
+            if let AppId::Guest(gid) = id {
+                self.display_srv.resize_guest(gid, sw - 8, sh - 36);
+            }
             let msg = match zone {
                 SnapZone::Left => tr(lang, "Приклеено влево", "Snapped Left"),
                 SnapZone::Right => tr(lang, "Приклеено вправо", "Snapped Right"),
                 SnapZone::Maximize => tr(lang, "Окно развернуто", "Window Maximized"),
             };
             self.push_toast(msg, accent);
+        } else if was_dragging.is_none()
+            && ended_rz.is_none()
+            && let Some(top) = self.windows.iter().rfind(|w| w.open && !w.minimized && w.workspace == self.active_workspace)
+            && let AppId::Guest(gid) = top.id
+            && self.mouse_x >= top.x + 4
+            && self.mouse_x < top.x + top.w - 4
+            && self.mouse_y >= top.y + 32
+            && self.mouse_y < top.y + top.h - 4
+        {
+            let gx = self.mouse_x - (top.x + 4);
+            let gy = self.mouse_y - (top.y + 32);
+            self.display_srv.send_pointer(gid, gx, gy, Some((1, false)));
         }
         self.snap_zone = None;
     }
@@ -2557,6 +2669,7 @@ impl Desktop {
             }
             AppId::PizView => self.pizview.on_click(lx, ly, win.h),
             AppId::Minesweeper => self.minesweeper.on_click(lx, ly, win.w, win.h, false),
+            AppId::Guest(gid) => self.display_srv.send_pointer(gid, lx - 4, ly - 32, Some((1, true))),
             AppId::Paint => match self.paint.on_click(lx, ly, win.h) {
                 PaintAction::None => {}
                 PaintAction::Saved(path) => {
@@ -2926,11 +3039,12 @@ impl Desktop {
             } else {
                 0xCBD5E1
             };
+            let title = self.win_title(win.id);
             if pill_w > 34 {
                 canvas.fill_aa_circle((bx + 11) as f32, (task_y + 18) as f32, 2.5, win.id.color(), 255);
-                canvas.draw_text_clipped(bx + 19, task_y + 11, pill_w - 24, win.id.title(lang), fg, 1);
+                canvas.draw_text_clipped(bx + 19, task_y + 11, pill_w - 24, &title, fg, 1);
             } else {
-                canvas.draw_text_clipped(bx + 5, task_y + 11, pill_w - 8, win.id.title(lang), fg, 1);
+                canvas.draw_text_clipped(bx + 5, task_y + 11, pill_w - 8, &title, fg, 1);
             }
             if is_top {
                 canvas.fill_rounded_rect(bx + 14, task_y + 27, (pill_w - 28).max(8), 2, 1, accent);
@@ -3752,11 +3866,12 @@ impl Desktop {
                 canvas.draw_rounded_rect_alpha(cx, cy, cw, 68, 11, 0xFFFFFF, 26);
             }
             canvas.fill_aa_circle((cx + cw / 2) as f32, (cy + 24) as f32, 11.0, id.color(), 215);
+            let title = self.win_title(id);
             canvas.draw_text_clipped(
                 cx + 6,
                 cy + 46,
                 cw - 12,
-                id.title(lang),
+                &title,
                 if sel { 0xFFFFFF } else { 0xCBD5E1 },
                 1,
             );
@@ -4118,11 +4233,12 @@ impl Desktop {
             canvas.fill_aa_circle((win.x + 13) as f32, cy as f32, 5.2, 0xFF5F57, 255);
             canvas.fill_aa_circle((win.x + 31) as f32, cy as f32, 5.2, 0xFEBC2E, 255);
             canvas.fill_aa_circle((win.x + 49) as f32, cy as f32, 5.2, 0x28C840, 255);
+            let title = self.win_title(win.id);
             canvas.draw_text_clipped(
                 win.x + 66,
                 win.y + 7,
                 (win.w - 80).max(40),
-                win.id.title(lang),
+                &title,
                 if focused { 0xF1F5F9 } else { 0x7D8590 },
                 1,
             );
@@ -4134,11 +4250,12 @@ impl Desktop {
                 win.id.color(),
                 if focused { 245 } else { 125 },
             );
+            let title = self.win_title(win.id);
             canvas.draw_text_clipped(
                 win.x + 24,
                 win.y + 7,
                 win.w - 106,
-                win.id.title(lang),
+                &title,
                 if focused { 0xF1F5F9 } else { 0x7D8590 },
                 1,
             );
@@ -4190,6 +4307,7 @@ impl Desktop {
             AppId::PizView => self.pizview.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Minesweeper => self.minesweeper.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
+            AppId::Guest(gid) => self.draw_guest_contents(canvas, win, gid, accent),
             AppId::Settings => self.settings.draw(
                 canvas,
                 win.x,
@@ -4222,6 +4340,59 @@ impl Desktop {
             let gy = (win.y + win.h - 4) as f32;
             canvas.draw_aa_line(gx - 7.0, gy, gx, gy - 7.0, 1.1, 0xCBD5E1, ga);
             canvas.draw_aa_line(gx - 3.5, gy, gx, gy - 3.5, 1.1, 0xCBD5E1, ga);
+        }
+    }
+
+    fn draw_guest_contents(&self, canvas: &mut Canvas, win: &Window, gid: u32, accent: u32) {
+        let lang = self.settings.lang;
+        let cx = win.x + 4;
+        let cy = win.y + 32;
+        let cw = (win.w - 8).max(1);
+        let ch = (win.h - 36).max(1);
+        canvas.fill_rect(cx, cy, cw, ch, 0x090D16);
+        let Some(surf) = self.display_srv.window(gid) else {
+            canvas.draw_text_clipped(
+                cx + 12,
+                cy + 12,
+                cw - 24,
+                tr(lang, "Ожидание кадра...", "Waiting for frame..."),
+                0x94A3B8,
+                1,
+            );
+            return;
+        };
+        let bw = cw.min(surf.w).max(0);
+        let bh = ch.min(surf.h).max(0);
+        if bw > 0 && bh > 0 && !surf.pixels.is_empty() {
+            if bw == surf.w {
+                canvas.blit_rgb_rect(cx, cy, bw, bh, &surf.pixels);
+            } else {
+                let sw = surf.w.max(1) as usize;
+                for row in 0..bh as usize {
+                    let off = row * sw;
+                    if off + bw as usize <= surf.pixels.len() {
+                        canvas.blit_rgb_rect(
+                            cx,
+                            cy + row as i32,
+                            bw,
+                            1,
+                            &surf.pixels[off..off + bw as usize],
+                        );
+                    }
+                }
+            }
+        }
+        let tag = match surf.proto {
+            GuestProto::X11 => "X11",
+            GuestProto::Wayland => "Wayland",
+        };
+        let badge_w = canvas.measure_text(tag, 1) + 12;
+        let bx = cx + cw - badge_w - 6;
+        let by = cy + 6;
+        if cw > badge_w + 20 && ch > 28 {
+            canvas.blend_rounded_rect(bx, by, badge_w, 16, 6, 0x0F172A, 190);
+            canvas.draw_rounded_rect_alpha(bx, by, badge_w, 16, 6, accent, 150);
+            canvas.draw_text_clipped(bx + 6, by + 2, badge_w - 8, tag, accent, 1);
         }
     }
 

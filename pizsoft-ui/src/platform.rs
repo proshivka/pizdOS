@@ -125,6 +125,7 @@ mod linux_fb {
     }
 
     #[repr(C)]
+    #[derive(Default)]
     struct FbVarScreenInfo {
         xres: u32,
         yres: u32,
@@ -139,26 +140,6 @@ mod linux_fb {
         blue: FbBitfield,
         transp: FbBitfield,
         _rest: [u32; 20],
-    }
-
-    impl Default for FbVarScreenInfo {
-        fn default() -> Self {
-            Self {
-                xres: 0,
-                yres: 0,
-                xres_virtual: 0,
-                yres_virtual: 0,
-                xoffset: 0,
-                yoffset: 0,
-                bits_per_pixel: 0,
-                grayscale: 0,
-                red: FbBitfield::default(),
-                green: FbBitfield::default(),
-                blue: FbBitfield::default(),
-                transp: FbBitfield::default(),
-                _rest: [0; 20],
-            }
-        }
     }
 
     #[repr(C)]
@@ -420,11 +401,12 @@ mod linux_fb {
     }
 
     pub fn run_linux_fb() -> io::Result<()> {
-        let mut fb = OpenOptions::new().read(true).write(true).open("/dev/fb0")?;
+        let fb_path = std::env::var("PIZSOFT_FB").unwrap_or_else(|_| String::from("/dev/fb0"));
+        let mut fb = OpenOptions::new().read(true).write(true).open(&fb_path)?;
         let mut vinfo = FbVarScreenInfo::default();
         let rc = unsafe { ioctl(fb.as_raw_fd(), FBIOGET_VSCREENINFO, &mut vinfo) };
         if rc < 0 || vinfo.xres == 0 || vinfo.yres == 0 {
-            return Err(io::Error::other("FBIOGET_VSCREENINFO failed on /dev/fb0"));
+            return Err(io::Error::other(format!("FBIOGET_VSCREENINFO failed on {fb_path}")));
         }
         let mut finfo = FbFixScreenInfo::default();
         let frc = unsafe { ioctl(fb.as_raw_fd(), FBIOGET_FSCREENINFO, &mut finfo) };
@@ -502,9 +484,11 @@ mod linux_fb {
                                         desktop.on_right_click(abs_norm_x, abs_norm_y, log_w, log_h);
                                     }
                                     _ if down => {
-                                        if let Some(kev) = map_evdev_key(ev.code, &mods) {
-                                            if kev == KeyEvent::Escape && !desktop.on_escape() {
-                                                desktop.running = false;
+                                        if mods.ctrl && mods.alt && ev.code == 14 {
+                                            desktop.running = false;
+                                        } else if let Some(kev) = map_evdev_key(ev.code, &mods) {
+                                            if kev == KeyEvent::Escape {
+                                                let _ = desktop.on_escape();
                                             } else {
                                                 desktop.on_key(kev);
                                             }
@@ -524,7 +508,7 @@ mod linux_fb {
                                         let span = (max - min).max(1) as i64;
                                         abs_norm_x = ((((ev.value - min) as i64) * log_w as i64)
                                             / span)
-                                            .clamp(0, log_w - 1) as i32;
+                                            .clamp(0, (log_w - 1) as i64) as i32;
                                         moved_abs = true;
                                     }
                                 }
@@ -533,22 +517,20 @@ mod linux_fb {
                                         let span = (max - min).max(1) as i64;
                                         abs_norm_y = ((((ev.value - min) as i64) * log_h as i64)
                                             / span)
-                                            .clamp(0, log_h - 1) as i32;
+                                            .clamp(0, (log_h - 1) as i64) as i32;
                                         moved_abs = true;
                                     }
                                 }
                                 _ => {}
                             },
-                            EV_SYN => {
-                                if moved_abs || moved_rel != (0, 0) {
-                                    if !moved_abs {
-                                        abs_norm_x = (desktop.mouse_x + moved_rel.0).clamp(0, log_w - 1);
-                                        abs_norm_y = (desktop.mouse_y + moved_rel.1).clamp(0, log_h - 1);
-                                    }
-                                    desktop.on_mouse_move(abs_norm_x, abs_norm_y, log_w, log_h);
-                                    moved_rel = (0, 0);
-                                    moved_abs = false;
+                            EV_SYN if moved_abs || moved_rel != (0, 0) => {
+                                if !moved_abs {
+                                    abs_norm_x = (desktop.mouse_x + moved_rel.0).clamp(0, log_w - 1);
+                                    abs_norm_y = (desktop.mouse_y + moved_rel.1).clamp(0, log_h - 1);
                                 }
+                                desktop.on_mouse_move(abs_norm_x, abs_norm_y, log_w, log_h);
+                                moved_rel = (0, 0);
+                                moved_abs = false;
                             }
                             _ => {}
                         }
@@ -588,9 +570,11 @@ mod linux_fb {
                 }
             }
 
-            // 3. Stdin non-blocking ANSI keyboard fallback (if no evdev keyboard present)
+            // 3. Stdin non-blocking ANSI keyboard fallback (when no evdev devices are open)
             let mut kbuf = [0u8; 32];
-            if let Ok(kn) = stdin.read(&mut kbuf) {
+            if evdevs.is_empty()
+                && let Ok(kn) = stdin.read(&mut kbuf)
+            {
                 let mut i = 0;
                 while i < kn {
                     let b = kbuf[i];
@@ -609,9 +593,7 @@ mod linux_fb {
                                 continue;
                             }
                         }
-                        if !desktop.on_escape() {
-                            desktop.running = false;
-                        }
+                        let _ = desktop.on_escape();
                     } else if b == b'\r' || b == b'\n' {
                         desktop.on_key(KeyEvent::Enter);
                     } else if b == 0x7F || b == 0x08 {

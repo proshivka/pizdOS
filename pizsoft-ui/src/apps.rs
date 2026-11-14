@@ -53,6 +53,7 @@ pub enum TermAction {
     None,
     SetTheme(u8),
     SetScale(u16),
+    LaunchX11Demo,
 }
 
 pub struct TerminalState {
@@ -61,6 +62,7 @@ pub struct TerminalState {
     pub history: Vec<String>,
     pub hist_idx: Option<usize>,
     pub cwd: PathBuf,
+    pub display_env: Vec<(&'static str, String)>,
 }
 
 impl TerminalState {
@@ -75,14 +77,15 @@ impl TerminalState {
                 )),
                 String::from(tr(
                     lang,
-                    "Введи 'help', 'pizfetch' или любую команду (Up/Down/Tab):",
-                    "Type 'help', 'pizfetch' or any command (Up/Down/Tab):",
+                    "Введи 'help', 'pizfetch', 'x11demo' или любую команду (Up/Down/Tab):",
+                    "Type 'help', 'pizfetch', 'x11demo' or any command (Up/Down/Tab):",
                 )),
             ],
             input: String::new(),
             history: Vec::new(),
             hist_idx: None,
             cwd,
+            display_env: Vec::new(),
         }
     }
 
@@ -160,7 +163,7 @@ impl TerminalState {
     fn autocomplete(&mut self) {
         let builtins = [
             "help", "pizfetch", "poyasni", "clear", "nahuy", "whoami", "pwd", "ls", "cd", "cat",
-            "theme", "scale",
+            "theme", "scale", "x11demo",
         ];
         if let Some(space) = self.input.rfind(' ') {
             let prefix = &self.input[space + 1..];
@@ -194,8 +197,12 @@ impl TerminalState {
 
         match head {
             "help" | "huelp" => {
-                self.push_line(String::from("help, pizfetch, poyasni, clear/nahuy, pwd, ls, cd, cat"));
-                self.push_line(String::from("theme <0-3>, scale <100|125|150|175>, whoami, <shell>"));
+                self.push_line(String::from("help, pizfetch, x11demo, clear/nahuy, pwd, ls, cd, cat"));
+                self.push_line(String::from("theme <0-3>, scale <100|125|150|175>, <cmd &>, whoami"));
+            }
+            "x11demo" => {
+                self.push_line(String::from("Launching live MIT X11 wire client..."));
+                return TermAction::LaunchX11Demo;
             }
             "clear" | "nahuy" | "cls" => {
                 self.lines.clear();
@@ -282,25 +289,46 @@ impl TerminalState {
                 self.push_line(String::from("usage: scale <100|125|150|175>"));
             }
             _ => {
+                let bg = cmd.ends_with('&');
+                let clean = cmd.trim_end_matches('&').trim();
                 #[cfg(windows)]
-                let out = Command::new("cmd").args(["/C", cmd]).current_dir(&self.cwd).output();
+                let mut command = {
+                    let mut c = Command::new("cmd");
+                    c.args(["/C", clean]);
+                    c
+                };
                 #[cfg(not(windows))]
-                let out = Command::new("sh").args(["-c", cmd]).current_dir(&self.cwd).output();
+                let mut command = {
+                    let mut c = Command::new("sh");
+                    c.args(["-c", clean]);
+                    c
+                };
+                command.current_dir(&self.cwd);
+                for (k, v) in &self.display_env {
+                    command.env(k, v);
+                }
 
-                match out {
-                    Ok(res) => {
-                        let txt = String::from_utf8_lossy(&res.stdout);
-                        let err = String::from_utf8_lossy(&res.stderr);
-                        let mut any = false;
-                        for l in txt.lines().chain(err.lines()).take(12) {
-                            self.push_line(l.to_string());
-                            any = true;
-                        }
-                        if !any {
-                            self.push_line(format!("[exit {}]", res.status.code().unwrap_or(0)));
-                        }
+                if bg {
+                    match command.spawn() {
+                        Ok(ch) => self.push_line(format!("[spawned pid {}]", ch.id())),
+                        Err(e) => self.push_line(format!("spawn err: {e}")),
                     }
-                    Err(e) => self.push_line(format!("err: {e}")),
+                } else {
+                    match command.output() {
+                        Ok(res) => {
+                            let txt = String::from_utf8_lossy(&res.stdout);
+                            let err = String::from_utf8_lossy(&res.stderr);
+                            let mut any = false;
+                            for l in txt.lines().chain(err.lines()).take(12) {
+                                self.push_line(l.to_string());
+                                any = true;
+                            }
+                            if !any {
+                                self.push_line(format!("[exit {}]", res.status.code().unwrap_or(0)));
+                            }
+                        }
+                        Err(e) => self.push_line(format!("err: {e}")),
+                    }
                 }
             }
         }
