@@ -109,9 +109,11 @@ mod tests {
         desktop.on_mouse_up();
         assert_ne!(desktop.windows.last().unwrap().x, orig_x);
 
-        // Open Start Menu & all new apps
+        // Open Start Menu & all new apps + toggle RU/EN language
         desktop.on_mouse_down(20, 580, 960, 600);
         assert!(desktop.start_menu_open);
+        desktop.on_mouse_down(820, 580, 960, 600); // click [RU/EN] toggle on taskbar
+        assert_eq!(desktop.settings.lang, apps::Lang::En);
         desktop.focus_or_open(desktop::AppId::Terminal);
         desktop.focus_or_open(desktop::AppId::Paint);
         desktop.focus_or_open(desktop::AppId::Snake);

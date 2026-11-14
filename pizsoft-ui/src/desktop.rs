@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    KeyEvent, NotepadState, PaintState, SettingsState, SnakeState, TerminalState,
+    KeyEvent, Lang, NotepadState, PaintState, SettingsState, SnakeState, TerminalState,
+    ThemePreset, tr,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
@@ -24,10 +26,32 @@ pub enum AppId {
     Settings,
 }
 
+impl AppId {
+    pub fn title(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (AppId::System, Lang::Ru) => "Система",
+            (AppId::System, Lang::En) => "System Monitor",
+            (AppId::PizGet, Lang::Ru) => "Пакеты piz-get",
+            (AppId::PizGet, Lang::En) => "piz-get Store",
+            (AppId::Files, Lang::Ru) => "Файлы",
+            (AppId::Files, Lang::En) => "Files",
+            (AppId::Terminal, Lang::Ru) => "Терминал",
+            (AppId::Terminal, Lang::En) => "Terminal",
+            (AppId::Paint, Lang::Ru) => "PizPaint",
+            (AppId::Paint, Lang::En) => "PizPaint",
+            (AppId::Snake, Lang::Ru) => "Змейка",
+            (AppId::Snake, Lang::En) => "Snake",
+            (AppId::Notepad, Lang::Ru) => "Блокнот",
+            (AppId::Notepad, Lang::En) => "PizPad",
+            (AppId::Settings, Lang::Ru) => "Настройки",
+            (AppId::Settings, Lang::En) => "Settings",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Window {
     pub id: AppId,
-    pub title: &'static str,
     pub x: i32,
     pub y: i32,
     pub w: i32,
@@ -42,17 +66,22 @@ pub struct FileItem {
     pub path: PathBuf,
 }
 
-const START_ITEMS: [(Option<AppId>, &str); 9] = [
-    (Some(AppId::Terminal), "Terminal"),
-    (Some(AppId::Paint), "PizPaint"),
-    (Some(AppId::Snake), "Zmeyka"),
-    (Some(AppId::Notepad), "PizPad (Bloknot)"),
-    (Some(AppId::Files), "Fayly"),
-    (Some(AppId::PizGet), "piz-get Store"),
-    (Some(AppId::System), "Sistema"),
-    (Some(AppId::Settings), "Nastroyki / About OS"),
-    (None, "Vyhod (Exit)"),
+const START_ITEMS: [Option<AppId>; 9] = [
+    Some(AppId::Terminal),
+    Some(AppId::Paint),
+    Some(AppId::Snake),
+    Some(AppId::Notepad),
+    Some(AppId::Files),
+    Some(AppId::PizGet),
+    Some(AppId::System),
+    Some(AppId::Settings),
+    None,
 ];
+
+struct WallpaperCache {
+    key: (usize, usize, ThemePreset, bool),
+    pixels: Vec<u32>,
+}
 
 pub struct Desktop {
     pub running: bool,
@@ -90,6 +119,8 @@ pub struct Desktop {
     pub snake: SnakeState,
     pub notepad: NotepadState,
     pub settings: SettingsState,
+
+    wp_cache: RefCell<WallpaperCache>,
 }
 
 impl Desktop {
@@ -98,6 +129,8 @@ impl Desktop {
         let piz_root = env::var("PIZ_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
+        let settings = SettingsState::new();
+        let lang = settings.lang;
 
         let mut d = Self {
             running: true,
@@ -109,7 +142,6 @@ impl Desktop {
             windows: vec![
                 Window {
                     id: AppId::Files,
-                    title: "Fayly",
                     x: 150,
                     y: 70,
                     w: 400,
@@ -118,7 +150,6 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::PizGet,
-                    title: "piz-get Store",
                     x: 190,
                     y: 90,
                     w: 440,
@@ -127,7 +158,6 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::Terminal,
-                    title: "Terminal",
                     x: 120,
                     y: 60,
                     w: 440,
@@ -136,16 +166,14 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::Paint,
-                    title: "PizPaint",
                     x: 240,
                     y: 110,
-                    w: 364,
-                    h: 266,
+                    w: 368,
+                    h: 268,
                     open: false,
                 },
                 Window {
                     id: AppId::Snake,
-                    title: "Zmeyka",
                     x: 280,
                     y: 100,
                     w: 320,
@@ -154,7 +182,6 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::Notepad,
-                    title: "PizPad",
                     x: 210,
                     y: 130,
                     w: 420,
@@ -163,7 +190,6 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::System,
-                    title: "Sistema",
                     x: 110,
                     y: 45,
                     w: 380,
@@ -172,11 +198,10 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::Settings,
-                    title: "Nastroyki",
                     x: 370,
                     y: 90,
                     w: 520,
-                    h: 340,
+                    h: 344,
                     open: true,
                 },
             ],
@@ -199,11 +224,16 @@ impl Desktop {
             files: Vec::new(),
             file_sel: 0,
 
-            terminal: TerminalState::new(),
+            terminal: TerminalState::new(lang),
             paint: PaintState::new(),
             snake: SnakeState::new(),
-            notepad: NotepadState::new(),
-            settings: SettingsState::new(),
+            notepad: NotepadState::new(lang),
+            settings,
+
+            wp_cache: RefCell::new(WallpaperCache {
+                key: (0, 0, ThemePreset::AuroraPeaks, false),
+                pixels: Vec::new(),
+            }),
         };
 
         d.reload_packages();
@@ -290,7 +320,7 @@ impl Desktop {
             .output();
         self.status = match res {
             Ok(o) if o.status.success() => format!("piz-get {}: OK", args.join(" ")),
-            Ok(_) => format!("piz-get {}: oshibka", args.join(" ")),
+            Ok(_) => format!("piz-get {}: err", args.join(" ")),
             Err(e) => format!("piz-get: {e}"),
         };
         self.reload_packages();
@@ -334,8 +364,8 @@ impl Desktop {
         if open_count == 0 {
             return 100;
         }
-        let avail = (canvas_w - 250).max(120);
-        ((avail / open_count as i32) - 4).clamp(64, 120)
+        let avail = (canvas_w - 280).max(120);
+        ((avail / open_count as i32) - 4).clamp(64, 130)
     }
 
     pub fn on_mouse_down(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
@@ -343,17 +373,21 @@ impl Desktop {
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.mouse_down = true;
 
-        let task_y = if self.settings.taskbar_top { 0 } else { canvas_h - 34 };
+        let task_y = if self.settings.taskbar_top { 0 } else { canvas_h - 36 };
 
         // 1. Start Menu popup hit test
         if self.start_menu_open {
-            let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
-            let menu_y = if self.settings.taskbar_top { 34 } else { task_y - menu_h };
-            if (6..=216).contains(&x) && y >= menu_y && y < menu_y + menu_h {
-                let rel_y = y - (menu_y + 28);
+            let menu_h = (START_ITEMS.len() as i32) * 26 + 38;
+            let menu_y = if self.settings.taskbar_top {
+                38
+            } else {
+                task_y - menu_h - 4
+            };
+            if (8..=228).contains(&x) && y >= menu_y && y < menu_y + menu_h {
+                let rel_y = y - (menu_y + 32);
                 if rel_y >= 0 {
-                    let idx = (rel_y / 24) as usize;
-                    if let Some((app_opt, _)) = START_ITEMS.get(idx) {
+                    let idx = (rel_y / 26) as usize;
+                    if let Some(app_opt) = START_ITEMS.get(idx) {
                         self.start_menu_open = false;
                         match app_opt {
                             Some(id) => self.focus_or_open(*id),
@@ -367,12 +401,22 @@ impl Desktop {
             self.start_menu_open = false;
         }
 
-        // 2. Taskbar hit test (only currently open windows)
-        if y >= task_y && y < task_y + 34 {
-            if (6..=96).contains(&x) {
+        // 2. Taskbar hit test
+        if y >= task_y && y < task_y + 36 {
+            if (8..=94).contains(&x) {
                 self.start_menu_open = !self.start_menu_open;
                 return;
             }
+            // Language pill [RU/EN] on right side of taskbar
+            let lang_x = (canvas_w - 144).max(108);
+            if x >= lang_x && x <= lang_x + 36 {
+                self.settings.lang = match self.settings.lang {
+                    Lang::Ru => Lang::En,
+                    Lang::En => Lang::Ru,
+                };
+                return;
+            }
+
             let open_ids: Vec<AppId> = self
                 .windows
                 .iter()
@@ -380,7 +424,7 @@ impl Desktop {
                 .map(|w| w.id)
                 .collect();
             let pill_w = self.taskbar_pill_width(canvas_w, open_ids.len());
-            let mut bx = 104;
+            let mut bx = 102;
             for id in open_ids {
                 if x >= bx && x <= bx + pill_w {
                     self.focus_or_open(id);
@@ -405,14 +449,16 @@ impl Desktop {
             self.windows.push(win.clone());
             let top_idx = self.windows.len() - 1;
 
-            if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 && y >= win.y + 4 && y <= win.y + 22
+            // Close button [×]
+            if x >= win.x + win.w - 28 && x <= win.x + win.w - 6 && y >= win.y + 5 && y <= win.y + 23
             {
                 self.windows[top_idx].open = false;
                 self.dragging = None;
                 return;
             }
 
-            if y < win.y + 26 {
+            // Titlebar drag
+            if y < win.y + 28 {
                 self.dragging = Some((win.id, x - win.x, y - win.y));
                 return;
             }
@@ -422,18 +468,18 @@ impl Desktop {
         }
 
         // 4. Desktop icons on the left
-        if (14..=92).contains(&x) {
-            if (20..=76).contains(&y) {
+        if self.settings.show_icons && (14..=94).contains(&x) {
+            if (40..=98).contains(&y) {
                 self.focus_or_open(AppId::Terminal);
-            } else if (92..=148).contains(&y) {
+            } else if (112..=170).contains(&y) {
                 self.focus_or_open(AppId::PizGet);
-            } else if (164..=220).contains(&y) {
+            } else if (184..=242).contains(&y) {
                 self.focus_or_open(AppId::Paint);
-            } else if (236..=292).contains(&y) {
+            } else if (256..=314).contains(&y) {
                 self.focus_or_open(AppId::Snake);
-            } else if (308..=364).contains(&y) {
+            } else if (328..=386).contains(&y) {
                 self.focus_or_open(AppId::Notepad);
-            } else if (380..=436).contains(&y) {
+            } else if (400..=458).contains(&y) {
                 self.focus_or_open(AppId::Settings);
             }
         }
@@ -445,11 +491,12 @@ impl Desktop {
     }
 
     fn handle_window_click(&mut self, win: &Window, lx: i32, ly: i32) {
+        let lang = self.settings.lang;
         match win.id {
             AppId::System => {
-                if ly >= win.h - 36 && ly <= win.h - 12 && (14..=114).contains(&lx) {
+                if ly >= win.h - 36 && ly <= win.h - 10 && (14..=124).contains(&lx) {
                     self.refresh_metrics();
-                    self.status = String::from("Metriki obnovleny");
+                    self.status = String::from(tr(lang, "Метрики обновлены", "Metrics refreshed"));
                 }
             }
             AppId::PizGet => {
@@ -458,7 +505,7 @@ impl Desktop {
                     if row < self.packages.len() {
                         self.pkg_sel = row;
                     }
-                } else if ly >= win.h - 36 && ly <= win.h - 12 {
+                } else if ly >= win.h - 36 && ly <= win.h - 10 {
                     if (14..=104).contains(&lx) {
                         self.run_piz_get(&["obnovi"]);
                     } else if (112..=202).contains(&lx)
@@ -488,7 +535,7 @@ impl Desktop {
             }
             AppId::Paint => self.paint.on_click(lx, ly, win.h),
             AppId::Snake => self.snake.on_click(lx, ly, win.h),
-            AppId::Notepad => self.notepad.on_click(lx, ly, win.h),
+            AppId::Notepad => self.notepad.on_click(lx, ly, win.h, lang),
             AppId::Settings => {
                 if self.settings.on_click(lx, ly) {
                     self.refresh_metrics();
@@ -501,27 +548,39 @@ impl Desktop {
     pub fn render(&self, canvas: &mut Canvas) {
         let w = canvas.width as i32;
         let h = canvas.height as i32;
-        let (bg_col, grid_col, accent_col) = self.settings.theme.colors();
+        let lang = self.settings.lang;
+        let accent = self.settings.theme.accent();
 
-        // 1. Desktop background + optional grid
-        canvas.fill_rect(0, 0, w, h, bg_col);
-        if self.settings.show_grid {
-            for gx in (0..w).step_by(32) {
-                canvas.fill_rect(gx, 0, 1, h, grid_col);
+        // 1. Cached procedural gradient + mountain wallpaper
+        {
+            let mut wp = self.wp_cache.borrow_mut();
+            let key = (
+                canvas.width,
+                canvas.height,
+                self.settings.theme,
+                self.settings.show_grid,
+            );
+            if wp.key != key || wp.pixels.len() != canvas.pixels.len() {
+                wp.pixels.resize(canvas.pixels.len(), 0);
+                self.settings.theme.render_wallpaper(
+                    &mut wp.pixels,
+                    canvas.width,
+                    canvas.height,
+                    self.settings.show_grid,
+                );
+                wp.key = key;
             }
-            for gy in (0..h).step_by(32) {
-                canvas.fill_rect(0, gy, w, 1, grid_col);
-            }
+            canvas.pixels.copy_from_slice(&wp.pixels);
         }
 
         // 2. Desktop Icons
         if self.settings.show_icons {
-            self.draw_desktop_icon(canvas, 18, 42, "Terminal", 0x3FB950);
-            self.draw_desktop_icon(canvas, 18, 114, "piz-get", 0xD29922);
-            self.draw_desktop_icon(canvas, 18, 186, "PizPaint", 0xBC8CFF);
-            self.draw_desktop_icon(canvas, 18, 258, "Zmeyka", 0x2EA043);
-            self.draw_desktop_icon(canvas, 18, 330, "PizPad", 0x58A6FF);
-            self.draw_desktop_icon(canvas, 18, 402, "Nastroyki", 0xF85149);
+            self.draw_desktop_icon(canvas, 18, 42, AppId::Terminal.title(lang), 0x3FB950, ">_");
+            self.draw_desktop_icon(canvas, 18, 114, "piz-get", 0xD29922, "PKG");
+            self.draw_desktop_icon(canvas, 18, 186, "PizPaint", 0xBC8CFF, "ART");
+            self.draw_desktop_icon(canvas, 18, 258, AppId::Snake.title(lang), 0x2EA043, "S~");
+            self.draw_desktop_icon(canvas, 18, 330, AppId::Notepad.title(lang), 0x58A6FF, "TXT");
+            self.draw_desktop_icon(canvas, 18, 402, AppId::Settings.title(lang), 0xF85149, "OS");
         }
 
         // 3. Open Windows
@@ -533,36 +592,55 @@ impl Desktop {
             self.draw_window(canvas, win, focused);
         }
 
-        // 4. Taskbar (shows ONLY currently open windows)
-        let task_y = if self.settings.taskbar_top { 0 } else { h - 34 };
-        canvas.fill_rect(0, task_y, w, 34, 0x161B22);
-        canvas.fill_rect(0, task_y, w, 1, 0x30363D);
+        // 4. Frosted-glass Taskbar (shows ONLY currently open windows)
+        let task_y = if self.settings.taskbar_top { 0 } else { h - 36 };
+        canvas.blend_rect(0, task_y, w, 36, 0x0D1117, 215);
+        canvas.fill_rect(0, task_y, w, 1, 0x38424F);
+
         let start_bg = if self.start_menu_open { 0xDA3633 } else { 0xB62324 };
-        canvas.draw_button(6, task_y + 5, 90, 24, "Pusk", start_bg, 0xFFFFFF, 0xFF7B72);
+        canvas.draw_button(
+            8,
+            task_y + 6,
+            86,
+            24,
+            tr(lang, "Пуск", "Start"),
+            start_bg,
+            0xFFFFFF,
+            0xFF7B72,
+        );
 
         let open_wins: Vec<&Window> = self.windows.iter().filter(|win| win.open).collect();
         let pill_w = self.taskbar_pill_width(w, open_wins.len());
-        let mut bx = 104;
+        let mut bx = 102;
         for (i, win) in open_wins.iter().enumerate() {
             let is_top = i + 1 == open_wins.len();
-            let bg = if is_top { accent_col } else { 0x21262D };
+            let bg = if is_top { accent } else { 0x21262D };
             let border = if is_top { 0x79C0FF } else { 0x30363D };
-            canvas.draw_button(bx, task_y + 5, pill_w, 24, win.title, bg, 0xFFFFFF, border);
+            canvas.draw_button(
+                bx,
+                task_y + 6,
+                pill_w,
+                24,
+                win.id.title(lang),
+                bg,
+                0xFFFFFF,
+                border,
+            );
             bx += pill_w + 4;
         }
 
-        canvas.draw_text_clipped(
-            (w - 132).max(bx + 8),
-            task_y + 13,
-            126,
-            &self.uptime,
-            0x8B949E,
-            1,
-        );
+        // Quick RU / EN language button + Uptime
+        let lang_x = (w - 144).max(bx + 8);
+        let lang_lbl = match lang {
+            Lang::Ru => "RU",
+            Lang::En => "EN",
+        };
+        canvas.draw_button(lang_x, task_y + 6, 36, 24, lang_lbl, 0x21262D, 0xFFFFFF, accent);
+        canvas.draw_text_clipped(lang_x + 44, task_y + 12, 96, &self.uptime, 0xC9D1D9, 1);
 
-        // 5. Start Menu popup
+        // 5. Frosted Start Menu popup
         if self.start_menu_open {
-            self.draw_start_menu(canvas, task_y);
+            self.draw_start_menu(canvas, task_y, accent);
         }
 
         // 6. Mouse cursor
@@ -574,61 +652,92 @@ impl Desktop {
         }
     }
 
-    fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32) {
-        let menu_w = 210;
-        let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
-        let menu_x = 6;
-        let menu_y = if self.settings.taskbar_top { 34 } else { task_y - menu_h };
+    fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let menu_w = 220;
+        let menu_h = (START_ITEMS.len() as i32) * 26 + 38;
+        let menu_x = 8;
+        let menu_y = if self.settings.taskbar_top {
+            38
+        } else {
+            task_y - menu_h - 4
+        };
 
-        canvas.fill_rect(menu_x + 4, menu_y + 4, menu_w, menu_h, 0x090C10);
-        canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0x161B22);
-        canvas.draw_rect(menu_x, menu_y, menu_w, menu_h, 0x58A6FF);
-        canvas.fill_rect(menu_x + 1, menu_y + 1, menu_w - 2, 24, 0x1F6FEB);
+        canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 8);
+        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 8, 0x161B22, 238);
+        canvas.draw_rounded_rect(menu_x, menu_y, menu_w, menu_h, 8, accent);
+
+        canvas.fill_rounded_rect(menu_x + 2, menu_y + 2, menu_w - 4, 24, 6, accent);
         canvas.draw_text_clipped(
-            menu_x + 10,
-            menu_y + 9,
-            menu_w - 20,
-            "pizdOS 2.0 | Pusk",
+            menu_x + 12,
+            menu_y + 8,
+            menu_w - 24,
+            tr(lang, "pizdOS 2.0 • Пуск", "pizdOS 2.0 • Start"),
             0xFFFFFF,
             1,
         );
 
-        for (i, (app_opt, label)) in START_ITEMS.iter().enumerate() {
-            let iy = menu_y + 28 + (i as i32) * 24;
+        for (i, app_opt) in START_ITEMS.iter().enumerate() {
+            let iy = menu_y + 32 + (i as i32) * 26;
             let hovered = self.mouse_x >= menu_x
                 && self.mouse_x <= menu_x + menu_w
                 && self.mouse_y >= iy
-                && self.mouse_y < iy + 22;
+                && self.mouse_y < iy + 24;
             if hovered {
-                canvas.fill_rect(menu_x + 4, iy, menu_w - 8, 22, 0x21262D);
+                canvas.fill_rounded_rect(menu_x + 6, iy, menu_w - 12, 24, 5, 0x262D38);
             }
-            let col = if app_opt.is_none() { 0xFF7B72 } else { 0xE6EDF3 };
-            canvas.draw_text_clipped(menu_x + 12, iy + 7, menu_w - 24, label, col, 1);
+            let (label, col) = match app_opt {
+                Some(id) => (id.title(lang), 0xE6EDF3),
+                None => (tr(lang, "Выход", "Exit"), 0xFF7B72),
+            };
+            canvas.draw_text_clipped(menu_x + 14, iy + 6, menu_w - 28, label, col, 1);
         }
     }
 
-    fn draw_desktop_icon(&self, canvas: &mut Canvas, x: i32, y: i32, label: &str, accent: u32) {
-        canvas.fill_rect(x + 12, y, 40, 36, 0x21262D);
-        canvas.fill_rect(x + 12, y, 40, 8, accent);
-        canvas.draw_rect(x + 12, y, 40, 36, 0x30363D);
-        canvas.draw_text_clipped(x, y + 42, 76, label, 0xE6EDF3, 1);
+    fn draw_desktop_icon(
+        &self,
+        canvas: &mut Canvas,
+        x: i32,
+        y: i32,
+        label: &str,
+        accent: u32,
+        badge: &str,
+    ) {
+        canvas.draw_soft_shadow(x + 12, y, 42, 38, 8);
+        canvas.blend_rounded_rect(x + 12, y, 42, 38, 8, 0x1B222C, 225);
+        canvas.fill_rounded_rect(x + 12, y, 42, 9, 4, accent);
+        canvas.draw_rounded_rect(x + 12, y, 42, 38, 8, 0x38424F);
+        canvas.draw_text_clipped(x + 19, y + 17, 32, badge, 0xFFFFFF, 1);
+
+        canvas.draw_text_clipped(x + 3, y + 43, 76, label, 0x090C10, 1);
+        canvas.draw_text_clipped(x + 2, y + 42, 76, label, 0xF0F6FC, 1);
     }
 
     fn draw_window(&self, canvas: &mut Canvas, win: &Window, focused: bool) {
-        canvas.fill_rect(win.x + 4, win.y + 4, win.w, win.h, 0x090C10);
-        canvas.fill_rect(win.x, win.y, win.w, win.h, 0x161B22);
-        let border = if focused { 0x58A6FF } else { 0x30363D };
-        canvas.draw_rect(win.x, win.y, win.w, win.h, border);
+        let lang = self.settings.lang;
+        let accent = self.settings.theme.accent();
 
-        let title_bg = if focused { 0x1F6FEB } else { 0x21262D };
-        canvas.fill_rect(win.x + 1, win.y + 1, win.w - 2, 24, title_bg);
-        canvas.draw_text_clipped(win.x + 10, win.y + 9, win.w - 44, win.title, 0xFFFFFF, 1);
+        canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 8);
+        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 8, 0x161B22);
+        let border = if focused { accent } else { 0x30363D };
+        canvas.draw_rounded_rect(win.x, win.y, win.w, win.h, 8, border);
+
+        let title_bg = if focused { accent } else { 0x21262D };
+        canvas.fill_rounded_rect(win.x + 2, win.y + 2, win.w - 4, 24, 6, title_bg);
+        canvas.draw_text_clipped(
+            win.x + 12,
+            win.y + 8,
+            win.w - 48,
+            win.id.title(lang),
+            0xFFFFFF,
+            1,
+        );
         canvas.draw_button(
             win.x + win.w - 26,
-            win.y + 4,
+            win.y + 5,
             20,
             18,
-            "X",
+            "×",
             0xDA3633,
             0xFFFFFF,
             0xFF7B72,
@@ -639,9 +748,9 @@ impl Desktop {
             AppId::PizGet => self.draw_pizget_contents(canvas, win),
             AppId::Files => self.draw_files_contents(canvas, win),
             AppId::Terminal => self.terminal.draw(canvas, win.x, win.y, win.w, win.h),
-            AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h),
-            AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h),
-            AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h),
+            AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h, lang),
+            AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h, lang),
+            AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h, lang),
             AppId::Settings => self.settings.draw(
                 canvas,
                 win.x,
@@ -657,16 +766,31 @@ impl Desktop {
     }
 
     fn draw_system_contents(&self, canvas: &mut Canvas, win: &Window) {
+        let lang = self.settings.lang;
         let x = win.x + 14;
         let y = win.y + 36;
         let iw = win.w - 28;
 
-        canvas.draw_text_clipped(x, y, iw, &format!("Kernel: {}", self.kernel), 0xE6EDF3, 1);
-        canvas.draw_text_clipped(x, y + 16, iw, &format!("Uptime: {}", self.uptime), 0xE6EDF3, 1);
+        canvas.draw_text_clipped(
+            x,
+            y,
+            iw,
+            &format!("{}: {}", tr(lang, "Ядро", "Kernel"), self.kernel),
+            0xE6EDF3,
+            1,
+        );
+        canvas.draw_text_clipped(
+            x,
+            y + 16,
+            iw,
+            &format!("{}: {}", tr(lang, "Аптайм", "Uptime"), self.uptime),
+            0xE6EDF3,
+            1,
+        );
         canvas.draw_text_clipped(x, y + 32, iw, &format!("Load  : {}", self.loadavg), 0xE6EDF3, 1);
 
         canvas.draw_text_clipped(x, y + 54, iw, &format!("CPU: {}%", self.cpu_pct), 0x79C0FF, 1);
-        canvas.draw_progress_bar(x, y + 66, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
+        canvas.draw_progress_bar(x, y + 68, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
 
         canvas.draw_text_clipped(
             x,
@@ -681,7 +805,7 @@ impl Desktop {
         );
         canvas.draw_progress_bar(
             x,
-            y + 102,
+            y + 104,
             iw,
             14,
             self.mem.percent,
@@ -694,7 +818,7 @@ impl Desktop {
             x,
             y + 128,
             iw,
-            &format!("Processes: {}", self.procs.len()),
+            &format!("{}: {}", tr(lang, "Процессы", "Processes"), self.procs.len()),
             0x8B949E,
             1,
         );
@@ -712,9 +836,9 @@ impl Desktop {
         canvas.draw_button(
             x,
             win.y + win.h - 36,
-            100,
+            110,
             24,
-            "Obnovit",
+            tr(lang, "Обновить", "Refresh"),
             0x238636,
             0xFFFFFF,
             0x3FB950,
@@ -722,19 +846,27 @@ impl Desktop {
     }
 
     fn draw_pizget_contents(&self, canvas: &mut Canvas, win: &Window) {
+        let lang = self.settings.lang;
         let x = win.x + 14;
         let y = win.y + 36;
         let iw = win.w - 28;
 
         if self.packages.is_empty() {
-            canvas.draw_text_clipped(x, y + 8, iw, "Net paketov (nazhmi Obnovi)", 0x8B949E, 1);
+            canvas.draw_text_clipped(
+                x,
+                y + 8,
+                iw,
+                tr(lang, "Нет пакетов (нажми Обновить)", "No packages (click Update)"),
+                0x8B949E,
+                1,
+            );
         } else {
             let max_rows = ((win.h - 86) / 18).max(1) as usize;
             for (i, p) in self.packages.iter().take(max_rows).enumerate() {
                 let ry = y + (i as i32) * 18;
                 let selected = i == self.pkg_sel;
                 if selected {
-                    canvas.fill_rect(x, ry, iw, 16, 0x1F6FEB);
+                    canvas.fill_rounded_rect(x, ry, iw, 16, 4, 0x1F6FEB);
                 }
                 let tag = if p.installed { "[INST]" } else { "[AVAIL]" };
                 let color = if selected {
@@ -745,10 +877,10 @@ impl Desktop {
                     0xE6EDF3
                 };
                 canvas.draw_text_clipped(
-                    x + 4,
-                    ry + 4,
-                    iw - 8,
-                    &format!("{tag} {} {} - {}", p.name, p.version, p.desc),
+                    x + 6,
+                    ry + 2,
+                    iw - 12,
+                    &format!("{tag} {} {} — {}", p.name, p.version, p.desc),
                     color,
                     1,
                 );
@@ -756,9 +888,36 @@ impl Desktop {
         }
 
         let by = win.y + win.h - 36;
-        canvas.draw_button(x, by, 90, 24, "Obnovi", 0x21262D, 0xFFFFFF, 0x58A6FF);
-        canvas.draw_button(x + 98, by, 90, 24, "Ebash", 0x238636, 0xFFFFFF, 0x3FB950);
-        canvas.draw_button(x + 196, by, 90, 24, "Snesti", 0xB62324, 0xFFFFFF, 0xFF7B72);
+        canvas.draw_button(
+            x,
+            by,
+            90,
+            24,
+            tr(lang, "Обновить", "Update"),
+            0x21262D,
+            0xFFFFFF,
+            0x58A6FF,
+        );
+        canvas.draw_button(
+            x + 98,
+            by,
+            90,
+            24,
+            tr(lang, "Поставить", "Install"),
+            0x238636,
+            0xFFFFFF,
+            0x3FB950,
+        );
+        canvas.draw_button(
+            x + 196,
+            by,
+            90,
+            24,
+            tr(lang, "Снести", "Remove"),
+            0xB62324,
+            0xFFFFFF,
+            0xFF7B72,
+        );
     }
 
     fn draw_files_contents(&self, canvas: &mut Canvas, win: &Window) {
@@ -773,14 +932,14 @@ impl Desktop {
             let ry = win.y + 54 + (i as i32) * 18;
             let selected = i == self.file_sel;
             if selected {
-                canvas.fill_rect(x, ry, iw, 16, 0x21262D);
+                canvas.fill_rounded_rect(x, ry, iw, 16, 4, 0x21262D);
             }
             let prefix = if item.is_dir { "[DIR]" } else { "     " };
             let color = if item.is_dir { 0x58A6FF } else { 0xE6EDF3 };
             canvas.draw_text_clipped(
-                x + 4,
-                ry + 4,
-                iw - 8,
+                x + 6,
+                ry + 2,
+                iw - 12,
                 &format!("{prefix} {}", item.name),
                 color,
                 1,
