@@ -6,5 +6,7 @@ build/
 test_boot.py
 target/
 piz-get/target/
+pizsoft-ui/target/
 pizdos2/
 os2/overlay/usr/bin/piz-get
+os2/overlay/usr/bin/pizsoft

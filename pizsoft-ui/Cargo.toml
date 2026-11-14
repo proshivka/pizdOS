@@ -1,0 +1,19 @@
+[package]
+name = "pizsoft-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-dependency TUI desktop environment for pizdOS 2.0"
+license = "MIT"
+
+[[bin]]
+name = "pizsoft"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
