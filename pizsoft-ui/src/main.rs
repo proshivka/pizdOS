@@ -102,10 +102,10 @@ mod tests {
         let mut canvas = Canvas::new(960, 600);
         let mut desktop = Desktop::new(960, 600);
 
-        // Drag topmost window ("Nastroyki - About OS" at 420,120)
+        // Drag topmost window ("Nastroyki" at 370,90)
         let orig_x = desktop.windows.last().unwrap().x;
-        desktop.on_mouse_down(440, 130, 960, 600);
-        desktop.on_mouse_move(490, 150, 960, 600);
+        desktop.on_mouse_down(390, 100, 960, 600);
+        desktop.on_mouse_move(440, 120, 960, 600);
         desktop.on_mouse_up();
         assert_ne!(desktop.windows.last().unwrap().x, orig_x);
 

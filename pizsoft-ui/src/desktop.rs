@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    KeyEvent, NotepadState, PaintState, SnakeState, TerminalState, draw_settings_about_os,
+    KeyEvent, NotepadState, PaintState, SettingsState, SnakeState, TerminalState,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
@@ -89,6 +89,7 @@ pub struct Desktop {
     pub paint: PaintState,
     pub snake: SnakeState,
     pub notepad: NotepadState,
+    pub settings: SettingsState,
 }
 
 impl Desktop {
@@ -171,11 +172,11 @@ impl Desktop {
                 },
                 Window {
                     id: AppId::Settings,
-                    title: "Nastroyki - About OS",
-                    x: 420,
-                    y: 120,
-                    w: 430,
-                    h: 300,
+                    title: "Nastroyki",
+                    x: 370,
+                    y: 90,
+                    w: 520,
+                    h: 340,
                     open: true,
                 },
             ],
@@ -202,6 +203,7 @@ impl Desktop {
             paint: PaintState::new(),
             snake: SnakeState::new(),
             notepad: NotepadState::new(),
+            settings: SettingsState::new(),
         };
 
         d.reload_packages();
@@ -265,7 +267,8 @@ impl Desktop {
         if self.tick.is_multiple_of(30) {
             self.refresh_metrics();
         }
-        if self.tick.is_multiple_of(10)
+        let div = self.settings.snake_tick_div.max(1);
+        if self.tick.is_multiple_of(div)
             && self.windows.iter().any(|w| w.id == AppId::Snake && w.open)
         {
             self.snake.step();
@@ -340,13 +343,13 @@ impl Desktop {
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.mouse_down = true;
 
-        let task_y = canvas_h - 34;
+        let task_y = if self.settings.taskbar_top { 0 } else { canvas_h - 34 };
 
         // 1. Start Menu popup hit test
         if self.start_menu_open {
             let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
-            let menu_y = task_y - menu_h;
-            if (6..=216).contains(&x) && y >= menu_y && y < task_y {
+            let menu_y = if self.settings.taskbar_top { 34 } else { task_y - menu_h };
+            if (6..=216).contains(&x) && y >= menu_y && y < menu_y + menu_h {
                 let rel_y = y - (menu_y + 28);
                 if rel_y >= 0 {
                     let idx = (rel_y / 24) as usize;
@@ -365,7 +368,7 @@ impl Desktop {
         }
 
         // 2. Taskbar hit test (only currently open windows)
-        if y >= task_y {
+        if y >= task_y && y < task_y + 34 {
             if (6..=96).contains(&x) {
                 self.start_menu_open = !self.start_menu_open;
                 return;
@@ -486,30 +489,40 @@ impl Desktop {
             AppId::Paint => self.paint.on_click(lx, ly, win.h),
             AppId::Snake => self.snake.on_click(lx, ly, win.h),
             AppId::Notepad => self.notepad.on_click(lx, ly, win.h),
-            AppId::Terminal | AppId::Settings => {}
+            AppId::Settings => {
+                if self.settings.on_click(lx, ly) {
+                    self.refresh_metrics();
+                }
+            }
+            AppId::Terminal => {}
         }
     }
 
     pub fn render(&self, canvas: &mut Canvas) {
         let w = canvas.width as i32;
         let h = canvas.height as i32;
+        let (bg_col, grid_col, accent_col) = self.settings.theme.colors();
 
-        // 1. Desktop background + subtle grid
-        canvas.fill_rect(0, 0, w, h, 0x101822);
-        for gx in (0..w).step_by(32) {
-            canvas.fill_rect(gx, 0, 1, h, 0x15202E);
-        }
-        for gy in (0..h).step_by(32) {
-            canvas.fill_rect(0, gy, w, 1, 0x15202E);
+        // 1. Desktop background + optional grid
+        canvas.fill_rect(0, 0, w, h, bg_col);
+        if self.settings.show_grid {
+            for gx in (0..w).step_by(32) {
+                canvas.fill_rect(gx, 0, 1, h, grid_col);
+            }
+            for gy in (0..h).step_by(32) {
+                canvas.fill_rect(0, gy, w, 1, grid_col);
+            }
         }
 
         // 2. Desktop Icons
-        self.draw_desktop_icon(canvas, 18, 22, "Terminal", 0x3FB950);
-        self.draw_desktop_icon(canvas, 18, 94, "piz-get", 0xD29922);
-        self.draw_desktop_icon(canvas, 18, 166, "PizPaint", 0xBC8CFF);
-        self.draw_desktop_icon(canvas, 18, 238, "Zmeyka", 0x2EA043);
-        self.draw_desktop_icon(canvas, 18, 310, "PizPad", 0x58A6FF);
-        self.draw_desktop_icon(canvas, 18, 382, "Nastroyki", 0xF85149);
+        if self.settings.show_icons {
+            self.draw_desktop_icon(canvas, 18, 42, "Terminal", 0x3FB950);
+            self.draw_desktop_icon(canvas, 18, 114, "piz-get", 0xD29922);
+            self.draw_desktop_icon(canvas, 18, 186, "PizPaint", 0xBC8CFF);
+            self.draw_desktop_icon(canvas, 18, 258, "Zmeyka", 0x2EA043);
+            self.draw_desktop_icon(canvas, 18, 330, "PizPad", 0x58A6FF);
+            self.draw_desktop_icon(canvas, 18, 402, "Nastroyki", 0xF85149);
+        }
 
         // 3. Open Windows
         for (idx, win) in self.windows.iter().enumerate() {
@@ -521,7 +534,7 @@ impl Desktop {
         }
 
         // 4. Taskbar (shows ONLY currently open windows)
-        let task_y = h - 34;
+        let task_y = if self.settings.taskbar_top { 0 } else { h - 34 };
         canvas.fill_rect(0, task_y, w, 34, 0x161B22);
         canvas.fill_rect(0, task_y, w, 1, 0x30363D);
         let start_bg = if self.start_menu_open { 0xDA3633 } else { 0xB62324 };
@@ -532,7 +545,7 @@ impl Desktop {
         let mut bx = 104;
         for (i, win) in open_wins.iter().enumerate() {
             let is_top = i + 1 == open_wins.len();
-            let bg = if is_top { 0x1F6FEB } else { 0x21262D };
+            let bg = if is_top { accent_col } else { 0x21262D };
             let border = if is_top { 0x79C0FF } else { 0x30363D };
             canvas.draw_button(bx, task_y + 5, pill_w, 24, win.title, bg, 0xFFFFFF, border);
             bx += pill_w + 4;
@@ -553,14 +566,19 @@ impl Desktop {
         }
 
         // 6. Mouse cursor
-        canvas.draw_cursor(self.mouse_x, self.mouse_y);
+        if self.settings.crosshair_cursor {
+            canvas.fill_rect(self.mouse_x - 6, self.mouse_y, 13, 1, 0xFFFFFF);
+            canvas.fill_rect(self.mouse_x, self.mouse_y - 6, 1, 13, 0xFFFFFF);
+        } else {
+            canvas.draw_cursor(self.mouse_x, self.mouse_y);
+        }
     }
 
     fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32) {
         let menu_w = 210;
         let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
         let menu_x = 6;
-        let menu_y = task_y - menu_h;
+        let menu_y = if self.settings.taskbar_top { 34 } else { task_y - menu_h };
 
         canvas.fill_rect(menu_x + 4, menu_y + 4, menu_w, menu_h, 0x090C10);
         canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0x161B22);
@@ -624,9 +642,17 @@ impl Desktop {
             AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h),
             AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h),
             AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h),
-            AppId::Settings => {
-                draw_settings_about_os(canvas, win.x, win.y, win.w, win.h, &self.kernel, &self.mem)
-            }
+            AppId::Settings => self.settings.draw(
+                canvas,
+                win.x,
+                win.y,
+                win.w,
+                win.h,
+                &self.kernel,
+                &self.mem,
+                self.cpu_pct,
+                &self.uptime,
+            ),
         }
     }
 

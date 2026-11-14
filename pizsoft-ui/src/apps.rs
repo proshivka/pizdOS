@@ -449,66 +449,264 @@ impl NotepadState {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Settings — ColorOS-style "About OS"
+// 5. Full Settings App (Sidebar + ColorOS-style About OS)
 // ---------------------------------------------------------------------------
-pub fn draw_settings_about_os(
-    canvas: &mut Canvas,
-    wx: i32,
-    wy: i32,
-    ww: i32,
-    wh: i32,
-    kernel: &str,
-    mem: &MemInfo,
-) {
-    let x = wx + 14;
-    let y = wy + 34;
-    let iw = ww - 28;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPage {
+    Display,
+    Taskbar,
+    System,
+    About,
+}
 
-    // ColorOS-style Hero Banner Card
-    canvas.fill_rect(x, y, iw, 74, 0x162436);
-    canvas.fill_rect(x, y, 6, 74, 0x1F6FEB);
-    canvas.draw_rect(x, y, iw, 74, 0x388BFD);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreset {
+    CyberSlate,
+    CrimsonBratukha,
+    MatrixDark,
+    ClassicBlue,
+}
 
-    canvas.draw_text_clipped(x + 18, y + 12, iw - 28, "pizdOS 2.0", 0xFFFFFF, 2);
-    canvas.draw_text_clipped(
-        x + 18,
-        y + 34,
-        iw - 28,
-        "Bratukha Edition | Pizsoft UI",
-        0x79C0FF,
-        1,
-    );
-    canvas.draw_text_clipped(
-        x + 18,
-        y + 50,
-        iw - 28,
-        "by prosh1vka, Lowyk, KiryxaTipa",
-        0x3FB950,
-        1,
-    );
-
-    // 2-Column ColorOS Info Tiles
-    let col_w = (iw - 10) / 2;
-    let tiles = [
-        ("Stack", "musl + BusyBox (NO GNU)"),
-        ("License", "MIT (GNU Nahuy)"),
-        ("Kernel", kernel),
-        ("RAM", &format!("{} MB Total", mem.total_mb)),
-        ("Pkg Mgr", "piz-get 0.1.0 (0 deps)"),
-        ("UI Engine", "Pizsoft 2D (0 crates)"),
-    ];
-
-    for (idx, (label, val)) in tiles.iter().enumerate() {
-        let col = (idx % 2) as i32;
-        let row = (idx / 2) as i32;
-        let tx = x + col * (col_w + 10);
-        let ty = y + 84 + row * 50;
-        if ty + 44 > wy + wh - 12 {
-            break;
+impl ThemePreset {
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemePreset::CyberSlate => "Cyber Slate",
+            ThemePreset::CrimsonBratukha => "Crimson Bratukha",
+            ThemePreset::MatrixDark => "Matrix Dark",
+            ThemePreset::ClassicBlue => "Classic Blue",
         }
-        canvas.fill_rect(tx, ty, col_w, 44, 0x21262D);
-        canvas.draw_rect(tx, ty, col_w, 44, 0x30363D);
-        canvas.draw_text_clipped(tx + 10, ty + 8, col_w - 20, label, 0x8B949E, 1);
-        canvas.draw_text_clipped(tx + 10, ty + 24, col_w - 20, val, 0xE6EDF3, 1);
+    }
+
+    pub fn colors(self) -> (u32, u32, u32) {
+        // (bg, grid, accent)
+        match self {
+            ThemePreset::CyberSlate => (0x101822, 0x15202E, 0x1F6FEB),
+            ThemePreset::CrimsonBratukha => (0x1A0E12, 0x26141A, 0xDA3633),
+            ThemePreset::MatrixDark => (0x08140C, 0x0E2214, 0x238636),
+            ThemePreset::ClassicBlue => (0x004E98, 0x0059AD, 0x003B73),
+        }
+    }
+}
+
+pub struct SettingsState {
+    pub page: SettingsPage,
+    pub theme: ThemePreset,
+    pub show_grid: bool,
+    pub show_icons: bool,
+    pub taskbar_top: bool,
+    pub crosshair_cursor: bool,
+    pub snake_tick_div: u64,
+}
+
+impl SettingsState {
+    pub fn new() -> Self {
+        Self {
+            page: SettingsPage::About,
+            theme: ThemePreset::CyberSlate,
+            show_grid: true,
+            show_icons: true,
+            taskbar_top: false,
+            crosshair_cursor: false,
+            snake_tick_div: 10,
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32) -> bool {
+        // Left sidebar (x: 10..130)
+        if (10..=130).contains(&lx) && ly >= 36 {
+            let idx = (ly - 36) / 30;
+            match idx {
+                0 => self.page = SettingsPage::Display,
+                1 => self.page = SettingsPage::Taskbar,
+                2 => self.page = SettingsPage::System,
+                3 => self.page = SettingsPage::About,
+                _ => {}
+            }
+            return false;
+        }
+
+        // Right content area (x >= 142)
+        if lx < 142 {
+            return false;
+        }
+
+        match self.page {
+            SettingsPage::Display => {
+                if (68..=92).contains(&ly) {
+                    self.theme = match self.theme {
+                        ThemePreset::CyberSlate => ThemePreset::CrimsonBratukha,
+                        ThemePreset::CrimsonBratukha => ThemePreset::MatrixDark,
+                        ThemePreset::MatrixDark => ThemePreset::ClassicBlue,
+                        ThemePreset::ClassicBlue => ThemePreset::CyberSlate,
+                    };
+                } else if (110..=134).contains(&ly) {
+                    self.show_grid = !self.show_grid;
+                } else if (152..=176).contains(&ly) {
+                    self.show_icons = !self.show_icons;
+                }
+            }
+            SettingsPage::Taskbar => {
+                if (68..=92).contains(&ly) {
+                    self.taskbar_top = !self.taskbar_top;
+                } else if (110..=134).contains(&ly) {
+                    self.crosshair_cursor = !self.crosshair_cursor;
+                }
+            }
+            SettingsPage::System => {
+                if (68..=92).contains(&ly) {
+                    self.snake_tick_div = match self.snake_tick_div {
+                        14 => 10,
+                        10 => 5,
+                        _ => 14,
+                    };
+                } else if (188..=214).contains(&ly) {
+                    return true; // signal caller to refresh metrics
+                }
+            }
+            SettingsPage::About => {}
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        wx: i32,
+        wy: i32,
+        ww: i32,
+        wh: i32,
+        kernel: &str,
+        mem: &MemInfo,
+        cpu_pct: u8,
+        uptime: &str,
+    ) {
+        // Sidebar background
+        let sb_x = wx + 8;
+        let sb_y = wy + 32;
+        let sb_w = 124;
+        let sb_h = wh - 40;
+        canvas.fill_rect(sb_x, sb_y, sb_w, sb_h, 0x0D1117);
+        canvas.draw_rect(sb_x, sb_y, sb_w, sb_h, 0x30363D);
+
+        let tabs = [
+            (SettingsPage::Display, "Ekran / Tema"),
+            (SettingsPage::Taskbar, "Panel zadach"),
+            (SettingsPage::System, "Sistema"),
+            (SettingsPage::About, "About OS"),
+        ];
+        for (i, (p, label)) in tabs.iter().enumerate() {
+            let ty = sb_y + 4 + (i as i32) * 30;
+            let active = self.page == *p;
+            let bg = if active { 0x1F6FEB } else { 0x161B22 };
+            let fg = if active { 0xFFFFFF } else { 0xC9D1D9 };
+            canvas.fill_rect(sb_x + 4, ty, sb_w - 8, 24, bg);
+            canvas.draw_text_clipped(sb_x + 10, ty + 8, sb_w - 16, label, fg, 1);
+        }
+
+        // Right content pane
+        let x = wx + 142;
+        let y = wy + 34;
+        let iw = ww - 154;
+        let (_, _, accent) = self.theme.colors();
+
+        match self.page {
+            SettingsPage::Display => {
+                canvas.draw_text_clipped(x, y, iw, "Ekran i Tema", 0xFFFFFF, 2);
+                canvas.draw_text_clipped(x, y + 34, iw, "Tema rabochego stola:", 0x8B949E, 1);
+                canvas.draw_button(x, wy + 68, iw, 24, self.theme.name(), 0x21262D, 0xFFFFFF, accent);
+
+                let grid_lbl = if self.show_grid { "Setka fona: [VKL]" } else { "Setka fona: [VYKL]" };
+                canvas.draw_button(x, wy + 110, iw, 24, grid_lbl, 0x21262D, 0xE6EDF3, 0x30363D);
+
+                let icon_lbl = if self.show_icons { "Ikonki stola: [VKL]" } else { "Ikonki stola: [VYKL]" };
+                canvas.draw_button(x, wy + 152, iw, 24, icon_lbl, 0x21262D, 0xE6EDF3, 0x30363D);
+            }
+            SettingsPage::Taskbar => {
+                canvas.draw_text_clipped(x, y, iw, "Panel i Kursor", 0xFFFFFF, 2);
+                let pos_lbl = if self.taskbar_top {
+                    "Poziciya paneli: [Sverhu]"
+                } else {
+                    "Poziciya paneli: [Snizu]"
+                };
+                canvas.draw_button(x, wy + 68, iw, 24, pos_lbl, 0x21262D, 0xFFFFFF, accent);
+
+                let cur_lbl = if self.crosshair_cursor {
+                    "Kursor: [Pricel]"
+                } else {
+                    "Kursor: [Strelka]"
+                };
+                canvas.draw_button(x, wy + 110, iw, 24, cur_lbl, 0x21262D, 0xE6EDF3, 0x30363D);
+            }
+            SettingsPage::System => {
+                canvas.draw_text_clipped(x, y, iw, "Proizvoditelnost", 0xFFFFFF, 2);
+                let spd = match self.snake_tick_div {
+                    14 => "Skorost Zmeyki: [Medlenno]",
+                    5 => "Skorost Zmeyki: [Turbo]",
+                    _ => "Skorost Zmeyki: [Normalno]",
+                };
+                canvas.draw_button(x, wy + 68, iw, 24, spd, 0x21262D, 0xFFFFFF, accent);
+                canvas.draw_text_clipped(x, wy + 114, iw, &format!("CPU: {cpu_pct}%"), 0x79C0FF, 1);
+                canvas.draw_text_clipped(
+                    x,
+                    wy + 134,
+                    iw,
+                    &format!("RAM: {} / {} MB", mem.used_mb, mem.total_mb),
+                    0xD29922,
+                    1,
+                );
+                canvas.draw_text_clipped(x, wy + 154, iw, &format!("Uptime: {uptime}"), 0x3FB950, 1);
+                canvas.draw_button(x, wy + 188, 140, 26, "Obnovit metriki", 0x238636, 0xFFFFFF, 0x3FB950);
+            }
+            SettingsPage::About => {
+                // ColorOS-style Hero Banner Card
+                canvas.fill_rect(x, y, iw, 74, 0x162436);
+                canvas.fill_rect(x, y, 6, 74, accent);
+                canvas.draw_rect(x, y, iw, 74, accent);
+
+                canvas.draw_text_clipped(x + 16, y + 10, iw - 24, "pizdOS 2.0", 0xFFFFFF, 2);
+                canvas.draw_text_clipped(
+                    x + 16,
+                    y + 34,
+                    iw - 24,
+                    "Bratukha Edition | Pizsoft UI",
+                    0x79C0FF,
+                    1,
+                );
+                canvas.draw_text_clipped(
+                    x + 16,
+                    y + 50,
+                    iw - 24,
+                    "by prosh1vka, Lowyk, KiryxaTipa",
+                    0x3FB950,
+                    1,
+                );
+
+                // 2-Column ColorOS Info Tiles
+                let col_w = (iw - 8) / 2;
+                let tiles = [
+                    ("Stack", "musl + BusyBox"),
+                    ("Policy", "NO GNU / 0 Deps"),
+                    ("License", "MIT (GNU Nahuy)"),
+                    ("Kernel", kernel),
+                    ("RAM", &format!("{} MB Total", mem.total_mb)),
+                    ("Pkg Mgr", "piz-get 0.1.0"),
+                ];
+
+                for (idx, (label, val)) in tiles.iter().enumerate() {
+                    let col = (idx % 2) as i32;
+                    let row = (idx / 2) as i32;
+                    let tx = x + col * (col_w + 8);
+                    let ty = y + 84 + row * 50;
+                    if ty + 44 > wy + wh - 10 {
+                        break;
+                    }
+                    canvas.fill_rect(tx, ty, col_w, 44, 0x21262D);
+                    canvas.draw_rect(tx, ty, col_w, 44, 0x30363D);
+                    canvas.draw_text_clipped(tx + 8, ty + 8, col_w - 16, label, 0x8B949E, 1);
+                    canvas.draw_text_clipped(tx + 8, ty + 24, col_w - 16, val, 0xE6EDF3, 1);
+                }
+            }
+        }
     }
 }
