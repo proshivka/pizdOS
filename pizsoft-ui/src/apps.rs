@@ -29,6 +29,9 @@ pub enum KeyEvent {
     Down,
     Left,
     Right,
+    ToggleLauncher,
+    ToggleControlCenter,
+    ScaleDelta(i8),
 }
 
 // ---------------------------------------------------------------------------
@@ -128,28 +131,31 @@ impl TerminalState {
         }
     }
 
-    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32) {
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
         let x = wx + 10;
         let y = wy + 34;
         let iw = ww - 20;
         let ih = wh - 44;
-        canvas.fill_rounded_rect(x, y, iw, ih, 6, 0x090C10);
-        canvas.draw_rounded_rect(x, y, iw, ih, 6, 0x30363D);
+        canvas.fill_rounded_rect(x, y, iw, ih, 10, 0x090C12);
+        canvas.draw_rounded_rect_alpha(x, y, iw, ih, 10, 0xFFFFFF, 24);
+        canvas.blend_rect(x + 12, y + 1, (iw - 24).max(0), 1, 0xFFFFFF, 16);
 
-        let max_lines = ((ih - 28) / 15).max(1) as usize;
+        let max_lines = ((ih - 34) / 15).max(1) as usize;
         let skip = self.lines.len().saturating_sub(max_lines);
         for (i, line) in self.lines.iter().skip(skip).enumerate() {
-            canvas.draw_text_clipped(x + 8, y + 6 + (i as i32) * 15, iw - 16, line, 0x3FB950, 1);
+            let col = if line.starts_with("pizdOS#") { accent } else { 0x6EE7B7 };
+            canvas.draw_text_clipped(x + 10, y + 8 + (i as i32) * 15, iw - 20, line, col, 1);
         }
 
-        let prompt_y = y + ih - 22;
-        canvas.fill_rounded_rect(x + 2, prompt_y - 2, iw - 4, 20, 4, 0x161B22);
+        let prompt_y = y + ih - 24;
+        canvas.blend_rounded_rect(x + 4, prompt_y - 2, iw - 8, 22, 7, 0xFFFFFF, 14);
+        canvas.draw_rounded_rect_alpha(x + 4, prompt_y - 2, iw - 8, 22, 7, accent, 55);
         canvas.draw_text_clipped(
-            x + 8,
+            x + 10,
             prompt_y + 2,
-            iw - 16,
+            iw - 20,
             &format!("pizdOS# {}_", self.input),
-            0xFFFFFF,
+            0xF8FAFC,
             1,
         );
     }
@@ -164,10 +170,19 @@ pub const PALETTE: [u32; 7] = [
     0xFFFFFF, 0xF85149, 0x3FB950, 0x58A6FF, 0xD29922, 0xBC8CFF, 0x090C10,
 ];
 
+pub enum PaintAction {
+    None,
+    Saved(String),
+    SaveErr(String),
+}
+
 pub struct PaintState {
     pub buf: Vec<u32>,
     pub color_idx: usize,
     pub brush: i32,
+    pub eraser: bool,
+    pub fill_mode: bool,
+    pub brush_tier: u8,
     pub last_pos: Option<(i32, i32)>,
 }
 
@@ -176,7 +191,10 @@ impl PaintState {
         Self {
             buf: vec![0x0D1117; PAINT_W * PAINT_H],
             color_idx: 1,
-            brush: 3,
+            brush: 4,
+            eraser: false,
+            fill_mode: false,
+            brush_tier: 1,
             last_pos: None,
         }
     }
@@ -185,20 +203,60 @@ impl PaintState {
         self.last_pos = None;
     }
 
+    fn active_color(&self) -> u32 {
+        if self.eraser {
+            0x0D1117
+        } else {
+            PALETTE[self.color_idx]
+        }
+    }
+
     fn stamp_brush(&mut self, cx: i32, cy: i32, color: u32) {
-        let r = self.brush / 2;
-        let r2 = r * r + r;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if r > 1 && dx * dx + dy * dy > r2 {
-                    continue;
-                }
+        let rf = (self.brush as f32) * 0.5;
+        let ri = rf.ceil() as i32 + 1;
+        for dy in -ri..=ri {
+            for dx in -ri..=ri {
                 let px = cx + dx;
                 let py = cy + dy;
-                if px >= 0 && py >= 0 && px < PAINT_W as i32 && py < PAINT_H as i32 {
+                if px < 0 || py < 0 || px >= PAINT_W as i32 || py >= PAINT_H as i32 {
+                    continue;
+                }
+                let dist = ((dx * dx + dy * dy) as f32).sqrt() - rf;
+                if dist <= -0.35 {
                     self.buf[(py as usize) * PAINT_W + (px as usize)] = color;
+                } else if dist < 0.65 {
+                    let cov = ((0.65 - dist).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    if cov > 8 {
+                        let idx = (py as usize) * PAINT_W + (px as usize);
+                        self.buf[idx] = crate::gfx::blend_rgb(self.buf[idx], color, cov);
+                    }
                 }
             }
+        }
+    }
+
+    fn flood_fill(&mut self, sx: i32, sy: i32, replacement: u32) {
+        if sx < 0 || sy < 0 || sx >= PAINT_W as i32 || sy >= PAINT_H as i32 {
+            return;
+        }
+        let target = self.buf[(sy as usize) * PAINT_W + (sx as usize)];
+        if target == replacement {
+            return;
+        }
+        let mut stack = vec![(sx, sy)];
+        while let Some((x, y)) = stack.pop() {
+            if x < 0 || y < 0 || x >= PAINT_W as i32 || y >= PAINT_H as i32 {
+                continue;
+            }
+            let idx = (y as usize) * PAINT_W + (x as usize);
+            if self.buf[idx] != target {
+                continue;
+            }
+            self.buf[idx] = replacement;
+            stack.push((x + 1, y));
+            stack.push((x - 1, y));
+            stack.push((x, y + 1));
+            stack.push((x, y - 1));
         }
     }
 
@@ -209,11 +267,18 @@ impl PaintState {
             self.last_pos = None;
             return;
         }
-        let color = PALETTE[self.color_idx];
+        let color = self.active_color();
+        if self.fill_mode {
+            if self.last_pos.is_none() {
+                self.flood_fill(cx, cy, color);
+                self.last_pos = Some((cx, cy));
+            }
+            return;
+        }
         if let Some((x0, y0)) = self.last_pos {
             let dx = cx - x0;
             let dy = cy - y0;
-            let steps = dx.abs().max(dy.abs()).max(1);
+            let steps = (dx.abs().max(dy.abs()) * 2).max(1);
             for i in 1..=steps {
                 let px = x0 + (dx * i) / steps;
                 let py = y0 + (dy * i) / steps;
@@ -225,67 +290,175 @@ impl PaintState {
         self.last_pos = Some((cx, cy));
     }
 
-    pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) {
-        if ly >= wh - 36 && ly <= wh - 10 {
+    pub fn save_bmp(&self) -> Result<String, String> {
+        let mut c = Canvas::new(PAINT_W, PAINT_H);
+        c.pixels.copy_from_slice(&self.buf);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let fname = format!("pizpaint_{ts}.bmp");
+        let path = std::env::temp_dir().join(&fname);
+        c.write_bmp(&path)
+            .map(|()| fname)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) -> PaintAction {
+        if ly >= wh - 38 && ly <= wh - 8 {
             for i in 0..PALETTE.len() {
-                let bx = 14 + (i as i32) * 26;
-                if lx >= bx && lx <= bx + 20 {
+                let bx = 14 + (i as i32) * 20;
+                if lx >= bx && lx <= bx + 18 {
                     self.color_idx = i;
-                    return;
+                    self.eraser = false;
+                    return PaintAction::None;
                 }
             }
-            if (210..=270).contains(&lx) {
-                self.brush = if self.brush == 3 { 6 } else { 3 };
-                return;
+            if (156..=186).contains(&lx) {
+                self.brush_tier = (self.brush_tier + 1) % 3;
+                self.brush = match self.brush_tier {
+                    0 => 2,
+                    1 => 4,
+                    _ => 7,
+                };
+                return PaintAction::None;
             }
-            if (278..=350).contains(&lx) {
+            if (190..=236).contains(&lx) {
+                self.eraser = !self.eraser;
+                if self.eraser {
+                    self.fill_mode = false;
+                }
+                return PaintAction::None;
+            }
+            if (240..=280).contains(&lx) {
+                self.fill_mode = !self.fill_mode;
+                if self.fill_mode {
+                    self.eraser = false;
+                }
+                return PaintAction::None;
+            }
+            if (284..=318).contains(&lx) {
+                return match self.save_bmp() {
+                    Ok(f) => PaintAction::Saved(f),
+                    Err(e) => PaintAction::SaveErr(e),
+                };
+            }
+            if (322..=362).contains(&lx) {
                 self.buf.fill(0x0D1117);
-                return;
+                return PaintAction::None;
             }
         }
         self.paint_at(lx, ly);
+        PaintAction::None
     }
 
-    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, _ww: i32, wh: i32, lang: Lang) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        wx: i32,
+        wy: i32,
+        _ww: i32,
+        wh: i32,
+        lang: Lang,
+        accent: u32,
+        hover_lx: i32,
+        hover_ly: i32,
+    ) {
         let ox = wx + 14;
         let oy = wy + 36;
         canvas.blit_rgb_rect(ox, oy, PAINT_W as i32, PAINT_H as i32, &self.buf);
-        canvas.draw_rect(ox - 1, oy - 1, PAINT_W as i32 + 2, PAINT_H as i32 + 2, 0x30363D);
+        canvas.draw_rounded_rect_alpha(ox - 1, oy - 1, PAINT_W as i32 + 2, PAINT_H as i32 + 2, 6, 0xFFFFFF, 32);
+
+        // Live brush ring preview over canvas
+        let cx = hover_lx - 14;
+        let cy = hover_ly - 36;
+        if cx >= 0 && cy >= 0 && cx < PAINT_W as i32 && cy < PAINT_H as i32 {
+            let preview_col = if self.eraser { 0xF87171 } else { PALETTE[self.color_idx] };
+            let r = (self.brush as f32 * 0.5).max(1.5);
+            canvas.fill_aa_circle((wx + hover_lx) as f32, (wy + hover_ly) as f32, r + 1.0, 0xFFFFFF, 90);
+            canvas.fill_aa_circle((wx + hover_lx) as f32, (wy + hover_ly) as f32, r, preview_col, 145);
+        }
 
         let by = wy + wh - 34;
         for (i, &col) in PALETTE.iter().enumerate() {
-            let bx = wx + 14 + (i as i32) * 26;
-            canvas.fill_rounded_rect(bx, by, 20, 22, 4, col);
-            let border = if i == self.color_idx { 0xFFFFFF } else { 0x30363D };
-            canvas.draw_rounded_rect(bx, by, 20, 22, 4, border);
+            let cx_p = (wx + 23 + (i as i32) * 20) as f32;
+            let cy_p = (by + 11) as f32;
+            let sel = !self.eraser && i == self.color_idx;
+            if sel {
+                canvas.fill_aa_circle(cx_p, cy_p, 8.8, 0xFFFFFF, 225);
+                canvas.fill_aa_circle(cx_p, cy_p, 7.2, 0x131720, 255);
+            }
+            canvas.fill_aa_circle(cx_p, cy_p, 6.0, col, 255);
         }
-        let b_lbl = if self.brush == 3 { "1x" } else { "2x" };
-        canvas.draw_button(wx + 210, by, 60, 22, b_lbl, 0x21262D, 0xFFFFFF, 0x58A6FF);
+        let b_lbl = match self.brush_tier {
+            0 => "S",
+            1 => "M",
+            _ => "L",
+        };
+        canvas.draw_button(wx + 156, by, 30, 22, b_lbl, 0x21262D, 0xFFFFFF, accent);
+        let erase_bg = if self.eraser { accent } else { 0x21262D };
         canvas.draw_button(
-            wx + 278,
+            wx + 190,
             by,
-            72,
+            46,
             22,
-            tr(lang, "Очистить", "Clear"),
-            0xB62324,
+            tr(lang, "Ласт", "Eras"),
+            erase_bg,
             0xFFFFFF,
-            0xFF7B72,
+            if self.eraser { 0xFFFFFF } else { 0x475569 },
+        );
+        let fill_bg = if self.fill_mode { accent } else { 0x21262D };
+        canvas.draw_button(
+            wx + 240,
+            by,
+            40,
+            22,
+            tr(lang, "Зал", "Fill"),
+            fill_bg,
+            0xFFFFFF,
+            if self.fill_mode { 0xFFFFFF } else { 0x475569 },
+        );
+        canvas.draw_button(wx + 284, by, 34, 22, "BMP", 0x1E293B, 0x93C5FD, 0x38BDF8);
+        canvas.draw_button(
+            wx + 322,
+            by,
+            40,
+            22,
+            tr(lang, "Сбр", "Clr"),
+            0x9F1239,
+            0xFFFFFF,
+            0xFB7185,
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// 3. Zmeyka (Snake)
+// 3. Pizmeyka / Piznake
 // ---------------------------------------------------------------------------
 const SNAKE_COLS: i32 = 20;
 const SNAKE_ROWS: i32 = 14;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnakeEvent {
+    None,
+    AteBonus,
+    NewBest(u32),
+    GameOver,
+}
+
 pub struct SnakeState {
     pub body: Vec<(i32, i32)>,
+    pub prev_body: Vec<(i32, i32)>,
     pub dir: (i32, i32),
     pub food: (i32, i32),
+    pub bonus_food: Option<(i32, i32, u16)>,
     pub score: u32,
+    pub best_score: u32,
+    pub wrap_walls: bool,
+    pub move_t: f32,
     pub game_over: bool,
+    pub new_best_notified: bool,
     rng: u64,
 }
 
@@ -293,10 +466,16 @@ impl SnakeState {
     pub fn new() -> Self {
         let mut s = Self {
             body: Vec::new(),
+            prev_body: Vec::new(),
             dir: (1, 0),
             food: (12, 7),
+            bonus_food: None,
             score: 0,
+            best_score: 0,
+            wrap_walls: true,
+            move_t: 1.0,
             game_over: false,
+            new_best_notified: false,
             rng: 0x1337_BEEF_CAFE_0001,
         };
         s.reset();
@@ -305,10 +484,14 @@ impl SnakeState {
 
     pub fn reset(&mut self) {
         self.body = vec![(6, 7), (5, 7), (4, 7)];
+        self.prev_body = self.body.clone();
         self.dir = (1, 0);
         self.food = (14, 7);
+        self.bonus_food = None;
         self.score = 0;
+        self.move_t = 1.0;
         self.game_over = false;
+        self.new_best_notified = false;
     }
 
     fn next_rand(&mut self) -> i32 {
@@ -318,6 +501,17 @@ impl SnakeState {
         x ^= x << 17;
         self.rng = x;
         (x & 0x7FFF) as i32
+    }
+
+    fn spawn_free_cell(&mut self) -> (i32, i32) {
+        for _ in 0..32 {
+            let fx = self.next_rand() % SNAKE_COLS;
+            let fy = self.next_rand() % SNAKE_ROWS;
+            if !self.body.contains(&(fx, fy)) {
+                return (fx, fy);
+            }
+        }
+        (0, 0)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -337,76 +531,177 @@ impl SnakeState {
         }
     }
 
-    pub fn step(&mut self) {
+    pub fn step_interp(&mut self, div: u64, animated: bool) {
+        if !animated || self.game_over {
+            self.move_t = 1.0;
+            return;
+        }
+        let inc = 1.0 / (div.max(1) as f32);
+        self.move_t = (self.move_t + inc).min(1.0);
+    }
+
+    pub fn step(&mut self) -> SnakeEvent {
         if self.game_over || self.body.is_empty() {
-            return;
+            return SnakeEvent::None;
         }
+        self.prev_body = self.body.clone();
+        self.move_t = 0.0;
+
+        if let Some((bx, by, ttl)) = self.bonus_food {
+            if ttl <= 1 {
+                self.bonus_food = None;
+            } else {
+                self.bonus_food = Some((bx, by, ttl - 1));
+            }
+        }
+
         let head = self.body[0];
-        let nx = head.0 + self.dir.0;
-        let ny = head.1 + self.dir.1;
-        if nx < 0 || ny < 0 || nx >= SNAKE_COLS || ny >= SNAKE_ROWS || self.body.contains(&(nx, ny))
-        {
+        let mut nx = head.0 + self.dir.0;
+        let mut ny = head.1 + self.dir.1;
+        if self.wrap_walls {
+            nx = nx.rem_euclid(SNAKE_COLS);
+            ny = ny.rem_euclid(SNAKE_ROWS);
+        } else if nx < 0 || ny < 0 || nx >= SNAKE_COLS || ny >= SNAKE_ROWS {
             self.game_over = true;
-            return;
+            return SnakeEvent::GameOver;
         }
+        if self.body.contains(&(nx, ny)) {
+            self.game_over = true;
+            return SnakeEvent::GameOver;
+        }
+
+        let mut ev = SnakeEvent::None;
         self.body.insert(0, (nx, ny));
         if (nx, ny) == self.food {
             self.score += 10;
-            let fx = self.next_rand() % SNAKE_COLS;
-            let fy = self.next_rand() % SNAKE_ROWS;
-            self.food = (fx, fy);
+            self.food = self.spawn_free_cell();
+            if self.score.is_multiple_of(40) && self.bonus_food.is_none() {
+                let (bx, by) = self.spawn_free_cell();
+                self.bonus_food = Some((bx, by, 45));
+            }
+        } else if let Some((bx, by, _)) = self.bonus_food
+            && (nx, ny) == (bx, by)
+        {
+            self.score += 30;
+            self.bonus_food = None;
+            ev = SnakeEvent::AteBonus;
         } else {
             self.body.pop();
         }
+
+        if self.score > self.best_score {
+            let had_prev = self.best_score > 0;
+            self.best_score = self.score;
+            if had_prev && !self.new_best_notified {
+                self.new_best_notified = true;
+                return SnakeEvent::NewBest(self.best_score);
+            }
+        }
+        ev
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) {
-        if ly >= wh - 34 && ly <= wh - 10 && (14..=124).contains(&lx) {
-            self.reset();
+        if ly >= wh - 36 && ly <= wh - 8 {
+            if (14..=104).contains(&lx) {
+                self.reset();
+            } else if (110..=186).contains(&lx) {
+                self.wrap_walls = !self.wrap_walls;
+            }
         }
     }
 
-    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, _ww: i32, wh: i32, lang: Lang) {
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        wx: i32,
+        wy: i32,
+        wh: i32,
+        lang: Lang,
+        tick: u64,
+    ) {
         let gx = wx + 18;
         let gy = wy + 36;
         let cell = 14;
-        canvas.fill_rounded_rect(gx, gy, SNAKE_COLS * cell, SNAKE_ROWS * cell, 6, 0x090C10);
-        canvas.draw_rounded_rect(
-            gx - 1,
-            gy - 1,
-            SNAKE_COLS * cell + 2,
-            SNAKE_ROWS * cell + 2,
-            6,
-            0x30363D,
-        );
+        let bw = SNAKE_COLS * cell;
+        let bh = SNAKE_ROWS * cell;
+        canvas.fill_rounded_rect(gx, gy, bw, bh, 10, 0x090D14);
+        canvas.draw_rounded_rect_alpha(gx - 1, gy - 1, bw + 2, bh + 2, 10, 0xFFFFFF, 30);
 
-        canvas.fill_rounded_rect(
-            gx + self.food.0 * cell + 2,
-            gy + self.food.1 * cell + 2,
-            cell - 4,
-            cell - 4,
-            4,
-            0xF85149,
-        );
+        // Subtle dot matrix grid on board
+        for ry in 1..SNAKE_ROWS {
+            for rx in 1..SNAKE_COLS {
+                if (rx + ry) % 2 == 0 {
+                    canvas.blend_pixel(gx + rx * cell, gy + ry * cell, 0x475569, 40);
+                }
+            }
+        }
 
-        for (i, &(sx, sy)) in self.body.iter().enumerate() {
-            let col = if i == 0 { 0x56D364 } else { 0x2EA043 };
-            canvas.fill_rounded_rect(
-                gx + sx * cell + 1,
-                gy + sy * cell + 1,
-                cell - 2,
-                cell - 2,
-                3,
-                col,
-            );
+        // Glowing food orb
+        let pulse = 0.88 + 0.12 * ((tick as f32) * 0.16).sin();
+        let fx = gx as f32 + self.food.0 as f32 * cell as f32 + 7.0;
+        let fy = gy as f32 + self.food.1 as f32 * cell as f32 + 7.0;
+        canvas.fill_aa_circle(fx, fy, 7.5 * pulse, 0xF43F5E, 48);
+        canvas.fill_aa_circle(fx, fy, 4.8 * pulse, 0xFB7185, 255);
+        canvas.fill_aa_circle(fx - 1.3, fy - 1.3, 1.5, 0xFFFFFF, 190);
+
+        // Golden bonus apple orb
+        if let Some((bx, by, _)) = self.bonus_food {
+            let bpx = gx as f32 + bx as f32 * cell as f32 + 7.0;
+            let bpy = gy as f32 + by as f32 * cell as f32 + 7.0;
+            let gp = 0.85 + 0.15 * ((tick as f32) * 0.25).cos();
+            canvas.fill_aa_circle(bpx, bpy, 8.5 * gp, 0xF59E0B, 68);
+            canvas.fill_aa_circle(bpx, bpy, 5.2 * gp, 0xFBBF24, 255);
+            canvas.fill_aa_circle(bpx - 1.2, bpy - 1.2, 1.6, 0xFFFFFF, 220);
+        }
+
+        // Smoothly interpolated snake segments + connected joints
+        let t = self.move_t.clamp(0.0, 1.0);
+        let len = self.body.len();
+        for (i, &(sx, sy)) in self.body.iter().enumerate().rev() {
+            let (px, py) = self.prev_body.get(i).copied().unwrap_or((sx, sy));
+            let dx = sx - px;
+            let dy = sy - py;
+            let (ix, iy) = if dx.abs() <= 1 && dy.abs() <= 1 {
+                (px as f32 + (dx as f32) * t, py as f32 + (dy as f32) * t)
+            } else {
+                (sx as f32, sy as f32)
+            };
+            let cx = gx as f32 + ix * cell as f32 + 7.0;
+            let cy = gy as f32 + iy * cell as f32 + 7.0;
+            let radius = if i == 0 {
+                6.3
+            } else if i + 1 == len {
+                4.2
+            } else {
+                5.4
+            };
+            let col = if i == 0 {
+                0x4ADE80
+            } else {
+                lerp_rgb(0x22C55E, 0x15803D, i as u32, len.max(2) as u32)
+            };
+            canvas.fill_aa_circle(cx, cy, radius, col, 255);
+            if i == 0 {
+                // Cute eyes facing current direction
+                let (ex1, ey1, ex2, ey2) = match self.dir {
+                    (1, 0) => (cx + 2.2, cy - 2.3, cx + 2.2, cy + 2.3),
+                    (-1, 0) => (cx - 2.2, cy - 2.3, cx - 2.2, cy + 2.3),
+                    (0, -1) => (cx - 2.3, cy - 2.2, cx + 2.3, cy - 2.2),
+                    _ => (cx - 2.3, cy + 2.2, cx + 2.3, cy + 2.2),
+                };
+                canvas.fill_aa_circle(ex1, ey1, 1.4, 0x090D14, 255);
+                canvas.fill_aa_circle(ex2, ey2, 1.4, 0x090D14, 255);
+            }
         }
 
         if self.game_over {
+            canvas.blend_rounded_rect(gx + 34, gy + 74, bw - 68, 42, 10, 0x0B0F1A, 225);
+            canvas.draw_rounded_rect_alpha(gx + 34, gy + 74, bw - 68, 42, 10, 0xFB7185, 165);
             canvas.draw_text(
-                gx + 60,
+                gx + 54,
                 gy + 88,
                 tr(lang, "ПИЗДЕЦ! ИГРА ОКОНЧЕНА", "GAME OVER!"),
-                0xFF7B72,
+                0xFDA4AF,
                 1,
             );
         }
@@ -415,18 +710,33 @@ impl SnakeState {
         canvas.draw_button(
             wx + 14,
             by,
-            110,
+            90,
             22,
-            tr(lang, "Новая игра", "New Game"),
-            0x238636,
+            tr(lang, "Заново", "New Game"),
+            0x166534,
             0xFFFFFF,
-            0x3FB950,
+            0x4ADE80,
+        );
+        let mode_lbl = if self.wrap_walls {
+            tr(lang, "Портал", "Portal")
+        } else {
+            tr(lang, "Стены", "Walls")
+        };
+        canvas.draw_button(
+            wx + 110,
+            by,
+            76,
+            22,
+            mode_lbl,
+            if self.wrap_walls { 0x1E3A8A } else { 0x21262D },
+            0xE2E8F0,
+            if self.wrap_walls { 0x38BDF8 } else { 0x475569 },
         );
         let score_lbl = match lang {
-            Lang::Ru => format!("Очки: {} (WASD/Стрл)", self.score),
-            Lang::En => format!("Score: {} (WASD/Arrows)", self.score),
+            Lang::Ru => format!("{} (Р:{})", self.score, self.best_score),
+            Lang::En => format!("{} (B:{})", self.score, self.best_score),
         };
-        canvas.draw_text(wx + 134, by + 5, &score_lbl, 0xE6EDF3, 1);
+        canvas.draw_text_clipped(wx + 194, by + 4, 120, &score_lbl, 0xE6EDF3, 1);
     }
 }
 
@@ -489,20 +799,25 @@ impl NotepadState {
         }
     }
 
-    pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32, lang: Lang) {
+    pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32, lang: Lang) -> Option<String> {
         if ly >= wh - 34 && ly <= wh - 10 {
             if (14..=114).contains(&lx) {
                 let text = self.lines.join("\n");
                 let path = std::env::temp_dir().join("pizpad_note.txt");
-                self.saved_msg = match fs::write(&path, text) {
-                    Ok(()) => String::from(tr(lang, "Сохранено в pizpad_note.txt", "Saved to pizpad_note.txt")),
-                    Err(e) => format!("Err: {e}"),
-                };
+                match fs::write(&path, text) {
+                    Ok(()) => {
+                        let msg = tr(lang, "Сохранено в pizpad_note.txt", "Saved to pizpad_note.txt");
+                        self.saved_msg = String::from(msg);
+                        return Some(String::from(msg));
+                    }
+                    Err(e) => self.saved_msg = format!("Err: {e}"),
+                }
             } else if (122..=212).contains(&lx) {
                 self.lines = vec![String::new()];
                 self.saved_msg = String::from(tr(lang, "Очищено!", "Cleared!"));
             }
         }
+        None
     }
 
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, lang: Lang) {
@@ -510,16 +825,17 @@ impl NotepadState {
         let y = wy + 34;
         let iw = ww - 24;
         let ih = wh - 76;
-        canvas.fill_rounded_rect(x, y, iw, ih, 6, 0x0D1117);
-        canvas.draw_rounded_rect(x, y, iw, ih, 6, 0x30363D);
+        canvas.fill_rounded_rect(x, y, iw, ih, 10, 0x0B0E15);
+        canvas.draw_rounded_rect_alpha(x, y, iw, ih, 10, 0xFFFFFF, 24);
+        canvas.blend_rect(x + 12, y + 1, (iw - 24).max(0), 1, 0xFFFFFF, 16);
 
         let max_lines = ((ih - 8) / 15).max(1) as usize;
         for (i, line) in self.lines.iter().take(max_lines).enumerate() {
             let cursor = if i + 1 == self.lines.len() { "_" } else { "" };
             canvas.draw_text_clipped(
-                x + 8,
-                y + 6 + (i as i32) * 15,
-                iw - 16,
+                x + 10,
+                y + 8 + (i as i32) * 15,
+                iw - 20,
                 &format!("{line}{cursor}"),
                 0xE6EDF3,
                 1,
@@ -745,12 +1061,19 @@ pub const ACCENT_PALETTE: [u32; 5] = [
 ];
 
 struct HeroCache {
-    iw: i32,
+    pw: i32,
+    ph: i32,
+    mw: i32,
+    mh: i32,
+    pr: i32,
+    mr: i32,
     theme: ThemePreset,
     accent: u32,
     hero: Vec<u32>,
     mini: Vec<u32>,
 }
+
+pub const UI_SCALES: [u16; 4] = [100, 125, 150, 175];
 
 pub struct SettingsState {
     pub page: SettingsPage,
@@ -764,6 +1087,7 @@ pub struct SettingsState {
     pub animations: bool,
     pub genie_minimize: bool,
     pub glass_level: u8,
+    pub ui_scale_pct: u16,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub snake_tick_div: u64,
@@ -772,6 +1096,8 @@ pub struct SettingsState {
     pub update_taps: u8,
     pub license_alt: bool,
     pub tab_pill_y: f32,
+    pub tab_pill_vel: f32,
+    pub tab_fade: f32,
     pub toggle_anim: [f32; 8],
     pub display_picker: Option<DisplayPicker>,
     pub picker_anim: f32,
@@ -793,6 +1119,7 @@ impl SettingsState {
             animations: true,
             genie_minimize: true,
             glass_level: 0,
+            ui_scale_pct: 100,
             crosshair_cursor: false,
             show_clock: true,
             snake_tick_div: 10,
@@ -801,12 +1128,28 @@ impl SettingsState {
             update_taps: 0,
             license_alt: false,
             tab_pill_y: 90.0,
+            tab_pill_vel: 0.0,
+            tab_fade: 1.0,
             toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
             display_picker: None,
             picker_anim: 0.0,
             last_picker: None,
             hero_cache: RefCell::new(None),
         }
+    }
+
+    #[inline]
+    pub fn ui_scale(&self) -> f32 {
+        (self.ui_scale_pct as f32 / 100.0).clamp(0.75, 2.5)
+    }
+
+    pub fn step_ui_scale(&mut self, delta: i8) {
+        let cur = UI_SCALES
+            .iter()
+            .position(|&s| s == self.ui_scale_pct)
+            .unwrap_or(0) as i32;
+        let next = (cur + delta as i32).clamp(0, UI_SCALES.len() as i32 - 1) as usize;
+        self.ui_scale_pct = UI_SCALES[next];
     }
 
     #[inline]
@@ -856,6 +1199,8 @@ impl SettingsState {
         let p_tgt = if self.display_picker.is_some() { 1.0 } else { 0.0 };
         if !self.animations {
             self.tab_pill_y = target_pill;
+            self.tab_pill_vel = 0.0;
+            self.tab_fade = 1.0;
             self.picker_anim = p_tgt;
             if self.display_picker.is_none() {
                 self.last_picker = None;
@@ -872,21 +1217,26 @@ impl SettingsState {
                 self.last_picker = None;
             }
         } else {
-            self.picker_anim += pd * 0.35;
+            self.picker_anim += pd * 0.34;
         }
-        let diff = target_pill - self.tab_pill_y;
-        if diff.abs() < 0.25 {
-            self.tab_pill_y = target_pill;
-        } else {
-            self.tab_pill_y += diff * 0.28;
+        if self.tab_fade < 1.0 {
+            self.tab_fade = (self.tab_fade + 0.14).min(1.0);
         }
+        Canvas::step_spring(
+            &mut self.tab_pill_y,
+            &mut self.tab_pill_vel,
+            target_pill,
+            0.26,
+            0.66,
+            0.18,
+        );
         for (slot, &on) in self.toggle_anim.iter_mut().zip(targets.iter()) {
             let tgt = if on { 1.0 } else { 0.0 };
             let d = tgt - *slot;
-            if d.abs() < 0.015 {
+            if d.abs() < 0.012 {
                 *slot = tgt;
             } else {
-                *slot += d * 0.30;
+                *slot += d * 0.32;
             }
         }
     }
@@ -901,31 +1251,41 @@ impl SettingsState {
         let (x, y, iw) = hero_rect;
         let (scr_x, scr_y) = scr_pos;
         let cw = iw.clamp(16, 1200);
+        let (hx, pw) = canvas.span(x, cw);
+        let (hy, ph) = canvas.span(y, 90);
+        let (mx, mw) = canvas.span(scr_x, 32);
+        let (my, mh) = canvas.span(scr_y, 52);
+        let pr = canvas.sx(14);
+        let mr = canvas.sx(6);
         let mut cache_ref = self.hero_cache.borrow_mut();
-        let valid = cache_ref
-            .as_ref()
-            .is_some_and(|c| c.iw == cw && c.theme == self.theme && c.accent == accent);
-        if !valid {
+        let valid = cache_ref.as_ref().is_some_and(|c| {
+            c.pw == pw && c.ph == ph && c.mw == mw && c.mh == mh && c.theme == self.theme && c.accent == accent
+        });
+        if !valid && pw > 0 && ph > 0 && mw > 0 && mh > 0 {
             let (wp_tl, wp_br, wp_a, wp_b, _, wp_rib) = self.theme.mesh_palette();
-            let cw_u = cw as usize;
-            let mut hc = Canvas::new(cw_u, 90);
+            let mut hc = Canvas::new(pw as usize, ph as usize);
             hc.pixels.fill(0x131720);
-            hc.fill_luminous_card(
+            hc.fill_luminous_card_phys(
                 0,
                 0,
-                cw,
-                90,
-                14,
+                pw,
+                ph,
+                pr,
                 0x101521,
                 lerp_rgb(0x161E30, accent, 52, 255),
                 accent,
                 wp_rib,
             );
-            let mut mc = Canvas::new(32, 52);
+            let mut mc = Canvas::new(mw as usize, mh as usize);
             mc.pixels.fill(0x161B26);
-            mc.fill_luminous_card(0, 0, 32, 52, 6, wp_tl, wp_br, wp_a, wp_b);
+            mc.fill_luminous_card_phys(0, 0, mw, mh, mr, wp_tl, wp_br, wp_a, wp_b);
             *cache_ref = Some(HeroCache {
-                iw: cw,
+                pw,
+                ph,
+                mw,
+                mh,
+                pr,
+                mr,
                 theme: self.theme,
                 accent,
                 hero: hc.pixels,
@@ -933,8 +1293,9 @@ impl SettingsState {
             });
         }
         if let Some(c) = cache_ref.as_ref() {
-            canvas.blit_rgb_rect(x, y, cw, 90, &c.hero);
-            canvas.blit_rgb_rect(scr_x, scr_y, 32, 52, &c.mini);
+            let _ = (c.pr, c.mr);
+            canvas.blit_phys_rgb_rect(hx, hy, c.pw, c.ph, &c.hero);
+            canvas.blit_phys_rgb_rect(mx, my, c.mw, c.mh, &c.mini);
         }
     }
 
@@ -967,12 +1328,16 @@ impl SettingsState {
             let idx = (ly - 36) / 30;
             self.editing_device = false;
             self.display_picker = None;
+            let prev_page = self.page;
             match idx {
                 0 => self.page = SettingsPage::Display,
                 1 => self.page = SettingsPage::Taskbar,
                 2 => self.page = SettingsPage::System,
                 3 => self.page = SettingsPage::About,
                 _ => {}
+            }
+            if self.page != prev_page {
+                self.tab_fade = if self.animations { 0.0 } else { 1.0 };
             }
             return SettingsAction::None;
         }
@@ -1052,7 +1417,7 @@ impl SettingsState {
                     } else {
                         self.accent_idx = (self.accent_idx + 1) % 6;
                     }
-                } else if (256..=302).contains(&ly) && iw >= 160 {
+                } else if (254..=288).contains(&ly) && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let rel_x = lx - 146;
                     let idx = (rel_x / (sw_w + 6)) as usize;
@@ -1064,6 +1429,14 @@ impl SettingsState {
                     ];
                     if let Some(&preset) = presets.get(idx) {
                         self.theme = preset;
+                    }
+                } else if (294..=328).contains(&ly) {
+                    let pill_x0 = (ww - 196).max(146);
+                    if lx >= pill_x0 {
+                        let idx = (((lx - pill_x0) * 4) / 184).clamp(0, 3) as usize;
+                        self.ui_scale_pct = UI_SCALES[idx];
+                    } else {
+                        self.step_ui_scale(1);
                     }
                 }
             }
@@ -1178,7 +1551,7 @@ impl SettingsState {
         canvas.draw_text_clipped(x + 32, mid_y - 7, 150, label, 0xE2E8F0, 1);
 
         let max_vw = (w - 190).max(40);
-        let vw = crate::font::measure_text(value, 1).min(max_vw);
+        let vw = canvas.measure_text(value, 1).min(max_vw);
         canvas.draw_text_clipped(x + w - 24 - vw, mid_y - 7, max_vw, value, 0x94A3B8, 1);
         Self::draw_chevron(canvas, (x + w - 14) as f32, mid_y as f32);
     }
@@ -1261,6 +1634,13 @@ impl SettingsState {
         }
 
         let x = wx + 146;
+        let tab_dy = if self.animations && self.tab_fade < 0.99 {
+            ((1.0 - Canvas::ease_out_cubic(self.tab_fade)) * 7.0).round() as i32
+        } else {
+            0
+        };
+        let wy_base = wy;
+        let wy = wy + tab_dy;
         let y = wy + 36;
         let iw = ww - 158;
         let in_content = hover_lx >= 146 && hover_lx < ww - 12;
@@ -1374,9 +1754,9 @@ impl SettingsState {
                 }
 
                 // Interactive ColorOS Luminous Theme Swatches
-                let sw_y = wy + 256;
-                let sw_h = (wy + wh - 10 - sw_y).clamp(32, 46);
-                if sw_y + 32 <= wy + wh - 8 && iw >= 160 {
+                let sw_y = wy + 254;
+                let sw_h = if wy + wh >= sw_y + 78 { 32 } else { (wy + wh - 10 - sw_y).clamp(24, 34) };
+                if sw_y + 24 <= wy + wh - 8 && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let presets = [
                         ThemePreset::AuroraPeaks,
@@ -1400,13 +1780,59 @@ impl SettingsState {
                         );
                         if selected {
                             canvas.fill_aa_circle(
-                                (sx + sw_w - 11) as f32,
-                                (sw_y + 11) as f32,
-                                3.2,
+                                (sx + sw_w - 10) as f32,
+                                (sw_y + 10) as f32,
+                                3.0,
                                 0xFFFFFF,
                                 240,
                             );
                         }
+                    }
+                }
+
+                // Card 4: Segmented UI Scale Switcher (100% / 125% / 150% / 175%)
+                let sc_y = wy + 294;
+                if sc_y + 32 <= wy_base + wh - 4 {
+                    Self::draw_card_frame(canvas, x, sc_y, iw, 34, 12);
+                    let mid_y = sc_y + 17;
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, 0x2DD4BF, 32);
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, 0x2DD4BF, 240);
+                    canvas.draw_text_clipped(
+                        x + 32,
+                        mid_y - 7,
+                        (iw - 210).max(40),
+                        tr(lang, "Масштаб UI", "UI Scale"),
+                        0xE2E8F0,
+                        1,
+                    );
+                    let seg_x0 = (wx + ww - 196).max(x + 110);
+                    let seg_w = 184;
+                    canvas.fill_rounded_rect(seg_x0, sc_y + 5, seg_w, 24, 8, 0x0E121B);
+                    let cell_w = seg_w / 4;
+                    for (idx, &pct) in UI_SCALES.iter().enumerate() {
+                        let px = seg_x0 + (idx as i32) * cell_w + 2;
+                        let pw = cell_w - 4;
+                        let active = self.ui_scale_pct == pct;
+                        if active {
+                            canvas.blend_rounded_rect(px, sc_y + 7, pw, 20, 6, accent, 170);
+                            canvas.draw_rounded_rect_alpha(px, sc_y + 7, pw, 20, 6, 0xFFFFFF, 85);
+                        } else if in_content
+                            && (294..=328).contains(&hover_ly)
+                            && hover_lx >= (px - wx)
+                            && hover_lx < (px - wx + pw)
+                        {
+                            canvas.blend_rounded_rect(px, sc_y + 7, pw, 20, 6, 0xFFFFFF, 18);
+                        }
+                        let lbl = format!("{pct}%");
+                        let tw = canvas.measure_text(&lbl, 1);
+                        canvas.draw_text_clipped(
+                            px + ((pw - tw) / 2).max(2),
+                            sc_y + 10,
+                            pw - 4,
+                            &lbl,
+                            if active { 0xFFFFFF } else { 0x94A3B8 },
+                            1,
+                        );
                     }
                 }
             }
@@ -1610,7 +2036,7 @@ impl SettingsState {
                     iw,
                     34,
                     0x3FB950,
-                    tr(lang, "Скорость Змейки", "Snake Speed"),
+                    tr(lang, "Скорость Pizмейки", "Piznake Speed"),
                     spd,
                     in_content && (138..172).contains(&hover_ly),
                     false,
@@ -1679,7 +2105,7 @@ impl SettingsState {
 
                 // Wordmark + Floating Liquid-Glass Version Pill
                 canvas.draw_text_clipped(x + 18, y + 13, iw - 126, "pizdOS", 0xFFFFFF, 2);
-                let title_w = crate::font::measure_text("pizdOS", 2);
+                let title_w = canvas.measure_text("pizdOS", 2);
                 let pill_x = x + 18 + title_w + 8;
                 if pill_x + 42 < x + iw - 96 {
                     canvas.blend_rounded_rect(pill_x, y + 16, 36, 19, 9, 0xFFFFFF, 28);
@@ -2035,6 +2461,7 @@ pub struct CalcState {
     pub acc: Option<i64>,
     pub op: Option<char>,
     pub clear_next: bool,
+    pub flash: Option<(usize, f32)>,
 }
 
 const CALC_BUTTONS: [&str; 16] = [
@@ -2051,10 +2478,25 @@ impl CalcState {
             acc: None,
             op: None,
             clear_next: false,
+            flash: None,
+        }
+    }
+
+    pub fn step_anim(&mut self) {
+        if let Some((idx, v)) = self.flash {
+            let next = v - 0.14;
+            if next <= 0.01 {
+                self.flash = None;
+            } else {
+                self.flash = Some((idx, next));
+            }
         }
     }
 
     pub fn press(&mut self, token: &str) {
+        if let Some(pos) = CALC_BUTTONS.iter().position(|&b| b == token) {
+            self.flash = Some((pos, 1.0));
+        }
         match token {
             "C" => {
                 self.display = String::from("0");
@@ -2148,8 +2590,8 @@ impl CalcState {
         let x = wx + 12;
         let y = wy + 34;
         let iw = ww - 24;
-        canvas.fill_rounded_rect(x, y, iw, 42, 8, 0x0B0E14);
-        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 8, 0xFFFFFF, 22);
+        canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x090D14);
+        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xFFFFFF, 26);
         if let (Some(a), Some(op)) = (self.acc, self.op) {
             canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
         }
@@ -2167,11 +2609,18 @@ impl CalcState {
             let by = gy + row * row_h + 2;
             let bw = col_w - 4;
             let bh = row_h - 4;
-            let (bg, border) = match *tok {
-                "=" => (accent, 0x79C0FF),
-                "C" => (0xB62324, 0xFF7B72),
-                "+" | "-" | "*" | "/" => (0x1F2937, 0x388BFD),
-                _ => (0x21262D, 0x30363D),
+            let (base_bg, border) = match *tok {
+                "=" => (accent, 0x93C5FD),
+                "C" => (0x9F1239, 0xFB7185),
+                "+" | "-" | "*" | "/" => (0x1B2333, accent),
+                _ => (0x1A202E, 0x475569),
+            };
+            let bg = if let Some((f_idx, fv)) = self.flash
+                && f_idx == idx
+            {
+                lerp_rgb(base_bg, 0xFFFFFF, (fv * 90.0) as u32, 255)
+            } else {
+                base_bg
             };
             canvas.draw_button(bx, by, bw, bh, tok, bg, 0xFFFFFF, border);
         }
@@ -2240,8 +2689,8 @@ impl MatrixState {
         let y = wy + 34;
         let iw = ww - 20;
         let ih = wh - 70;
-        canvas.fill_rounded_rect(x, y, iw, ih, 6, 0x050A06);
-        canvas.draw_rounded_rect(x, y, iw, ih, 6, 0x30363D);
+        canvas.fill_rounded_rect(x, y, iw, ih, 10, 0x050A06);
+        canvas.draw_rounded_rect_alpha(x, y, iw, ih, 10, 0xFFFFFF, 26);
 
         let glyphs = ['0', '1', 'P', 'Z', 'Я', 'Ж', 'Ф', '@', '#', '7'];
         let base_col = MATRIX_COLORS[self.color_idx];

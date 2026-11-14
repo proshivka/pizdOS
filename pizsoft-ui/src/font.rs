@@ -26,6 +26,7 @@ pub struct VectorGlyph {
 
 pub struct RasterGlyph {
     pub advance: i32,
+    pub advance_f: f32,
     pub width: usize,
     pub height: usize,
     pub alpha: Vec<u8>,
@@ -33,14 +34,14 @@ pub struct RasterGlyph {
 
 struct FontCaches {
     ascii_1x: [Option<&'static RasterGlyph>; 95],
-    other: HashMap<(char, i32), &'static RasterGlyph>,
+    other: HashMap<(char, i32, u16), &'static RasterGlyph>,
 }
 
 impl FontCaches {
     fn new() -> Self {
         Self {
             ascii_1x: [None; 95],
-            other: HashMap::with_capacity(128),
+            other: HashMap::with_capacity(256),
         }
     }
 }
@@ -58,36 +59,44 @@ pub fn px_height_for_scale(scale: i32) -> i32 {
     }
 }
 
-pub fn measure_text(s: &str, scale: i32) -> i32 {
-    let sc = scale.max(1);
-    let mut total = 0i32;
-    for ch in s.chars() {
-        total += rasterize_cached(ch, sc).advance;
-    }
-    total
+#[inline]
+fn ui_scale_key(ui_scale: f32) -> u16 {
+    (ui_scale.clamp(0.5, 4.0) * 100.0).round() as u16
 }
 
-pub fn rasterize_cached(ch: char, scale: i32) -> &'static RasterGlyph {
+pub fn measure_text_scaled(s: &str, scale: i32, ui_scale: f32) -> i32 {
+    let sc = scale.max(1);
+    let ui = ui_scale.clamp(0.5, 4.0);
+    let mut total_f = 0.0f32;
+    for ch in s.chars() {
+        total_f += rasterize_scaled_cached(ch, sc, ui).advance_f;
+    }
+    (total_f / ui).ceil() as i32
+}
+
+pub fn rasterize_scaled_cached(ch: char, scale: i32, ui_scale: f32) -> &'static RasterGlyph {
     let s = scale.max(1);
+    let key_s = ui_scale_key(ui_scale);
     GLYPH_CACHE.with(|cache| {
         let mut fc = cache.borrow_mut();
-        if s == 1 {
+        if s == 1 && key_s == 100 {
             let u = ch as u32;
             if (0x20..=0x7E).contains(&u) {
                 let idx = (u - 0x20) as usize;
                 if let Some(g) = fc.ascii_1x[idx] {
                     return g;
                 }
-                let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s)));
+                let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s, 1.0)));
                 fc.ascii_1x[idx] = Some(leaked);
                 return leaked;
             }
         }
-        if let Some(&g) = fc.other.get(&(ch, s)) {
+        if let Some(&g) = fc.other.get(&(ch, s, key_s)) {
             return g;
         }
-        let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s)));
-        fc.other.insert((ch, s), leaked);
+        let eff_ui = key_s as f32 / 100.0;
+        let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s, eff_ui)));
+        fc.other.insert((ch, s, key_s), leaked);
         leaked
     })
 }
@@ -150,17 +159,20 @@ fn flatten_segs(segs: &[Seg], scale_f: f32, lines: &mut Vec<(f32, f32, f32, f32)
     }
 }
 
-fn build_raster_glyph(ch: char, scale: i32) -> RasterGlyph {
+fn build_raster_glyph(ch: char, scale: i32, ui_scale: f32) -> RasterGlyph {
     let vg = vector_glyph(ch);
-    let px_h = px_height_for_scale(scale);
+    let base_h = px_height_for_scale(scale) as f32;
+    let px_h = (base_h * ui_scale).round().clamp(10.0, 128.0) as i32;
     let unit = (px_h as f32) / 100.0;
-    let advance = ((vg.advance as f32) * unit).round().max(3.0) as i32;
-    let width = (advance as usize + 3).max(4);
+    let advance_f = ((vg.advance as f32) * unit).max(3.0);
+    let advance = advance_f.round() as i32;
+    let width = (advance_f.ceil() as usize + 3).max(4);
     let height = px_h as usize;
 
     if vg.segs.is_empty() {
         return RasterGlyph {
             advance,
+            advance_f,
             width,
             height,
             alpha: vec![0; width * height],
@@ -171,39 +183,47 @@ fn build_raster_glyph(ch: char, scale: i32) -> RasterGlyph {
     let mut dots = Vec::with_capacity(4);
     flatten_segs(vg.segs, unit, &mut lines, &mut dots);
 
-    let stroke_r = (0.52 * (px_h as f32 / 14.0).powf(0.88)).clamp(0.48, 1.35);
-    let aa_feather = 0.52_f32;
+    let stroke_r = (0.56 * (px_h as f32 / 14.0).powf(0.88)).clamp(0.50, 2.6);
+    let aa_feather = (0.46 * (14.0 / (px_h as f32)).sqrt()).clamp(0.32, 0.50);
     let mut alpha = vec![0u8; width * height];
+    const SUB_OFF: [f32; 2] = [0.25, 0.75];
 
     for py in 0..height {
-        let fy = py as f32 + 0.5;
         for px in 0..width {
-            let fx = px as f32 + 0.5;
-            let mut min_dist = f32::MAX;
-
-            for &(x0, y0, x1, y1) in &lines {
-                let d2 = dist_seg_sq(fx, fy, x0, y0, x1, y1);
-                let d = d2.sqrt() - stroke_r;
-                if d < min_dist {
-                    min_dist = d;
+            let mut cov_sum = 0.0f32;
+            for &oy in &SUB_OFF {
+                let fy = py as f32 + oy;
+                for &ox in &SUB_OFF {
+                    let fx = px as f32 + ox;
+                    let mut min_dist = f32::MAX;
+                    for &(x0, y0, x1, y1) in &lines {
+                        let d2 = dist_seg_sq(fx, fy, x0, y0, x1, y1);
+                        let d = d2.sqrt() - stroke_r;
+                        if d < min_dist {
+                            min_dist = d;
+                        }
+                    }
+                    for &(cx, cy, dr) in &dots {
+                        let d = ((fx - cx) * (fx - cx) + (fy - cy) * (fy - cy)).sqrt() - dr;
+                        if d < min_dist {
+                            min_dist = d;
+                        }
+                    }
+                    cov_sum += ((aa_feather - min_dist) / (aa_feather * 2.0)).clamp(0.0, 1.0);
                 }
             }
-            for &(cx, cy, dr) in &dots {
-                let d = ((fx - cx) * (fx - cx) + (fy - cy) * (fy - cy)).sqrt() - dr;
-                if d < min_dist {
-                    min_dist = d;
-                }
-            }
-
-            let cov = ((aa_feather - min_dist) / (aa_feather * 2.0)).clamp(0.0, 1.0);
-            if cov > 0.01 {
-                alpha[py * width + px] = (cov * 255.0).round() as u8;
+            let cov = (cov_sum * 0.25).clamp(0.0, 1.0);
+            if cov > 0.015 {
+                // Perceptual gamma lift so diagonal & subpixel-aligned stems don't wash out
+                let lifted = cov.powf(0.74);
+                alpha[py * width + px] = (lifted * 255.0).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
 
     RasterGlyph {
         advance,
+        advance_f,
         width,
         height,
         alpha,
@@ -257,6 +277,8 @@ pub fn vector_glyph(ch: char) -> VectorGlyph {
         '—' => vg(62, &[L(8, 50, 54, 50)]),
         '─' => vg(54, &[L(8, 50, 46, 50)]),
         '□' => vg(54, &[L(12, 24, 42, 24), L(42, 24, 42, 68), L(42, 68, 12, 68), L(12, 68, 12, 24)]),
+        '✓' => vg(54, &[L(10, 52, 23, 68), L(23, 68, 45, 28)]),
+        '°' => vg(36, &[E(18, 25, 8, 9, 0, 360)]),
 
         // Digits
         '0' => vg(54, &[E(27, 46, 16, 30, 0, 360)]),

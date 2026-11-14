@@ -2,12 +2,14 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::font::{GLYPH_H, RasterGlyph, measure_text, rasterize_cached};
+use crate::font::{GLYPH_H, RasterGlyph, measure_text_scaled, rasterize_scaled_cached};
 
 /// 32-bit XRGB pixel canvas (0x00RRGGBB).
+/// Supports logical coordinates automatically mapped to native physical pixels via `ui_scale`.
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
+    pub ui_scale: f32,
     pub pixels: Vec<u32>,
 }
 
@@ -51,8 +53,54 @@ impl Canvas {
         Self {
             width,
             height,
+            ui_scale: 1.0,
             pixels: vec![0; width.saturating_mul(height)],
         }
+    }
+
+    #[inline]
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = scale.clamp(0.75, 3.0);
+    }
+
+    #[inline]
+    pub fn logical_width(&self) -> i32 {
+        (self.width as f32 / self.ui_scale).round().max(1.0) as i32
+    }
+
+    #[inline]
+    pub fn logical_height(&self) -> i32 {
+        (self.height as f32 / self.ui_scale).round().max(1.0) as i32
+    }
+
+    #[inline]
+    pub fn sx(&self, v: i32) -> i32 {
+        if (self.ui_scale - 1.0).abs() < 0.001 {
+            v
+        } else {
+            (v as f32 * self.ui_scale).round() as i32
+        }
+    }
+
+    #[inline]
+    pub fn sf(&self, v: f32) -> f32 {
+        v * self.ui_scale
+    }
+
+    #[inline]
+    pub fn span(&self, pos: i32, size: i32) -> (i32, i32) {
+        if (self.ui_scale - 1.0).abs() < 0.001 {
+            (pos, size)
+        } else {
+            let p0 = (pos as f32 * self.ui_scale).round() as i32;
+            let p1 = ((pos + size) as f32 * self.ui_scale).round() as i32;
+            (p0, (p1 - p0).max(0))
+        }
+    }
+
+    #[inline]
+    pub fn measure_text(&self, text: &str, scale: i32) -> i32 {
+        measure_text_scaled(text, scale, self.ui_scale)
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -65,21 +113,30 @@ impl Canvas {
     }
 
     #[inline]
-    pub fn set_pixel(&mut self, x: i32, y: i32, color: u32) {
+    fn set_pixel_phys(&mut self, x: i32, y: i32, color: u32) {
         if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
             self.pixels[(y as usize) * self.width + (x as usize)] = color;
         }
     }
 
     #[inline]
-    pub fn blend_pixel(&mut self, x: i32, y: i32, color: u32, alpha: u8) {
+    fn blend_pixel_phys(&mut self, x: i32, y: i32, color: u32, alpha: u8) {
         if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
             let idx = (y as usize) * self.width + (x as usize);
             self.pixels[idx] = blend_rgb(self.pixels[idx], color, alpha);
         }
     }
 
-    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    #[inline]
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: u32, alpha: u8) {
+        if (self.ui_scale - 1.0).abs() < 0.001 {
+            self.blend_pixel_phys(x, y, color, alpha);
+        } else {
+            self.blend_rect(x, y, 1, 1, color, alpha);
+        }
+    }
+
+    fn fill_rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
         if w <= 0 || h <= 0 {
             return;
         }
@@ -93,8 +150,14 @@ impl Canvas {
         }
     }
 
-    /// Copy an opaque packed RGB pixel buffer (`w x h`) onto the canvas with clipping.
-    pub fn blit_rgb_rect(&mut self, dx: i32, dy: i32, w: i32, h: i32, src: &[u32]) {
+    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
+        let (px, pw) = self.span(x, w);
+        let (py, ph) = self.span(y, h);
+        self.fill_rect_phys(px, py, pw, ph, color);
+    }
+
+    /// Copy an opaque packed physical RGB pixel buffer (`pw x ph`) at physical `(dx, dy)` without rescaling.
+    pub fn blit_phys_rgb_rect(&mut self, dx: i32, dy: i32, w: i32, h: i32, src: &[u32]) {
         if w <= 0 || h <= 0 || src.len() < (w as usize) * (h as usize) {
             return;
         }
@@ -116,12 +179,46 @@ impl Canvas {
         }
     }
 
-    pub fn blend_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u8) {
+    /// Copy or cleanly scale an opaque packed RGB pixel buffer (`w x h`) onto the logical canvas rect.
+    pub fn blit_rgb_rect(&mut self, dx: i32, dy: i32, w: i32, h: i32, src: &[u32]) {
+        if w <= 0 || h <= 0 || src.len() < (w as usize) * (h as usize) {
+            return;
+        }
+        if (self.ui_scale - 1.0).abs() < 0.001 {
+            self.blit_phys_rgb_rect(dx, dy, w, h, src);
+            return;
+        }
+        let (px0, dw) = self.span(dx, w);
+        let (py0, dh) = self.span(dy, h);
+        if dw <= 0 || dh <= 0 {
+            return;
+        }
+        let x0 = px0.max(0);
+        let y0 = py0.max(0);
+        let x1 = (px0 + dw).min(self.width as i32);
+        let y1 = (py0 + dh).min(self.height as i32);
+        let sw = w as usize;
+        for py in y0..y1 {
+            let sy = (((py - py0) as f32 / dh as f32) * (h as f32))
+                .floor()
+                .clamp(0.0, (h - 1) as f32) as usize;
+            let dst_off = (py as usize) * self.width;
+            let src_off = sy * sw;
+            for px in x0..x1 {
+                let sx = (((px - px0) as f32 / dw as f32) * (w as f32))
+                    .floor()
+                    .clamp(0.0, (w - 1) as f32) as usize;
+                self.pixels[dst_off + px as usize] = src[src_off + sx];
+            }
+        }
+    }
+
+    fn blend_rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u8) {
         if w <= 0 || h <= 0 || alpha == 0 {
             return;
         }
         if alpha == 255 {
-            self.fill_rect(x, y, w, h, color);
+            self.fill_rect_phys(x, y, w, h, color);
             return;
         }
         let x0 = x.max(0) as usize;
@@ -145,14 +242,10 @@ impl Canvas {
         }
     }
 
-    pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        self.fill_rect(x, y, w, 1, color);
-        self.fill_rect(x, y + h - 1, w, 1, color);
-        self.fill_rect(x, y, 1, h, color);
-        self.fill_rect(x + w - 1, y, 1, h, color);
+    pub fn blend_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u8) {
+        let (px, pw) = self.span(x, w);
+        let (py, ph) = self.span(y, h);
+        self.blend_rect_phys(px, py, pw, ph, color, alpha);
     }
 
     #[inline]
@@ -161,35 +254,38 @@ impl Canvas {
             return 255;
         }
         let dist = ((ox as f32 * ox as f32 + oy as f32 * oy as f32).sqrt()) - (r as f32 - 0.5);
-        ((0.5 - dist).clamp(0.0, 1.0) * 255.0) as u8
+        let cov = (0.5 - dist).clamp(0.0, 1.0);
+        (cov.powf(0.86) * 255.0).round() as u8
     }
 
     pub fn fill_rounded_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = r.min(w / 2).min(h / 2).max(0);
+        let r = self.sx(r).min(w / 2).min(h / 2).max(0);
         if r == 0 {
-            self.fill_rect(x, y, w, h, color);
+            self.fill_rect_phys(x, y, w, h, color);
             return;
         }
-        self.fill_rect(x + r, y, w - 2 * r, h, color);
-        self.fill_rect(x, y + r, r, h - 2 * r, color);
-        self.fill_rect(x + w - r, y + r, r, h - 2 * r, color);
+        self.fill_rect_phys(x + r, y, w - 2 * r, h, color);
+        self.fill_rect_phys(x, y + r, r, h - 2 * r, color);
+        self.fill_rect_phys(x + w - r, y + r, r, h - 2 * r, color);
 
         for dy in 0..r {
             for dx in 0..r {
                 let cov = Self::corner_cov(r - 1 - dx, r - 1 - dy, r);
                 if cov == 255 {
-                    self.set_pixel(x + dx, y + dy, color);
-                    self.set_pixel(x + w - 1 - dx, y + dy, color);
-                    self.set_pixel(x + dx, y + h - 1 - dy, color);
-                    self.set_pixel(x + w - 1 - dx, y + h - 1 - dy, color);
+                    self.set_pixel_phys(x + dx, y + dy, color);
+                    self.set_pixel_phys(x + w - 1 - dx, y + dy, color);
+                    self.set_pixel_phys(x + dx, y + h - 1 - dy, color);
+                    self.set_pixel_phys(x + w - 1 - dx, y + h - 1 - dy, color);
                 } else if cov > 0 {
-                    self.blend_pixel(x + dx, y + dy, color, cov);
-                    self.blend_pixel(x + w - 1 - dx, y + dy, color, cov);
-                    self.blend_pixel(x + dx, y + h - 1 - dy, color, cov);
-                    self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, cov);
+                    self.blend_pixel_phys(x + dx, y + dy, color, cov);
+                    self.blend_pixel_phys(x + w - 1 - dx, y + dy, color, cov);
+                    self.blend_pixel_phys(x + dx, y + h - 1 - dy, color, cov);
+                    self.blend_pixel_phys(x + w - 1 - dx, y + h - 1 - dy, color, cov);
                 }
             }
         }
@@ -206,23 +302,25 @@ impl Canvas {
         top_col: u32,
         bot_col: u32,
     ) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = r.min(w / 2).min(h / 2).max(0);
+        let r = self.sx(r).min(w / 2).min(h / 2).max(0);
         let max_t = (h - 1).max(1) as u32;
         for dy in 0..h {
             let col = lerp_rgb(top_col, bot_col, dy as u32, max_t);
             if dy >= r && dy < h - r {
-                self.fill_rect(x, y + dy, w, 1, col);
+                self.fill_rect_phys(x, y + dy, w, 1, col);
             } else {
                 let cy = if dy < r { r - 1 - dy } else { dy - (h - r) };
-                self.fill_rect(x + r, y + dy, w - 2 * r, 1, col);
+                self.fill_rect_phys(x + r, y + dy, w - 2 * r, 1, col);
                 for dx in 0..r {
                     let cov = Self::corner_cov(r - 1 - dx, cy, r);
                     if cov > 0 {
-                        self.blend_pixel(x + dx, y + dy, col, cov);
-                        self.blend_pixel(x + w - 1 - dx, y + dy, col, cov);
+                        self.blend_pixel_phys(x + dx, y + dy, col, cov);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + dy, col, cov);
                     }
                 }
             }
@@ -240,23 +338,25 @@ impl Canvas {
         top_col: u32,
         bot_col: u32,
     ) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = r.min(w / 2).min(h).max(0);
+        let r = self.sx(r).min(w / 2).min(h).max(0);
         let max_t = (h - 1).max(1) as u32;
         for dy in 0..h {
             let col = lerp_rgb(top_col, bot_col, dy as u32, max_t);
             if dy >= r {
-                self.fill_rect(x, y + dy, w, 1, col);
+                self.fill_rect_phys(x, y + dy, w, 1, col);
             } else {
                 let cy = r - 1 - dy;
-                self.fill_rect(x + r, y + dy, w - 2 * r, 1, col);
+                self.fill_rect_phys(x + r, y + dy, w - 2 * r, 1, col);
                 for dx in 0..r {
                     let cov = Self::corner_cov(r - 1 - dx, cy, r);
                     if cov > 0 {
-                        self.blend_pixel(x + dx, y + dy, col, cov);
-                        self.blend_pixel(x + w - 1 - dx, y + dy, col, cov);
+                        self.blend_pixel_phys(x + dx, y + dy, col, cov);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + dy, col, cov);
                     }
                 }
             }
@@ -274,23 +374,25 @@ impl Canvas {
         left_col: u32,
         right_col: u32,
     ) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = r.min(w / 2).min(h / 2).max(0);
+        let r = self.sx(r).min(w / 2).min(h / 2).max(0);
         let max_t = (w - 1).max(1) as u32;
         for dx in 0..w {
             let col = lerp_rgb(left_col, right_col, dx as u32, max_t);
             if dx >= r && dx < w - r {
-                self.fill_rect(x + dx, y, 1, h, col);
+                self.fill_rect_phys(x + dx, y, 1, h, col);
             } else {
                 let cx = if dx < r { r - 1 - dx } else { dx - (w - r) };
-                self.fill_rect(x + dx, y + r, 1, h - 2 * r, col);
+                self.fill_rect_phys(x + dx, y + r, 1, h - 2 * r, col);
                 for dy in 0..r {
                     let cov = Self::corner_cov(cx, r - 1 - dy, r);
                     if cov > 0 {
-                        self.blend_pixel(x + dx, y + dy, col, cov);
-                        self.blend_pixel(x + dx, y + h - 1 - dy, col, cov);
+                        self.blend_pixel_phys(x + dx, y + dy, col, cov);
+                        self.blend_pixel_phys(x + dx, y + h - 1 - dy, col, cov);
                     }
                 }
             }
@@ -308,13 +410,15 @@ impl Canvas {
         color: u32,
         alpha: u8,
     ) {
-        if w <= 0 || h <= 0 {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
+        if w <= 0 || h <= 0 || alpha == 0 {
             return;
         }
-        let r = r.min(w / 2).min(h / 2).max(0);
-        self.blend_rect(x + r, y, w - 2 * r, h, color, alpha);
-        self.blend_rect(x, y + r, r, h - 2 * r, color, alpha);
-        self.blend_rect(x + w - r, y + r, r, h - 2 * r, color, alpha);
+        let r = self.sx(r).min(w / 2).min(h / 2).max(0);
+        self.blend_rect_phys(x + r, y, w - 2 * r, h, color, alpha);
+        self.blend_rect_phys(x, y + r, r, h - 2 * r, color, alpha);
+        self.blend_rect_phys(x + w - r, y + r, r, h - 2 * r, color, alpha);
 
         for dy in 0..r {
             for dx in 0..r {
@@ -322,10 +426,10 @@ impl Canvas {
                 if cov > 0 {
                     let a = ((alpha as u32 * cov as u32) / 255) as u8;
                     if a > 0 {
-                        self.blend_pixel(x + dx, y + dy, color, a);
-                        self.blend_pixel(x + w - 1 - dx, y + dy, color, a);
-                        self.blend_pixel(x + dx, y + h - 1 - dy, color, a);
-                        self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, a);
+                        self.blend_pixel_phys(x + dx, y + dy, color, a);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + dy, color, a);
+                        self.blend_pixel_phys(x + dx, y + h - 1 - dy, color, a);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + h - 1 - dy, color, a);
                     }
                 }
             }
@@ -333,7 +437,7 @@ impl Canvas {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn fill_luminous_card(
+    pub fn fill_luminous_card_phys(
         &mut self,
         x: i32,
         y: i32,
@@ -402,7 +506,6 @@ impl Canvas {
                     cb += (gb2 - cb) * w2;
                 }
 
-                // Subtle Liquid Glass top-edge specular sheen
                 if dy == 1 {
                     cr += (255.0 - cr) * 0.14;
                     cg += (255.0 - cg) * 0.14;
@@ -413,12 +516,31 @@ impl Canvas {
                     | ((cg.clamp(0.0, 255.0) as u32) << 8)
                     | (cb.clamp(0.0, 255.0) as u32);
                 if cov == 255 {
-                    self.set_pixel(x + dx, y + dy, col);
+                    self.set_pixel_phys(x + dx, y + dy, col);
                 } else {
-                    self.blend_pixel(x + dx, y + dy, col, cov);
+                    self.blend_pixel_phys(x + dx, y + dy, col, cov);
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_luminous_card(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        r: i32,
+        tl_col: u32,
+        br_col: u32,
+        glow_a: u32,
+        glow_b: u32,
+    ) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
+        let r = self.sx(r);
+        self.fill_luminous_card_phys(x, y, w, h, r, tl_col, br_col, glow_a, glow_b);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -432,21 +554,23 @@ impl Canvas {
         color: u32,
         alpha: u8,
     ) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
         if w <= 1 || h <= 1 || alpha == 0 {
             return;
         }
-        let r = r.min(w / 2).min(h / 2).max(0);
+        let r = self.sx(r).min(w / 2).min(h / 2).max(0);
         if r == 0 {
-            self.blend_rect(x, y, w, 1, color, alpha);
-            self.blend_rect(x, y + h - 1, w, 1, color, alpha);
-            self.blend_rect(x, y + 1, 1, h - 2, color, alpha);
-            self.blend_rect(x + w - 1, y + 1, 1, h - 2, color, alpha);
+            self.blend_rect_phys(x, y, w, 1, color, alpha);
+            self.blend_rect_phys(x, y + h - 1, w, 1, color, alpha);
+            self.blend_rect_phys(x, y + 1, 1, h - 2, color, alpha);
+            self.blend_rect_phys(x + w - 1, y + 1, 1, h - 2, color, alpha);
             return;
         }
-        self.blend_rect(x + r, y, w - 2 * r, 1, color, alpha);
-        self.blend_rect(x + r, y + h - 1, w - 2 * r, 1, color, alpha);
-        self.blend_rect(x, y + r, 1, h - 2 * r, color, alpha);
-        self.blend_rect(x + w - 1, y + r, 1, h - 2 * r, color, alpha);
+        self.blend_rect_phys(x + r, y, w - 2 * r, 1, color, alpha);
+        self.blend_rect_phys(x + r, y + h - 1, w - 2 * r, 1, color, alpha);
+        self.blend_rect_phys(x, y + r, 1, h - 2 * r, color, alpha);
+        self.blend_rect_phys(x + w - 1, y + r, 1, h - 2 * r, color, alpha);
 
         let rf = r as f32 - 0.5;
         for dy in 0..r {
@@ -456,23 +580,22 @@ impl Canvas {
                 let dist = ((ox * ox + oy * oy).sqrt() - rf).abs();
                 let cov = (1.0 - dist).clamp(0.0, 1.0);
                 if cov > 0.01 {
-                    let a = (alpha as f32 * cov) as u8;
+                    let a = (alpha as f32 * cov.powf(0.85)) as u8;
                     if a > 0 {
-                        self.blend_pixel(x + dx, y + dy, color, a);
-                        self.blend_pixel(x + w - 1 - dx, y + dy, color, a);
-                        self.blend_pixel(x + dx, y + h - 1 - dy, color, a);
-                        self.blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, a);
+                        self.blend_pixel_phys(x + dx, y + dy, color, a);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + dy, color, a);
+                        self.blend_pixel_phys(x + dx, y + h - 1 - dy, color, a);
+                        self.blend_pixel_phys(x + w - 1 - dx, y + h - 1 - dy, color, a);
                     }
                 }
             }
         }
     }
 
-    pub fn draw_rounded_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
-        self.draw_rounded_rect_alpha(x, y, w, h, r, color, 255);
-    }
-
     pub fn fill_aa_circle(&mut self, cx: f32, cy: f32, r: f32, color: u32, alpha: u8) {
+        let cx = self.sf(cx);
+        let cy = self.sf(cy);
+        let r = self.sf(r);
         if r <= 0.0 || alpha == 0 {
             return;
         }
@@ -505,7 +628,7 @@ impl Canvas {
                 }
                 let dist = d2.sqrt() - r;
                 let cov = (0.5 - dist).clamp(0.0, 1.0);
-                let a = (alpha as f32 * cov) as u8;
+                let a = (alpha as f32 * cov.powf(0.85)) as u8;
                 if a > 0 {
                     let idx = row + px as usize;
                     self.pixels[idx] = blend_rgb(self.pixels[idx], color, a);
@@ -525,7 +648,11 @@ impl Canvas {
         color: u32,
         alpha: u8,
     ) {
-        let half_t = (thickness * 0.5).max(0.4);
+        let x0 = self.sf(x0);
+        let y0 = self.sf(y0);
+        let x1 = self.sf(x1);
+        let y1 = self.sf(y1);
+        let half_t = (self.sf(thickness) * 0.5).max(0.45);
         let min_x = (x0.min(x1) - half_t - 1.0).floor() as i32;
         let max_x = (x0.max(x1) + half_t + 1.0).ceil() as i32;
         let min_y = (y0.min(y1) - half_t - 1.0).floor() as i32;
@@ -544,9 +671,9 @@ impl Canvas {
                 let dist = (dx * dx + dy * dy).sqrt() - half_t;
                 let cov = (0.5 - dist).clamp(0.0, 1.0);
                 if cov > 0.01 {
-                    let a = (alpha as f32 * cov) as u8;
+                    let a = (alpha as f32 * cov.powf(0.82)) as u8;
                     if a > 0 {
-                        self.blend_pixel(px, py, color, a);
+                        self.blend_pixel_phys(px, py, color, a);
                     }
                 }
             }
@@ -568,6 +695,12 @@ impl Canvas {
         if alpha == 0 {
             return;
         }
+        let x0 = self.sf(x0);
+        let y0 = self.sf(y0);
+        let x1 = self.sf(x1);
+        let y1 = self.sf(y1);
+        let x2 = self.sf(x2);
+        let y2 = self.sf(y2);
         let min_x = x0.min(x1).min(x2).floor() as i32 - 1;
         let max_x = x0.max(x1).max(x2).ceil() as i32 + 1;
         let min_y = y0.min(y1).min(y2).floor() as i32 - 1;
@@ -591,9 +724,9 @@ impl Canvas {
                 let d = e0.min(e1).min(e2);
                 let cov = (d + 0.5).clamp(0.0, 1.0);
                 if cov > 0.01 {
-                    let a = (alpha as f32 * cov) as u8;
+                    let a = (alpha as f32 * cov.powf(0.85)) as u8;
                     if a > 0 {
-                        self.blend_pixel(px, py, color, a);
+                        self.blend_pixel_phys(px, py, color, a);
                     }
                 }
             }
@@ -621,20 +754,19 @@ impl Canvas {
         let right_x = (inner_x + inner_w).clamp(sx, sx + sw);
         let right_w = (sx + sw - right_x).max(0);
 
-        // Straight outer bands outside the inner window rect (zero wasted fills behind opaque UI!)
         if top_h > sr {
-            self.blend_rect(sx, sy + sr, sw, top_h - sr, 0x000000, alpha);
+            self.blend_rect_phys(sx, sy + sr, sw, top_h - sr, 0x000000, alpha);
         }
         let top_bar_h = top_h.min(sr);
         if top_bar_h > 0 {
-            self.blend_rect(sx + sr, sy, (sw - 2 * sr).max(0), top_bar_h, 0x000000, alpha);
+            self.blend_rect_phys(sx + sr, sy, (sw - 2 * sr).max(0), top_bar_h, 0x000000, alpha);
         }
         if bot_h > sr {
-            self.blend_rect(sx, bot_y, sw, bot_h - sr, 0x000000, alpha);
+            self.blend_rect_phys(sx, bot_y, sw, bot_h - sr, 0x000000, alpha);
         }
         let bot_bar_h = bot_h.min(sr);
         if bot_bar_h > 0 {
-            self.blend_rect(
+            self.blend_rect_phys(
                 sx + sr,
                 sy + sh - bot_bar_h,
                 (sw - 2 * sr).max(0),
@@ -645,10 +777,10 @@ impl Canvas {
         }
         if mid_h > 0 {
             if left_w > 0 {
-                self.blend_rect(sx, mid_y, left_w, mid_h, 0x000000, alpha);
+                self.blend_rect_phys(sx, mid_y, left_w, mid_h, 0x000000, alpha);
             }
             if right_w > 0 {
-                self.blend_rect(right_x, mid_y, right_w, mid_h, 0x000000, alpha);
+                self.blend_rect_phys(right_x, mid_y, right_w, mid_h, 0x000000, alpha);
             }
         }
         for dy in 0..sr {
@@ -664,7 +796,7 @@ impl Canvas {
                             (sx + sw - 1 - dx, sy + sh - 1 - dy),
                         ] {
                             if px < inner_x || px >= inner_x + inner_w || py < inner_y || py >= inner_y + inner_h {
-                                self.blend_pixel(px, py, 0x000000, a);
+                                self.blend_pixel_phys(px, py, 0x000000, a);
                             }
                         }
                     }
@@ -674,15 +806,20 @@ impl Canvas {
     }
 
     pub fn draw_soft_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32) {
+        let (x, w) = self.span(x, w);
+        let (y, h) = self.span(y, h);
+        let r = self.sx(r);
+        let s = self.ui_scale;
+        let d = |v: i32| (v as f32 * s).round() as i32;
         let ir = r.min(w / 2).min(h / 2).max(0);
         let inner = (x + ir, y + ir, (w - 2 * ir).max(0), (h - 2 * ir).max(0));
-        self.blend_rounded_outer_ring((x - 6, y + 2, w + 12, h + 14, r + 7), inner, 14);
-        self.blend_rounded_outer_ring((x - 3, y + 4, w + 6, h + 8, r + 4), inner, 24);
-        self.blend_rounded_outer_ring((x, y + 5, w + 2, h + 5, r + 2), inner, 36);
-        self.blend_rounded_outer_ring((x + 1, y + 6, w, h + 2, r + 1), inner, 48);
+        self.blend_rounded_outer_ring((x - d(6), y + d(2), w + d(12), h + d(14), r + d(7)), inner, 13);
+        self.blend_rounded_outer_ring((x - d(3), y + d(4), w + d(6), h + d(8), r + d(4)), inner, 22);
+        self.blend_rounded_outer_ring((x, y + d(5), w + d(2), h + d(5), r + d(2)), inner, 34);
+        self.blend_rounded_outer_ring((x + d(1), y + d(6), w, h + d(2), r + d(1)), inner, 46);
     }
 
-    fn draw_glyph(&mut self, x: i32, y: i32, g: &RasterGlyph, color: u32) -> i32 {
+    fn draw_glyph_phys(&mut self, x: i32, y: i32, g: &RasterGlyph, color: u32) {
         let x0 = (-x).max(0) as usize;
         let y0 = (-y).max(0) as usize;
         let x1 = ((self.width as i32 - x).min(g.width as i32)).max(0) as usize;
@@ -698,21 +835,25 @@ impl Canvas {
                 }
             }
         }
-        g.advance
     }
 
     pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: u32, scale: i32) -> i32 {
-        let g = rasterize_cached(ch, scale);
-        self.draw_glyph(x, y, g, color)
+        let g = rasterize_scaled_cached(ch, scale, self.ui_scale);
+        self.draw_glyph_phys(self.sx(x), self.sx(y), g, color);
+        g.advance
     }
 
     pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, scale: i32) {
-        let mut cx = x;
+        let mut cx_f = self.sf(x as f32);
+        let py = self.sx(y);
         for ch in text.chars() {
-            if cx >= self.width as i32 {
+            let px = cx_f.round() as i32;
+            if px >= self.width as i32 {
                 break;
             }
-            cx += self.draw_char(cx, y, ch, color, scale);
+            let g = rasterize_scaled_cached(ch, scale, self.ui_scale);
+            self.draw_glyph_phys(px, py, g, color);
+            cx_f += g.advance_f;
         }
     }
 
@@ -729,14 +870,16 @@ impl Canvas {
             return;
         }
         let s = scale.max(1);
-        let limit = x + max_w;
-        let mut cx = x;
+        let limit_phys = self.sx(x + max_w) as f32;
+        let mut cx_f = self.sf(x as f32);
+        let py = self.sx(y);
         for ch in text.chars() {
-            let g = rasterize_cached(ch, s);
-            if cx + g.advance > limit {
+            let g = rasterize_scaled_cached(ch, s, self.ui_scale);
+            if cx_f + g.advance_f > limit_phys {
                 break;
             }
-            cx += self.draw_glyph(cx, y, g, color);
+            self.draw_glyph_phys(cx_f.round() as i32, py, g, color);
+            cx_f += g.advance_f;
         }
     }
 
@@ -777,12 +920,13 @@ impl Canvas {
         fg_color: u32,
         border_color: u32,
     ) {
-        let r = 7.min(w / 2).min(h / 2);
-        let top_col = lerp_rgb(bg_color, 0xFFFFFF, 10, 255);
+        let r = 8.min(w / 2).min(h / 2);
+        let top_col = lerp_rgb(bg_color, 0xFFFFFF, 14, 255);
         let bot_col = lerp_rgb(bg_color, 0x000000, 10, 255);
         self.fill_vgradient_rounded_rect(x, y, w, h, r, top_col, bot_col);
-        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 85);
-        let tw = measure_text(label, 1);
+        self.blend_rect(x + r, y + 1, (w - 2 * r).max(0), 1, 0xFFFFFF, 28);
+        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 72);
+        let tw = self.measure_text(label, 1);
         let tx = x + ((w - tw) / 2).max(4);
         let ty = y + ((h - (GLYPH_H as i32)) / 2).max(1);
         self.draw_text_clipped(tx, ty, w - 8, label, fg_color, 1);
@@ -845,6 +989,44 @@ impl Canvas {
     }
 
     #[inline]
+    pub fn ease_out_cubic(x: f32) -> f32 {
+        let inv = 1.0 - x.clamp(0.0, 1.0);
+        1.0 - inv * inv * inv
+    }
+
+    #[inline]
+    pub fn ease_in_out_cubic(x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        if x < 0.5 {
+            4.0 * x * x * x
+        } else {
+            1.0 - (-2.0 * x + 2.0).powi(3) * 0.5
+        }
+    }
+
+    /// Subtle overshoot curve for natural springy open/pop-in motion.
+    #[inline]
+    pub fn ease_out_back(x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        const C1: f32 = 1.35;
+        const C3: f32 = C1 + 1.0;
+        let t = x - 1.0;
+        1.0 + C3 * t * t * t + C1 * t * t
+    }
+
+    /// Critical/softly damped spring integrator step for silky non-linear UI motion.
+    #[inline]
+    pub fn step_spring(pos: &mut f32, vel: &mut f32, target: f32, stiffness: f32, damping: f32, snap: f32) {
+        let force = (target - *pos) * stiffness;
+        *vel = (*vel + force) * damping;
+        *pos += *vel;
+        if (*pos - target).abs() < snap && vel.abs() < snap {
+            *pos = target;
+            *vel = 0.0;
+        }
+    }
+
+    #[inline]
     fn blit_warped_row(
         &mut self,
         src_row: &[u32],
@@ -876,12 +1058,23 @@ impl Canvas {
         let edge_fade = span > 8.0;
 
         for px in x0..=x1 {
-            let sx = (sx_fp >> 16).clamp(0, max_sx) as usize;
+            let sxi = (sx_fp >> 16).clamp(0, max_sx) as usize;
+            let frac = ((sx_fp & 0xFFFF) >> 8) as u32;
             sx_fp += step_fp;
-            let src_px = src_row[sx];
-            if (src_px >> 24) != 0 {
+            let c0 = src_row[sxi];
+            if (c0 >> 24) != 0 {
                 continue;
             }
+            let src_px = if sxi + 1 < sw {
+                let c1 = src_row[sxi + 1];
+                if (c1 >> 24) == 0 && frac > 0 {
+                    lerp_rgb(c0, c1, frac, 256)
+                } else {
+                    c0
+                }
+            } else {
+                c0
+            };
             let pix_a = if edge_fade {
                 let cov = (px as f32 + 1.0 - row_l)
                     .clamp(0.0, 1.0)
@@ -899,8 +1092,8 @@ impl Canvas {
         }
     }
 
-    /// Warp an offscreen window capture (`0xFF______` = transparent) along a macOS-style
-    /// S-curve funnel into `target_pill (px, py, pw)`. `t = 1.0` open -> `0.0` minimized.
+    /// Warp an offscreen physical window capture (`0xFF______` = transparent) along a macOS-style
+    /// S-curve funnel into logical `target_pill (px, py, pw)`. `t = 1.0` open -> `0.0` minimized.
     pub fn blit_genie_rect(
         &mut self,
         src: &[u32],
@@ -914,24 +1107,24 @@ impl Canvas {
         if sw <= 1 || sh <= 1 || src.len() < (sw as usize) * (sh as usize) {
             return;
         }
-        let t = t.clamp(0.0, 1.0);
+        let t = Self::ease_in_out_cubic(t);
         if t <= 0.005 {
             return;
         }
         let p = 1.0 - t;
-        let funnel = Self::smoothstep(p / 0.48);
-        let slide = Self::smoothstep((p - 0.14) / 0.86);
-        let pull_near = Self::smoothstep(p * 1.32);
+        let funnel = Self::ease_out_cubic(p / 0.48);
+        let slide = Self::ease_in_out_cubic((p - 0.12) / 0.88);
+        let pull_near = Self::ease_out_cubic(p * 1.32);
 
-        let wx = win_pos.0 as f32;
-        let wy = win_pos.1 as f32;
+        let wx = self.sf(win_pos.0 as f32);
+        let wy = self.sf(win_pos.1 as f32);
         let sw_f = sw as f32;
         let sh_f = sh as f32;
         let wr = wx + sw_f;
 
-        let px_f = target_pill.0 as f32;
-        let pr_f = px_f + (target_pill.2.max(12)) as f32;
-        let dock_anchor = target_pill.1 as f32 + if top_dock { 18.0 } else { 14.0 };
+        let px_f = self.sf(target_pill.0 as f32);
+        let pr_f = px_f + self.sf((target_pill.2.max(12)) as f32);
+        let dock_anchor = self.sf(target_pill.1 as f32 + if top_dock { 18.0 } else { 14.0 });
 
         let near_l = wx + (px_f - wx) * funnel;
         let near_r = wr + (pr_f - wr) * funnel;
@@ -942,11 +1135,11 @@ impl Canvas {
         let (top_y, bot_y) = if top_dock {
             (
                 wy + (dock_anchor - wy) * pull_near,
-                (wy + sh_f) + (dock_anchor + 4.0 - (wy + sh_f)) * slide,
+                (wy + sh_f) + (dock_anchor + self.sf(4.0) - (wy + sh_f)) * slide,
             )
         } else {
             (
-                wy + (dock_anchor - 4.0 - wy) * slide,
+                wy + (dock_anchor - self.sf(4.0) - wy) * slide,
                 (wy + sh_f) + (dock_anchor - (wy + sh_f)) * pull_near,
             )
         };
@@ -978,7 +1171,7 @@ impl Canvas {
         }
     }
 
-    /// Blit a captured offscreen window scaled around `dst_center` with uniform opacity `alpha`.
+    /// Blit a captured physical offscreen window scaled around logical `dst_center` with opacity `alpha`.
     pub fn blit_scaled_alpha_rect(
         &mut self,
         src: &[u32],
@@ -993,9 +1186,11 @@ impl Canvas {
         }
         let dw = (sw as f32) * scale;
         let dh = (sh as f32) * scale;
-        let row_l = dst_center.0 - dw * 0.5;
+        let cx_p = self.sf(dst_center.0);
+        let cy_p = self.sf(dst_center.1);
+        let row_l = cx_p - dw * 0.5;
         let row_r = row_l + dw;
-        let top_y = dst_center.1 - dh * 0.5;
+        let top_y = cy_p - dh * 0.5;
         let bot_y = top_y + dh;
         let y0 = (top_y.round() as i32).max(0);
         let y1 = (bot_y.round() as i32).min(self.height as i32 - 1);

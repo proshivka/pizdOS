@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsAction,
-    SettingsState, SnakeState, TerminalState, ThemePreset, tr,
+    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintAction, PaintState, SettingsAction,
+    SettingsState, SnakeEvent, SnakeState, TerminalState, ThemePreset, UI_SCALES, tr,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
@@ -159,6 +159,31 @@ fn detect_resize_edge(win: &Window, x: i32, y: i32) -> ResizeEdge {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapZone {
+    Left,
+    Right,
+    Maximize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub text: String,
+    pub color: u32,
+    pub ttl: u16,
+    pub max_ttl: u16,
+    pub anim: f32,
+    pub vel: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClickRipple {
+    pub x: i32,
+    pub y: i32,
+    pub t: f32,
+    pub color: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Window {
     pub id: AppId,
@@ -174,6 +199,7 @@ pub struct Window {
     pub min_anim: f32,
     pub close_anim: f32,
     pub vis_rect: [f32; 4],
+    pub vis_vel: [f32; 4],
 }
 
 impl Window {
@@ -192,12 +218,14 @@ impl Window {
             min_anim: if open { 1.0 } else { 0.0 },
             close_anim: if open { 1.0 } else { 0.0 },
             vis_rect: [x as f32, y as f32, w as f32, h as f32],
+            vis_vel: [0.0; 4],
         }
     }
 
     #[inline]
     fn sync_vis_rect(&mut self) {
         self.vis_rect = [self.x as f32, self.y as f32, self.w as f32, self.h as f32];
+        self.vis_vel = [0.0; 4];
     }
 }
 
@@ -242,10 +270,26 @@ pub struct Desktop {
     pub running: bool,
     pub start_menu_open: bool,
     pub start_anim: f32,
+    pub start_vel: f32,
     pub ctx_menu: Option<(i32, i32)>,
     pub ctx_anim: f32,
     pub last_ctx_menu: Option<(i32, i32)>,
+    pub cc_open: bool,
+    pub cc_anim: f32,
+    pub cc_vel: f32,
+    pub launcher_open: bool,
+    pub launcher_anim: f32,
+    pub launcher_vel: f32,
+    pub launcher_query: String,
+    pub launcher_sel: usize,
+    pub snap_zone: Option<SnapZone>,
+    pub last_snap: Option<SnapZone>,
+    pub snap_anim: f32,
+    pub toast: Option<Toast>,
+    pub ripples: Vec<ClickRipple>,
     pub dock_float_anim: f32,
+    pub dock_float_vel: f32,
+    pub last_canvas_size: (i32, i32),
     pub icon_hover: [f32; 8],
     pub mouse_x: i32,
     pub mouse_y: i32,
@@ -290,6 +334,113 @@ pub struct Desktop {
     anim_canvas: RefCell<Canvas>,
 }
 
+#[derive(Clone, Copy)]
+enum LauncherKind {
+    App(AppId),
+    NextTheme,
+    ToggleDock,
+    RefreshMetrics,
+    SetScale(u16),
+    MathCopy(f64),
+}
+
+struct LauncherEntry {
+    label: String,
+    badge: &'static str,
+    color: u32,
+    kind: LauncherKind,
+}
+
+fn fmt_math(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 && v.abs() < 1e14 {
+        format!("{}", v.round() as i64)
+    } else {
+        let s = format!("{v:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+pub fn eval_quick_math(raw: &str) -> Option<f64> {
+    let s: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() || !s.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'*' | b'/' | b'.' | b'(' | b')'))
+    {
+        return None;
+    }
+    fn parse_expr(b: &[u8], i: &mut usize) -> Option<f64> {
+        let mut lhs = parse_term(b, i)?;
+        while *i < b.len() && matches!(b[*i], b'+' | b'-') {
+            let op = b[*i];
+            *i += 1;
+            let rhs = parse_term(b, i)?;
+            lhs = if op == b'+' { lhs + rhs } else { lhs - rhs };
+        }
+        Some(lhs)
+    }
+    fn parse_term(b: &[u8], i: &mut usize) -> Option<f64> {
+        let mut lhs = parse_factor(b, i)?;
+        while *i < b.len() && matches!(b[*i], b'*' | b'/') {
+            let op = b[*i];
+            *i += 1;
+            let rhs = parse_factor(b, i)?;
+            if op == b'/' {
+                if rhs.abs() < 1e-12 {
+                    return None;
+                }
+                lhs /= rhs;
+            } else {
+                lhs *= rhs;
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_factor(b: &[u8], i: &mut usize) -> Option<f64> {
+        if *i >= b.len() {
+            return None;
+        }
+        if b[*i] == b'-' {
+            *i += 1;
+            return parse_factor(b, i).map(|v| -v);
+        }
+        if b[*i] == b'+' {
+            *i += 1;
+            return parse_factor(b, i);
+        }
+        if b[*i] == b'(' {
+            *i += 1;
+            let v = parse_expr(b, i)?;
+            if *i >= b.len() || b[*i] != b')' {
+                return None;
+            }
+            *i += 1;
+            return Some(v);
+        }
+        let start = *i;
+        let mut seen_dot = false;
+        while *i < b.len() && (b[*i].is_ascii_digit() || (b[*i] == b'.' && !seen_dot)) {
+            if b[*i] == b'.' {
+                seen_dot = true;
+            }
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        core::str::from_utf8(&b[start..*i]).ok()?.parse::<f64>().ok()
+    }
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    let val = parse_expr(bytes, &mut idx)?;
+    if idx != bytes.len() || !val.is_finite() {
+        return None;
+    }
+    Some(val)
+}
+
 impl Desktop {
     pub fn new(width: i32, height: i32) -> Self {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -303,10 +454,26 @@ impl Desktop {
             running: true,
             start_menu_open: false,
             start_anim: 0.0,
+            start_vel: 0.0,
             ctx_menu: None,
             ctx_anim: 0.0,
             last_ctx_menu: None,
+            cc_open: false,
+            cc_anim: 0.0,
+            cc_vel: 0.0,
+            launcher_open: false,
+            launcher_anim: 0.0,
+            launcher_vel: 0.0,
+            launcher_query: String::new(),
+            launcher_sel: 0,
+            snap_zone: None,
+            last_snap: None,
+            snap_anim: 0.0,
+            toast: None,
+            ripples: Vec::with_capacity(8),
             dock_float_anim: 0.0,
+            dock_float_vel: 0.0,
+            last_canvas_size: (width.max(320), height.max(240)),
             icon_hover: [0.0; 8],
             mouse_x: width / 2,
             mouse_y: height / 2,
@@ -368,6 +535,206 @@ impl Desktop {
         d.reload_packages();
         d.reload_files();
         d
+    }
+
+    pub fn push_toast(&mut self, text: impl Into<String>, color: u32) {
+        let mut msg = text.into();
+        if msg.chars().count() > 48 {
+            msg = msg.chars().take(45).collect::<String>() + "...";
+        }
+        self.toast = Some(Toast {
+            text: msg,
+            color,
+            ttl: 115,
+            max_ttl: 115,
+            anim: if self.settings.animations { 0.05 } else { 1.0 },
+            vel: 0.0,
+        });
+    }
+
+    pub fn toggle_control_center(&mut self) {
+        self.cc_open = !self.cc_open;
+        if self.cc_open {
+            self.start_menu_open = false;
+            self.ctx_menu = None;
+            self.launcher_open = false;
+        }
+    }
+
+    pub fn toggle_launcher(&mut self) {
+        self.launcher_open = !self.launcher_open;
+        if self.launcher_open {
+            self.start_menu_open = false;
+            self.ctx_menu = None;
+            self.cc_open = false;
+            self.launcher_query.clear();
+            self.launcher_sel = 0;
+        }
+    }
+
+    fn snap_rect(&self, zone: SnapZone, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32) {
+        let reserve = self.dock_reserve();
+        let top_bar = if self.settings.taskbar_top { reserve } else { 0 };
+        let avail_h = (canvas_h - reserve).max(180);
+        match zone {
+            SnapZone::Maximize => (0, top_bar, canvas_w.max(220), avail_h),
+            SnapZone::Left => (6, top_bar + 6, (canvas_w / 2 - 9).max(160), (avail_h - 12).max(160)),
+            SnapZone::Right => (
+                canvas_w / 2 + 3,
+                top_bar + 6,
+                (canvas_w / 2 - 9).max(160),
+                (avail_h - 12).max(160),
+            ),
+        }
+    }
+
+    fn rescale_viewport(&mut self, old_scale: f32, cur_log_w: i32, cur_log_h: i32) {
+        let new_scale = self.settings.ui_scale();
+        if (new_scale - old_scale).abs() > 0.001 && cur_log_w > 0 && cur_log_h > 0 {
+            let phys_w = (cur_log_w as f32) * old_scale;
+            let phys_h = (cur_log_h as f32) * old_scale;
+            let nw = (phys_w / new_scale).round().max(320.0) as i32;
+            let nh = (phys_h / new_scale).round().max(240.0) as i32;
+            self.on_viewport_resize(nw, nh);
+        }
+    }
+
+    fn launcher_entries(&self) -> Vec<LauncherEntry> {
+        let lang = self.settings.lang;
+        let accent = self.settings.active_accent();
+        let q = self.launcher_query.trim().to_lowercase();
+        let mut out = Vec::new();
+
+        if let Some(val) = eval_quick_math(&self.launcher_query) {
+            out.push(LauncherEntry {
+                label: format!("= {}", fmt_math(val)),
+                badge: tr(lang, "ВЫЧИСЛЕНИЕ", "CALC"),
+                color: 0x38BDF8,
+                kind: LauncherKind::MathCopy(val),
+            });
+        }
+
+        let app_aliases = [
+            (AppId::Terminal, "terminal консоль bash term"),
+            (AppId::Paint, "paint draw кисть рисование pizpaint"),
+            (AppId::Snake, "snake game игра змейка piznake pizмейка"),
+            (AppId::Notepad, "notepad notes блокнот заметки pizpad"),
+            (AppId::Calc, "calc math калькулятор счет"),
+            (AppId::Matrix, "matrix rain матрица"),
+            (AppId::Files, "files explorer файлы проводник"),
+            (AppId::PizGet, "pizget packages пакеты apt"),
+            (AppId::System, "system cpu ram система монитор"),
+            (AppId::Settings, "settings theme scale настройки тема масштаб"),
+        ];
+        for (id, alias) in app_aliases {
+            let title = id.title(lang);
+            if q.is_empty()
+                || title.to_lowercase().contains(&q)
+                || alias.contains(&q)
+            {
+                out.push(LauncherEntry {
+                    label: String::from(title),
+                    badge: tr(lang, "ПРИЛОЖЕНИЕ", "APP"),
+                    color: id.color(),
+                    kind: LauncherKind::App(id),
+                });
+            }
+        }
+
+        let actions = [
+            (
+                tr(lang, "Следующие обои", "Next Wallpaper"),
+                tr(lang, "ДЕЙСТВИЕ", "ACTION"),
+                accent,
+                LauncherKind::NextTheme,
+                "wallpaper обои theme тема color",
+            ),
+            (
+                tr(lang, "Переключить плавучий док", "Toggle Floating Dock"),
+                tr(lang, "ДЕЙСТВИЕ", "ACTION"),
+                0xA855F7,
+                LauncherKind::ToggleDock,
+                "dock док panel панель float",
+            ),
+            (
+                tr(lang, "Обновить метрики системы", "Refresh System Metrics"),
+                tr(lang, "ДЕЙСТВИЕ", "ACTION"),
+                0x3FB950,
+                LauncherKind::RefreshMetrics,
+                "refresh обновить cpu ram metrics",
+            ),
+        ];
+        for (lbl, badge, col, kind, keys) in actions {
+            if q.is_empty() || lbl.to_lowercase().contains(&q) || keys.contains(&q) {
+                out.push(LauncherEntry {
+                    label: String::from(lbl),
+                    badge,
+                    color: col,
+                    kind,
+                });
+            }
+        }
+        for pct in UI_SCALES {
+            let lbl = format!("{} {}%", tr(lang, "Масштаб UI", "UI Scale"), pct);
+            if q.is_empty()
+                || lbl.to_lowercase().contains(&q)
+                || "scale dpi zoom".contains(&q)
+            {
+                out.push(LauncherEntry {
+                    label: lbl,
+                    badge: "DPI",
+                    color: accent,
+                    kind: LauncherKind::SetScale(pct),
+                });
+            }
+        }
+        out
+    }
+
+    fn exec_launcher_item(&mut self, item: &LauncherEntry) {
+        let lang = self.settings.lang;
+        match item.kind {
+            LauncherKind::App(id) => {
+                self.launcher_open = false;
+                self.focus_or_open(id);
+            }
+            LauncherKind::NextTheme => {
+                self.launcher_open = false;
+                self.settings.theme = match self.settings.theme {
+                    ThemePreset::AuroraPeaks => ThemePreset::CrimsonSunset,
+                    ThemePreset::CrimsonSunset => ThemePreset::MatrixGlow,
+                    ThemePreset::MatrixGlow => ThemePreset::OceanGlass,
+                    ThemePreset::OceanGlass => ThemePreset::AuroraPeaks,
+                };
+                self.push_toast(self.settings.theme.name(lang), self.settings.active_accent());
+            }
+            LauncherKind::ToggleDock => {
+                self.launcher_open = false;
+                self.settings.floating_dock = !self.settings.floating_dock;
+            }
+            LauncherKind::RefreshMetrics => {
+                self.launcher_open = false;
+                self.refresh_metrics();
+                self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
+            }
+            LauncherKind::SetScale(pct) => {
+                self.launcher_open = false;
+                self.settings.ui_scale_pct = pct;
+                self.push_toast(
+                    format!("{}: {}%", tr(lang, "Масштаб", "Scale"), pct),
+                    self.settings.active_accent(),
+                );
+            }
+            LauncherKind::MathCopy(val) => {
+                let s = fmt_math(val);
+                self.calc.display = s.clone();
+                self.calc.acc = None;
+                self.calc.op = None;
+                self.calc.clear_next = true;
+                self.launcher_open = false;
+                self.push_toast(format!("= {s}"), 0x38BDF8);
+            }
+        }
     }
 
     pub fn reload_packages(&mut self) {
@@ -433,6 +800,7 @@ impl Desktop {
     }
 
     pub fn on_viewport_resize(&mut self, canvas_w: i32, canvas_h: i32) {
+        self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         let reserve = self.dock_reserve();
         let top_bar = if self.settings.taskbar_top { reserve } else { 0 };
         for win in &mut self.windows {
@@ -453,6 +821,14 @@ impl Desktop {
         if self.ctx_menu.take().is_some() {
             return true;
         }
+        if self.launcher_open {
+            self.launcher_open = false;
+            return true;
+        }
+        if self.cc_open {
+            self.cc_open = false;
+            return true;
+        }
         if self.start_menu_open {
             self.start_menu_open = false;
             return true;
@@ -469,7 +845,7 @@ impl Desktop {
 
     #[inline]
     fn taskbar_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32, bool) {
-        let t = Canvas::smoothstep(self.dock_float_anim);
+        let t = Canvas::ease_out_cubic(self.dock_float_anim.clamp(0.0, 1.0));
         let target_w = (canvas_w - 28).max(260);
         let dw = canvas_w - ((canvas_w - target_w) as f32 * t).round() as i32;
         let dx = (canvas_w - dw) / 2;
@@ -480,6 +856,14 @@ impl Desktop {
             base_y - (6.0 * t).round() as i32
         };
         (dx, dy, dw, 36, t > 0.01)
+    }
+
+    fn taskbar_pill_width(&self, canvas_w: i32, open_count: usize) -> i32 {
+        if open_count == 0 {
+            return 100;
+        }
+        let avail = (canvas_w - 310).max(120);
+        ((avail / open_count as i32) - 4).clamp(64, 130)
     }
 
     fn taskbar_pill_rect(&self, canvas_w: i32, canvas_h: i32, id: AppId) -> (i32, i32, i32) {
@@ -498,22 +882,49 @@ impl Desktop {
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.settings.step_anim();
+        self.calc.step_anim();
 
         let start_tgt = if self.start_menu_open { 1.0 } else { 0.0 };
         let ctx_tgt = if self.ctx_menu.is_some() { 1.0 } else { 0.0 };
+        let cc_tgt = if self.cc_open { 1.0 } else { 0.0 };
+        let launch_tgt = if self.launcher_open { 1.0 } else { 0.0 };
         let dock_tgt = if self.settings.floating_dock { 1.0 } else { 0.0 };
-        let genie_step = if self.settings.genie_minimize { 0.072 } else { 0.095 };
+        let snap_tgt = if self.snap_zone.is_some() { 1.0 } else { 0.0 };
+        let genie_step = if self.settings.genie_minimize { 0.070 } else { 0.095 };
 
         if !self.settings.animations {
             self.start_anim = start_tgt;
+            self.start_vel = 0.0;
             self.ctx_anim = ctx_tgt;
+            self.cc_anim = cc_tgt;
+            self.cc_vel = 0.0;
+            self.launcher_anim = launch_tgt;
+            self.launcher_vel = 0.0;
             self.dock_float_anim = dock_tgt;
+            self.dock_float_vel = 0.0;
+            self.snap_anim = snap_tgt;
             if self.ctx_menu.is_none() {
                 self.last_ctx_menu = None;
+            }
+            if self.snap_zone.is_none() {
+                self.last_snap = None;
+            }
+            self.ripples.clear();
+            if let Some(t) = self.toast.as_mut() {
+                if t.ttl > 0 {
+                    t.ttl -= 1;
+                }
+                t.anim = if t.ttl > 8 { 1.0 } else { 0.0 };
+                t.vel = 0.0;
+            }
+            if self.toast.as_ref().is_some_and(|t| t.ttl == 0) {
+                self.toast = None;
             }
             for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
                 let hov = self.ctx_menu.is_none()
                     && !self.start_menu_open
+                    && !self.cc_open
+                    && !self.launcher_open
                     && self.mouse_x >= ix - 4
                     && self.mouse_x <= ix + 74
                     && self.mouse_y >= iy - 2
@@ -527,12 +938,24 @@ impl Desktop {
                 w.sync_vis_rect();
             }
         } else {
-            let sd = start_tgt - self.start_anim;
-            if sd.abs() < 0.015 {
-                self.start_anim = start_tgt;
-            } else {
-                self.start_anim += sd * 0.34;
-            }
+            Canvas::step_spring(&mut self.start_anim, &mut self.start_vel, start_tgt, 0.36, 0.52, 0.008);
+            Canvas::step_spring(&mut self.cc_anim, &mut self.cc_vel, cc_tgt, 0.36, 0.52, 0.008);
+            Canvas::step_spring(
+                &mut self.launcher_anim,
+                &mut self.launcher_vel,
+                launch_tgt,
+                0.38,
+                0.52,
+                0.008,
+            );
+            Canvas::step_spring(
+                &mut self.dock_float_anim,
+                &mut self.dock_float_vel,
+                dock_tgt,
+                0.34,
+                0.52,
+                0.008,
+            );
 
             let cd = ctx_tgt - self.ctx_anim;
             if cd.abs() < 0.015 {
@@ -544,16 +967,41 @@ impl Desktop {
                 self.ctx_anim += cd * 0.36;
             }
 
-            let dd = dock_tgt - self.dock_float_anim;
-            if dd.abs() < 0.01 {
-                self.dock_float_anim = dock_tgt;
+            let snd = snap_tgt - self.snap_anim;
+            if snd.abs() < 0.015 {
+                self.snap_anim = snap_tgt;
+                if self.snap_zone.is_none() {
+                    self.last_snap = None;
+                }
             } else {
-                self.dock_float_anim += dd * 0.24;
+                self.snap_anim += snd * 0.32;
             }
+
+            if let Some(t) = self.toast.as_mut() {
+                if t.ttl > 0 {
+                    t.ttl -= 1;
+                }
+                let tgt = if t.ttl > 14 { 1.0 } else { 0.0 };
+                Canvas::step_spring(&mut t.anim, &mut t.vel, tgt, 0.36, 0.52, 0.008);
+            }
+            if self
+                .toast
+                .as_ref()
+                .is_some_and(|t| t.ttl == 0 && t.anim <= 0.02)
+            {
+                self.toast = None;
+            }
+
+            for r in &mut self.ripples {
+                r.t += 0.11;
+            }
+            self.ripples.retain(|r| r.t < 1.0);
 
             for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
                 let hov = self.ctx_menu.is_none()
                     && !self.start_menu_open
+                    && !self.cc_open
+                    && !self.launcher_open
                     && self.mouse_x >= ix - 4
                     && self.mouse_x <= ix + 74
                     && self.mouse_y >= iy - 2
@@ -579,17 +1027,19 @@ impl Desktop {
                         w.min_anim = (w.min_anim + genie_step * 1.12).min(1.0);
                     }
                     if w.open_anim < 1.0 {
-                        w.open_anim = (w.open_anim + 0.14).min(1.0);
+                        w.open_anim = (w.open_anim + 0.115).min(1.0);
                     }
                 }
                 let targets = [w.x as f32, w.y as f32, w.w as f32, w.h as f32];
-                for (vr, tgt) in w.vis_rect.iter_mut().zip(targets.iter()) {
-                    let d = tgt - *vr;
-                    if d.abs() < 0.8 {
-                        *vr = *tgt;
-                    } else {
-                        *vr += d * 0.36;
-                    }
+                for (k, &tgt) in targets.iter().enumerate() {
+                    Canvas::step_spring(
+                        &mut w.vis_rect[k],
+                        &mut w.vis_vel[k],
+                        tgt,
+                        0.40,
+                        0.50,
+                        0.45,
+                    );
                 }
             }
         }
@@ -598,13 +1048,31 @@ impl Desktop {
             self.refresh_metrics();
         }
         let div = self.settings.snake_tick_div.max(1);
-        if self.tick.is_multiple_of(div)
-            && self
-                .windows
-                .iter()
-                .any(|w| w.id == AppId::Snake && w.open && !w.minimized)
+        if self
+            .windows
+            .iter()
+            .any(|w| w.id == AppId::Snake && w.open && !w.minimized)
         {
-            self.snake.step();
+            if self.tick.is_multiple_of(div) {
+                match self.snake.step() {
+                    SnakeEvent::NewBest(score) => {
+                        let msg = format!(
+                            "{}: {score}",
+                            tr(self.settings.lang, "Новый рекорд", "New Best")
+                        );
+                        self.push_toast(msg, 0xFBBF24);
+                    }
+                    SnakeEvent::AteBonus => {
+                        self.push_toast(
+                            tr(self.settings.lang, "Золотой бонус +3!", "Golden Bonus +3!"),
+                            0xF59E0B,
+                        );
+                    }
+                    SnakeEvent::GameOver | SnakeEvent::None => {}
+                }
+            } else {
+                self.snake.step_interp(div, self.settings.animations);
+            }
         }
         if self.tick.is_multiple_of(2)
             && let Some(m) = self
@@ -690,10 +1158,89 @@ impl Desktop {
         self.reload_packages();
     }
 
+    fn launcher_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32) {
+        let lw = (canvas_w - 48).clamp(280, 420);
+        let lh = 286;
+        let lx = (canvas_w - lw) / 2;
+        let ly = ((canvas_h - lh) / 3).max(20);
+        (lx, ly, lw, lh)
+    }
+
+    fn cc_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32) {
+        let (dock_x, task_y, dock_w, dock_h, _) = self.taskbar_rect(canvas_w, canvas_h);
+        let pw = 276;
+        let ph = 236;
+        let px = (dock_x + dock_w - pw - 8).max(8);
+        let py = if self.settings.taskbar_top {
+            task_y + dock_h + 6
+        } else {
+            task_y - ph - 6
+        };
+        (px, py, pw, ph)
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key == KeyEvent::Escape && self.on_escape() {
             return;
         }
+        match key {
+            KeyEvent::ToggleLauncher => {
+                self.toggle_launcher();
+                return;
+            }
+            KeyEvent::ToggleControlCenter => {
+                self.toggle_control_center();
+                return;
+            }
+            KeyEvent::ScaleDelta(delta) => {
+                let old_scale = self.settings.ui_scale();
+                if delta == 0 {
+                    self.settings.ui_scale_pct = 100;
+                } else {
+                    self.settings.step_ui_scale(delta);
+                }
+                let (cw, ch) = self.last_canvas_size;
+                self.rescale_viewport(old_scale, cw, ch);
+                let msg = format!(
+                    "{}: {}%",
+                    tr(self.settings.lang, "Масштаб UI", "UI Scale"),
+                    self.settings.ui_scale_pct
+                );
+                self.push_toast(msg, self.settings.active_accent());
+                return;
+            }
+            _ => {}
+        }
+
+        if self.launcher_open {
+            let entries = self.launcher_entries();
+            match key {
+                KeyEvent::Up => {
+                    self.launcher_sel = self.launcher_sel.saturating_sub(1);
+                }
+                KeyEvent::Down => {
+                    if !entries.is_empty() && self.launcher_sel + 1 < entries.len().min(7) {
+                        self.launcher_sel += 1;
+                    }
+                }
+                KeyEvent::Enter => {
+                    if let Some(entry) = entries.get(self.launcher_sel) {
+                        self.exec_launcher_item(entry);
+                    }
+                }
+                KeyEvent::Backspace => {
+                    self.launcher_query.pop();
+                    self.launcher_sel = 0;
+                }
+                KeyEvent::Char(ch) if !ch.is_control() && self.launcher_query.chars().count() < 36 => {
+                    self.launcher_query.push(ch);
+                    self.launcher_sel = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized) else {
             return;
         };
@@ -708,6 +1255,7 @@ impl Desktop {
     }
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
+        self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
 
@@ -755,11 +1303,30 @@ impl Desktop {
                 win.x = (self.mouse_x - off_x).clamp(0, (canvas_w - 60).max(0));
                 win.y = (self.mouse_y - off_y).clamp(0, (canvas_h - 60).max(0));
                 win.sync_vis_rect();
+
+                let reserve = self.dock_reserve();
+                let top_min = if self.settings.taskbar_top { reserve } else { 0 };
+                let zone = if self.mouse_y <= top_min + 10 {
+                    Some(SnapZone::Maximize)
+                } else if self.mouse_x <= 14 {
+                    Some(SnapZone::Left)
+                } else if self.mouse_x >= canvas_w - 15 {
+                    Some(SnapZone::Right)
+                } else {
+                    None
+                };
+                self.snap_zone = zone;
+                if let Some(z) = zone {
+                    self.last_snap = Some(z);
+                }
             }
             return;
         }
 
         if self.mouse_down
+            && !self.launcher_open
+            && !self.cc_open
+            && !self.start_menu_open
             && let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized)
             && top.id == AppId::Paint
         {
@@ -769,33 +1336,38 @@ impl Desktop {
     }
 
     pub fn on_right_click(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
+        self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.start_menu_open = false;
+        self.cc_open = false;
+        self.launcher_open = false;
         let mx = x.min((canvas_w - 190).max(0));
         let my = y.min((canvas_h - 170).max(0));
         self.ctx_menu = Some((mx, my));
         self.last_ctx_menu = Some((mx, my));
     }
 
-    fn taskbar_pill_width(&self, canvas_w: i32, open_count: usize) -> i32 {
-        if open_count == 0 {
-            return 100;
-        }
-        let avail = (canvas_w - 280).max(120);
-        ((avail / open_count as i32) - 4).clamp(64, 130)
-    }
-
     pub fn on_mouse_down(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
+        self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.mouse_down = true;
+        if self.settings.animations && self.ripples.len() < 6 {
+            self.ripples.push(ClickRipple {
+                x: self.mouse_x,
+                y: self.mouse_y,
+                t: 0.0,
+                color: self.settings.active_accent(),
+            });
+        }
 
         // 0. Right-click context menu hit test
         if let Some((cx, cy)) = self.ctx_menu {
             self.ctx_menu = None;
             if x >= cx && x <= cx + 184 && y >= cy && y <= cy + 134 {
                 let row = (y - cy - 4) / 25;
+                let lang = self.settings.lang;
                 match row {
                     0 => self.focus_or_open(AppId::Terminal),
                     1 => {
@@ -805,9 +1377,16 @@ impl Desktop {
                             ThemePreset::MatrixGlow => ThemePreset::OceanGlass,
                             ThemePreset::OceanGlass => ThemePreset::AuroraPeaks,
                         };
+                        self.push_toast(
+                            self.settings.theme.name(lang),
+                            self.settings.active_accent(),
+                        );
                     }
                     2 => self.focus_or_open(AppId::Settings),
-                    3 => self.refresh_metrics(),
+                    3 => {
+                        self.refresh_metrics();
+                        self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
+                    }
                     4 => self.running = false,
                     _ => {}
                 }
@@ -816,6 +1395,102 @@ impl Desktop {
         }
 
         let (dock_x, task_y, dock_w, dock_h, _floating) = self.taskbar_rect(canvas_w, canvas_h);
+        let lang_x = (dock_x + dock_w - 144).max(dock_x + 108);
+        let search_hit = x >= dock_x
+            && x < dock_x + dock_w
+            && y >= task_y
+            && y < task_y + dock_h
+            && x >= lang_x - 60
+            && x <= lang_x - 35;
+        let cc_hit = x >= dock_x
+            && x < dock_x + dock_w
+            && y >= task_y
+            && y < task_y + dock_h
+            && x >= lang_x - 30
+            && x <= lang_x - 5;
+
+        // 0b. Spotlight Launcher overlay
+        if self.launcher_open {
+            let (lx, ly, lw, lh) = self.launcher_rect(canvas_w, canvas_h);
+            if x >= lx && x <= lx + lw && y >= ly && y <= ly + lh {
+                let entries = self.launcher_entries();
+                if y >= ly + 52 {
+                    let row = ((y - (ly + 52)) / 28) as usize;
+                    if row < 7 && let Some(item) = entries.get(row) {
+                        self.exec_launcher_item(item);
+                    }
+                }
+                return;
+            }
+            if !search_hit {
+                self.launcher_open = false;
+                return;
+            }
+        }
+
+        // 0c. ColorOS Control Center overlay
+        if self.cc_open {
+            let (px, py, pw, ph) = self.cc_rect(canvas_w, canvas_h);
+            if x >= px && x <= px + pw && y >= py && y <= py + ph {
+                let lang = self.settings.lang;
+                let tiles_y = py + 36;
+                for row in 0..2 {
+                    for col in 0..2 {
+                        let tx = px + 10 + col * 132;
+                        let ty = tiles_y + row * 48;
+                        if x >= tx && x <= tx + 124 && y >= ty && y <= ty + 42 {
+                            match (col, row) {
+                                (0, 0) => {
+                                    self.settings.floating_dock = !self.settings.floating_dock;
+                                    self.on_viewport_resize(canvas_w, canvas_h);
+                                }
+                                (1, 0) => self.settings.animations = !self.settings.animations,
+                                (0, 1) => {
+                                    self.settings.genie_minimize = !self.settings.genie_minimize
+                                }
+                                _ => self.settings.show_grid = !self.settings.show_grid,
+                            }
+                            return;
+                        }
+                    }
+                }
+                let glass_y = py + 136;
+                if y >= glass_y && y <= glass_y + 26 {
+                    for idx in 0..3 {
+                        let gx = px + 10 + idx * 87;
+                        if x >= gx && x <= gx + 82 {
+                            self.settings.glass_level = idx as u8;
+                            return;
+                        }
+                    }
+                }
+                let scale_y = py + 170;
+                if y >= scale_y && y <= scale_y + 26 {
+                    for (idx, &pct) in UI_SCALES.iter().enumerate() {
+                        let sx = px + 10 + (idx as i32) * 65;
+                        if x >= sx && x <= sx + 61 {
+                            let old_scale = self.settings.ui_scale();
+                            self.settings.ui_scale_pct = pct;
+                            self.rescale_viewport(old_scale, canvas_w, canvas_h);
+                            self.push_toast(
+                                format!("{}: {}%", tr(lang, "Масштаб UI", "UI Scale"), pct),
+                                self.settings.active_accent(),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let foot_y = py + 204;
+                if y >= foot_y && y <= foot_y + 24 {
+                    self.refresh_metrics();
+                    self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
+                }
+                return;
+            }
+            if !cc_hit {
+                self.cc_open = false;
+            }
+        }
 
         // 1. Start Menu popup hit test
         if self.start_menu_open {
@@ -849,9 +1524,20 @@ impl Desktop {
         if x >= dock_x && x < dock_x + dock_w && y >= task_y && y < task_y + dock_h {
             if x >= dock_x + 8 && x <= dock_x + 94 {
                 self.start_menu_open = !self.start_menu_open;
+                if self.start_menu_open {
+                    self.cc_open = false;
+                    self.launcher_open = false;
+                }
                 return;
             }
-            let lang_x = (dock_x + dock_w - 144).max(dock_x + 108);
+            if search_hit {
+                self.toggle_launcher();
+                return;
+            }
+            if cc_hit {
+                self.toggle_control_center();
+                return;
+            }
             if x >= lang_x && x <= lang_x + 36 {
                 self.settings.lang = match self.settings.lang {
                     Lang::Ru => Lang::En,
@@ -864,6 +1550,8 @@ impl Desktop {
                 return;
             }
 
+            self.cc_open = false;
+            self.launcher_open = false;
             let open_ids: Vec<AppId> = self
                 .windows
                 .iter()
@@ -945,7 +1633,7 @@ impl Desktop {
             }
 
             self.paint.end_stroke();
-            self.handle_window_click(&win, x - win.x, y - win.y);
+            self.handle_window_click(&win, x - win.x, y - win.y, canvas_w, canvas_h);
             return;
         }
 
@@ -962,18 +1650,48 @@ impl Desktop {
 
     pub fn on_mouse_up(&mut self) {
         self.mouse_down = false;
-        self.dragging = None;
         self.resizing = None;
         self.paint.end_stroke();
+
+        if let Some((id, _, _)) = self.dragging.take()
+            && let Some(zone) = self.snap_zone.take()
+        {
+            let (cw, ch) = self.last_canvas_size;
+            let (sx, sy, sw, sh) = self.snap_rect(zone, cw, ch);
+            let lang = self.settings.lang;
+            let accent = self.settings.active_accent();
+            if let Some(win) = self.windows.iter_mut().find(|w| w.id == id) {
+                if !win.maximized {
+                    win.saved_rect = (win.x, win.y, win.w, win.h);
+                }
+                win.x = sx;
+                win.y = sy;
+                win.w = sw;
+                win.h = sh;
+                win.maximized = zone == SnapZone::Maximize;
+                if !self.settings.animations {
+                    win.sync_vis_rect();
+                }
+            }
+            let msg = match zone {
+                SnapZone::Left => tr(lang, "Приклеено влево", "Snapped Left"),
+                SnapZone::Right => tr(lang, "Приклеено вправо", "Snapped Right"),
+                SnapZone::Maximize => tr(lang, "Окно развернуто", "Window Maximized"),
+            };
+            self.push_toast(msg, accent);
+        }
+        self.snap_zone = None;
     }
 
-    fn handle_window_click(&mut self, win: &Window, lx: i32, ly: i32) {
+    fn handle_window_click(&mut self, win: &Window, lx: i32, ly: i32, canvas_w: i32, canvas_h: i32) {
         let lang = self.settings.lang;
         match win.id {
             AppId::System => {
                 if ly >= win.h - 36 && ly <= win.h - 10 && (14..=124).contains(&lx) {
                     self.refresh_metrics();
-                    self.status = String::from(tr(lang, "Метрики обновлены", "Metrics refreshed"));
+                    let msg = String::from(tr(lang, "Метрики обновлены", "Metrics refreshed"));
+                    self.status = msg.clone();
+                    self.push_toast(msg, 0x3FB950);
                 }
             }
             AppId::PizGet => {
@@ -1010,33 +1728,78 @@ impl Desktop {
                     }
                 }
             }
-            AppId::Paint => self.paint.on_click(lx, ly, win.h),
+            AppId::Paint => match self.paint.on_click(lx, ly, win.h) {
+                PaintAction::None => {}
+                PaintAction::Saved(path) => {
+                    self.status = format!("BMP: {path}");
+                    self.push_toast(
+                        format!("{}: {path}", tr(lang, "Сохранено", "Saved")),
+                        0xBC8CFF,
+                    );
+                }
+                PaintAction::SaveErr(err) => {
+                    self.status = err.clone();
+                    self.push_toast(err, 0xF85149);
+                }
+            },
             AppId::Snake => self.snake.on_click(lx, ly, win.h),
-            AppId::Notepad => self.notepad.on_click(lx, ly, win.h, lang),
+            AppId::Notepad => {
+                if let Some(msg) = self.notepad.on_click(lx, ly, win.h, lang) {
+                    self.status = msg.clone();
+                    self.push_toast(msg, 0x58A6FF);
+                }
+            }
             AppId::Calc => self.calc.on_click(lx, ly, win.w, win.h),
             AppId::Matrix => {
                 if ly >= win.h - 32 && ly <= win.h - 8 && (12..=142).contains(&lx) {
                     self.matrix.cycle_color();
                 }
             }
-            AppId::Settings => match self.settings.on_click(lx, ly, win.w, win.h) {
-                SettingsAction::None => {}
-                SettingsAction::RefreshMetrics => self.refresh_metrics(),
-                SettingsAction::OpenTerminal => self.focus_or_open(AppId::Terminal),
-                SettingsAction::OpenPizGet => self.focus_or_open(AppId::PizGet),
-            },
+            AppId::Settings => {
+                let old_scale = self.settings.ui_scale();
+                let prev_dock = self.settings.floating_dock;
+                let action = self.settings.on_click(lx, ly, win.w, win.h);
+                if self.settings.floating_dock != prev_dock {
+                    self.on_viewport_resize(canvas_w, canvas_h);
+                }
+                if (self.settings.ui_scale() - old_scale).abs() > 0.001 {
+                    self.rescale_viewport(old_scale, canvas_w, canvas_h);
+                    self.push_toast(
+                        format!(
+                            "{}: {}%",
+                            tr(lang, "Масштаб UI", "UI Scale"),
+                            self.settings.ui_scale_pct
+                        ),
+                        self.settings.active_accent(),
+                    );
+                }
+                match action {
+                    SettingsAction::None => {}
+                    SettingsAction::RefreshMetrics => {
+                        self.refresh_metrics();
+                        self.push_toast(
+                            tr(lang, "Метрики обновлены", "Metrics refreshed"),
+                            0x3FB950,
+                        );
+                    }
+                    SettingsAction::OpenTerminal => self.focus_or_open(AppId::Terminal),
+                    SettingsAction::OpenPizGet => self.focus_or_open(AppId::PizGet),
+                }
+            }
             AppId::Terminal => {}
         }
     }
 
     pub fn render(&self, canvas: &mut Canvas) {
-        let w = canvas.width as i32;
-        let h = canvas.height as i32;
+        canvas.set_ui_scale(self.settings.ui_scale());
+        let w = canvas.logical_width();
+        let h = canvas.logical_height();
         let lang = self.settings.lang;
         let accent = self.settings.active_accent();
         let (glass_a, border_a) = self.settings.glass_alphas();
+        let anim = self.settings.animations;
 
-        // 1. Cached procedural gradient + mountain wallpaper
+        // 1. Cached procedural gradient + mountain wallpaper (native physical resolution)
         {
             let mut wp = self.wp_cache.borrow_mut();
             let key = (
@@ -1065,7 +1828,21 @@ impl Desktop {
             }
         }
 
-        // 3. Visible & Animating Windows (macOS Genie / Scale / Close / Maximize Morph)
+        // 2b. Window Snap Zone Preview (below active windows)
+        if let Some(zone) = self.snap_zone.or(if anim && self.snap_anim > 0.02 {
+            self.last_snap
+        } else {
+            None
+        }) {
+            let t = if anim {
+                Canvas::ease_out_cubic(self.snap_anim)
+            } else {
+                1.0
+            };
+            self.draw_snap_preview(canvas, w, h, zone, t, accent);
+        }
+
+        // 3. Visible & Animating Windows (non-linear Genie / Spring Morph / Back Pop-In)
         let top_vis = self
             .windows
             .iter()
@@ -1076,16 +1853,18 @@ impl Desktop {
 
         for (idx, win) in self.windows.iter().enumerate() {
             let focused = Some(idx) == top_vis;
-            let anim = self.settings.animations;
             if !win.open {
                 if anim && win.close_anim > 0.01 {
-                    let s = Canvas::smoothstep(win.close_anim);
+                    let s = Canvas::ease_out_cubic(win.close_anim);
                     let scale = 0.88 + 0.12 * s;
                     let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
                     let vw = win.vis_rect[2].round().max(80.0) as i32;
                     let vh = win.vis_rect[3].round().max(60.0) as i32;
                     let mut cap = self.anim_canvas.borrow_mut();
-                    cap.resize(vw as usize, vh as usize);
+                    cap.set_ui_scale(canvas.ui_scale);
+                    let cap_pw = ((vw as f32) * canvas.ui_scale).round().max(2.0) as usize;
+                    let cap_ph = ((vh as f32) * canvas.ui_scale).round().max(2.0) as usize;
+                    cap.resize(cap_pw, cap_ph);
                     cap.pixels.fill(0xFF0B_0E16);
                     let mut cap_win = win.clone();
                     cap_win.x = 0;
@@ -1095,7 +1874,13 @@ impl Desktop {
                     self.draw_window_frame(&mut cap, &cap_win, focused, false);
                     let cx = win.vis_rect[0] + win.vis_rect[2] * 0.5;
                     let cy = win.vis_rect[1] + win.vis_rect[3] * 0.5;
-                    canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                    canvas.blit_scaled_alpha_rect(
+                        &cap.pixels,
+                        (cap_pw as i32, cap_ph as i32),
+                        (cx, cy),
+                        scale,
+                        alpha,
+                    );
                 }
                 continue;
             }
@@ -1113,7 +1898,10 @@ impl Desktop {
 
             if is_genie_or_scale || is_fresh_open {
                 let mut cap = self.anim_canvas.borrow_mut();
-                cap.resize(vw as usize, vh as usize);
+                cap.set_ui_scale(canvas.ui_scale);
+                let cap_pw = ((vw as f32) * canvas.ui_scale).round().max(2.0) as usize;
+                let cap_ph = ((vh as f32) * canvas.ui_scale).round().max(2.0) as usize;
+                cap.resize(cap_pw, cap_ph);
                 cap.pixels.fill(0xFF0B_0E16);
                 let mut cap_win = win.clone();
                 cap_win.x = 0;
@@ -1127,14 +1915,14 @@ impl Desktop {
                     if self.settings.genie_minimize {
                         canvas.blit_genie_rect(
                             &cap.pixels,
-                            (vw, vh),
+                            (cap_pw as i32, cap_ph as i32),
                             (vx, vy),
                             pill_rect,
                             win.min_anim,
                             self.settings.taskbar_top,
                         );
                     } else {
-                        let s = Canvas::smoothstep(win.min_anim);
+                        let s = Canvas::ease_in_out_cubic(win.min_anim);
                         let win_cx = vx as f32 + vw as f32 * 0.5;
                         let win_cy = vy as f32 + vh as f32 * 0.5;
                         let pill_cx = pill_rect.0 as f32 + pill_rect.2 as f32 * 0.5;
@@ -1143,15 +1931,28 @@ impl Desktop {
                         let cy = pill_cy + (win_cy - pill_cy) * s;
                         let scale = 0.14 + 0.86 * s;
                         let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
-                        canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                        canvas.blit_scaled_alpha_rect(
+                            &cap.pixels,
+                            (cap_pw as i32, cap_ph as i32),
+                            (cx, cy),
+                            scale,
+                            alpha,
+                        );
                     }
                 } else {
-                    let s = Canvas::smoothstep(win.open_anim);
-                    let scale = 0.93 + 0.07 * s;
-                    let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
+                    let s_pos = Canvas::ease_out_back(win.open_anim);
+                    let s_op = Canvas::ease_out_cubic(win.open_anim);
+                    let scale = 0.92 + 0.08 * s_pos;
+                    let alpha = (s_op * 255.0).clamp(0.0, 255.0) as u8;
                     let cx = vx as f32 + vw as f32 * 0.5;
-                    let cy = vy as f32 + vh as f32 * 0.5 + (1.0 - s) * 10.0;
-                    canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                    let cy = vy as f32 + vh as f32 * 0.5 + (1.0 - s_op) * 12.0;
+                    canvas.blit_scaled_alpha_rect(
+                        &cap.pixels,
+                        (cap_pw as i32, cap_ph as i32),
+                        (cx, cy),
+                        scale,
+                        alpha,
+                    );
                 }
             } else {
                 let mut vis_win = win.clone();
@@ -1163,15 +1964,15 @@ impl Desktop {
             }
         }
 
-        // 4. Minimalist Dark Frosted Taskbar or Animated Floating Minimal Dock (ONLY open windows)
+        // 4. ColorOS Minimalist Frosted Taskbar or Animated Floating Dock
         let (dock_x, task_y, dock_w, dock_h, floating) = self.taskbar_rect(w, h);
-        let dock_t = Canvas::smoothstep(self.dock_float_anim);
+        let dock_t = Canvas::ease_out_cubic(self.dock_float_anim.clamp(0.0, 1.0));
         if floating {
-            let r = (13.0 * dock_t).round() as i32;
+            let r = (14.0 * dock_t).round() as i32;
             if dock_t > 0.15 {
                 canvas.draw_soft_shadow(dock_x, task_y, dock_w, dock_h, r);
             }
-            canvas.blend_rounded_rect(dock_x, task_y, dock_w, dock_h, r, 0x0B0E14, glass_a);
+            canvas.blend_rounded_rect(dock_x, task_y, dock_w, dock_h, r, 0x0B0E16, glass_a);
             canvas.draw_rounded_rect_alpha(
                 dock_x,
                 task_y,
@@ -1182,17 +1983,17 @@ impl Desktop {
                 (border_a as f32 * dock_t).round() as u8,
             );
             canvas.blend_rect(
-                dock_x + r + 1,
+                dock_x + r + 2,
                 task_y + 1,
-                (dock_w - (r + 1) * 2).max(0),
+                (dock_w - (r + 2) * 2).max(0),
                 1,
                 0xFFFFFF,
-                (22.0 * dock_t).round() as u8,
+                (28.0 * dock_t).round() as u8,
             );
         } else {
-            canvas.blend_rect(0, task_y, w, dock_h, 0x0B0E14, glass_a);
+            canvas.blend_rect(0, task_y, w, dock_h, 0x0B0E16, glass_a);
             let rim_y = if self.settings.taskbar_top { task_y + 35 } else { task_y };
-            canvas.blend_rect(0, rim_y, w, 1, 0xFFFFFF, border_a.min(48));
+            canvas.blend_rect(0, rim_y, w, 1, 0xFFFFFF, border_a.min(52));
         }
 
         let start_x = dock_x + 8;
@@ -1201,14 +2002,13 @@ impl Desktop {
             && self.mouse_y >= task_y + 6
             && self.mouse_y <= task_y + 30;
         if self.start_menu_open {
-            canvas.blend_rounded_rect(start_x, task_y + 6, 86, 24, 7, accent, 55);
-            canvas.draw_rounded_rect_alpha(start_x, task_y + 6, 86, 24, 7, accent, 115);
+            canvas.blend_rounded_rect(start_x, task_y + 6, 86, 24, 8, accent, 58);
+            canvas.draw_rounded_rect_alpha(start_x, task_y + 6, 86, 24, 8, accent, 125);
         } else {
             let start_alpha = if start_hovered { 28 } else { 15 };
-            canvas.blend_rounded_rect(start_x, task_y + 6, 86, 24, 7, 0xFFFFFF, start_alpha);
-            canvas.draw_rounded_rect_alpha(start_x, task_y + 6, 86, 24, 7, 0xFFFFFF, 28);
+            canvas.blend_rounded_rect(start_x, task_y + 6, 86, 24, 8, 0xFFFFFF, start_alpha);
+            canvas.draw_rounded_rect_alpha(start_x, task_y + 6, 86, 24, 8, 0xFFFFFF, 28);
         }
-        // Minimalist 2x2 dot-grid emblem
         canvas.fill_aa_circle((start_x + 11) as f32, (task_y + 15) as f32, 1.7, accent, 255);
         canvas.fill_aa_circle((start_x + 17) as f32, (task_y + 15) as f32, 1.7, 0xE2E8F0, 220);
         canvas.fill_aa_circle((start_x + 11) as f32, (task_y + 21) as f32, 1.7, 0xE2E8F0, 220);
@@ -1229,26 +2029,26 @@ impl Desktop {
                 && self.mouse_x <= bx + pill_w
                 && self.mouse_y >= task_y + 6
                 && self.mouse_y <= task_y + 30;
-            let genie_pulse = if self.settings.animations && win.min_anim > 0.02 && win.min_anim < 0.98 {
+            let genie_pulse = if anim && win.min_anim > 0.02 && win.min_anim < 0.98 {
                 ((1.0 - (win.min_anim - 0.5).abs() * 2.0) * 70.0) as u8
             } else {
                 0
             };
             if is_top {
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 26);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 38);
-                canvas.blend_rect(bx + 10, task_y + 7, (pill_w - 20).max(0), 1, 0xFFFFFF, 22);
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 8, 0xFFFFFF, 28);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 8, 0xFFFFFF, 42);
+                canvas.blend_rect(bx + 10, task_y + 7, (pill_w - 20).max(0), 1, 0xFFFFFF, 26);
             } else if win.minimized {
                 let a = if pill_hovered { 16 } else { 7 };
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 8, 0xFFFFFF, a);
             } else {
                 let a = if pill_hovered { 20 } else { 12 };
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 18);
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 8, 0xFFFFFF, a);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 8, 0xFFFFFF, 18);
             }
             if genie_pulse > 0 {
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, accent, genie_pulse);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, accent, (genie_pulse * 2).min(180));
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 8, accent, genie_pulse);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 8, accent, (genie_pulse * 2).min(180));
             }
 
             let fg = if win.minimized {
@@ -1271,19 +2071,56 @@ impl Desktop {
         }
 
         let lang_x = (dock_x + dock_w - 144).max(bx + 8);
+        // Spotlight Search quick pill
+        let search_x = lang_x - 60;
+        let search_hov = self.mouse_x >= search_x
+            && self.mouse_x <= search_x + 26
+            && self.mouse_y >= task_y + 6
+            && self.mouse_y <= task_y + 30;
+        if self.launcher_open {
+            canvas.blend_rounded_rect(search_x, task_y + 6, 26, 24, 7, accent, 70);
+            canvas.draw_rounded_rect_alpha(search_x, task_y + 6, 26, 24, 7, accent, 150);
+        } else {
+            canvas.blend_rounded_rect(search_x, task_y + 6, 26, 24, 7, 0xFFFFFF, if search_hov { 26 } else { 13 });
+            canvas.draw_rounded_rect_alpha(search_x, task_y + 6, 26, 24, 7, 0xFFFFFF, 24);
+        }
+        let scx = (search_x + 12) as f32;
+        let scy = (task_y + 16) as f32;
+        canvas.fill_aa_circle(scx, scy, 4.2, 0xCBD5E1, 210);
+        canvas.fill_aa_circle(scx, scy, 2.4, 0x101520, 255);
+        canvas.draw_aa_line(scx + 2.4, scy + 2.4, scx + 5.6, scy + 5.6, 1.5, 0xE2E8F0, 235);
+
+        // Control Center quick pill (two ColorOS micro-toggles)
+        let cc_x = lang_x - 30;
+        let cc_hov = self.mouse_x >= cc_x
+            && self.mouse_x <= cc_x + 26
+            && self.mouse_y >= task_y + 6
+            && self.mouse_y <= task_y + 30;
+        if self.cc_open {
+            canvas.blend_rounded_rect(cc_x, task_y + 6, 26, 24, 7, accent, 70);
+            canvas.draw_rounded_rect_alpha(cc_x, task_y + 6, 26, 24, 7, accent, 150);
+        } else {
+            canvas.blend_rounded_rect(cc_x, task_y + 6, 26, 24, 7, 0xFFFFFF, if cc_hov { 26 } else { 13 });
+            canvas.draw_rounded_rect_alpha(cc_x, task_y + 6, 26, 24, 7, 0xFFFFFF, 24);
+        }
+        canvas.draw_aa_line((cc_x + 7) as f32, (task_y + 15) as f32, (cc_x + 19) as f32, (task_y + 15) as f32, 1.3, 0xCBD5E1, 210);
+        canvas.fill_aa_circle((cc_x + 16) as f32, (task_y + 15) as f32, 2.1, accent, 255);
+        canvas.draw_aa_line((cc_x + 7) as f32, (task_y + 21) as f32, (cc_x + 19) as f32, (task_y + 21) as f32, 1.3, 0x94A3B8, 210);
+        canvas.fill_aa_circle((cc_x + 10) as f32, (task_y + 21) as f32, 2.1, 0xE2E8F0, 235);
+
         let lang_lbl = match lang {
             Lang::Ru => "RU",
             Lang::En => "EN",
         };
-        canvas.blend_rounded_rect(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 15);
-        canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 26);
+        canvas.blend_rounded_rect(lang_x, task_y + 6, 36, 24, 7, 0xFFFFFF, 15);
+        canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 7, 0xFFFFFF, 26);
         canvas.draw_text_clipped(lang_x + 10, task_y + 11, 26, lang_lbl, 0xE2E8F0, 1);
 
         let tray_x = lang_x + 40;
         let tray_w = (dock_x + dock_w - 6 - tray_x).max(40);
-        canvas.blend_rounded_rect(tray_x, task_y + 6, tray_w, 24, 6, 0xFFFFFF, 11);
-        canvas.draw_rounded_rect_alpha(tray_x, task_y + 6, tray_w, 24, 6, 0xFFFFFF, 20);
-        let pulse_a = if self.settings.animations {
+        canvas.blend_rounded_rect(tray_x, task_y + 6, tray_w, 24, 7, 0xFFFFFF, 11);
+        canvas.draw_rounded_rect_alpha(tray_x, task_y + 6, tray_w, 24, 7, 0xFFFFFF, 20);
+        let pulse_a = if anim {
             (205.0 + 50.0 * ((self.tick as f32) * 0.08).sin()).clamp(150.0, 255.0) as u8
         } else {
             255
@@ -1303,19 +2140,40 @@ impl Desktop {
             1,
         );
 
-        // 5. Start Menu popup (with smooth glass fade/slide animation)
-        if self.start_menu_open || (self.settings.animations && self.start_anim > 0.04) {
+        // 5. Overlays: Start Menu, Control Center, Spotlight Launcher, Context Menu, Dynamic Island Toast
+        if self.start_menu_open || (anim && self.start_anim > 0.03) {
             self.draw_start_menu(canvas, dock_x, task_y, dock_h, accent);
         }
-
-        // 6. Right-click Context Menu (with smooth fade & slide)
-        let anim_ctx = if self.settings.animations && self.ctx_anim > 0.04 {
+        if self.cc_open || (anim && self.cc_anim > 0.03) {
+            self.draw_control_center(canvas, w, h, accent);
+        }
+        if self.launcher_open || (anim && self.launcher_anim > 0.03) {
+            self.draw_launcher(canvas, w, h, accent);
+        }
+        let anim_ctx = if anim && self.ctx_anim > 0.04 {
             self.last_ctx_menu
         } else {
             None
         };
         if let Some((cx, cy)) = self.ctx_menu.or(anim_ctx) {
             self.draw_context_menu(canvas, cx, cy, accent);
+        }
+        if let Some(toast) = self.toast.as_ref() {
+            self.draw_toast(canvas, w, h, toast);
+        }
+
+        // 6. Expanding AA click ripples
+        if anim {
+            for r in &self.ripples {
+                let s = Canvas::ease_out_cubic(r.t);
+                let rad = 3.5 + s * 17.0;
+                let glow_a = ((1.0 - s) * 42.0).clamp(0.0, 255.0) as u8;
+                let ring_a = ((1.0 - s) * 145.0).clamp(0.0, 255.0) as u8;
+                if glow_a > 1 {
+                    canvas.fill_aa_circle(r.x as f32, r.y as f32, rad, r.color, glow_a);
+                    canvas.fill_aa_circle(r.x as f32, r.y as f32, (rad - 2.0).max(1.0), 0xFFFFFF, ring_a / 3);
+                }
+            }
         }
 
         // 7. Mouse cursor (morphs to crisp AA resize arrows over edges/corners)
@@ -1331,7 +2189,12 @@ impl Desktop {
                 && self.mouse_y >= task_y
                 && self.mouse_y < task_y + dock_h;
             let mut hover_edge = ResizeEdge::none();
-            if self.ctx_menu.is_none() && !self.start_menu_open && !over_dock {
+            if self.ctx_menu.is_none()
+                && !self.start_menu_open
+                && !self.cc_open
+                && !self.launcher_open
+                && !over_dock
+            {
                 for win in self.windows.iter().rev() {
                     if !win.open || win.minimized {
                         continue;
@@ -1356,15 +2219,321 @@ impl Desktop {
         }
     }
 
+    fn draw_snap_preview(
+        &self,
+        canvas: &mut Canvas,
+        w: i32,
+        h: i32,
+        zone: SnapZone,
+        t: f32,
+        accent: u32,
+    ) {
+        if t <= 0.02 {
+            return;
+        }
+        let (sx, sy, sw, sh) = self.snap_rect(zone, w, h);
+        canvas.blend_rounded_rect(
+            sx + 2,
+            sy + 2,
+            (sw - 4).max(8),
+            (sh - 4).max(8),
+            13,
+            accent,
+            (46.0 * t).clamp(0.0, 255.0) as u8,
+        );
+        canvas.draw_rounded_rect_alpha(
+            sx + 2,
+            sy + 2,
+            (sw - 4).max(8),
+            (sh - 4).max(8),
+            13,
+            accent,
+            (185.0 * t).clamp(0.0, 255.0) as u8,
+        );
+        canvas.blend_rect(
+            sx + 16,
+            sy + 4,
+            (sw - 32).max(0),
+            1,
+            0xFFFFFF,
+            (65.0 * t).clamp(0.0, 255.0) as u8,
+        );
+    }
+
+    fn draw_control_center(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let (glass_a, border_a) = self.settings.glass_alphas();
+        let raw_t = if self.settings.animations {
+            self.cc_anim.clamp(0.0, 1.05)
+        } else {
+            1.0
+        };
+        let t = raw_t.clamp(0.0, 1.0);
+        let (px, base_y, pw, ph) = self.cc_rect(w, h);
+        let slide = ((1.0 - raw_t) * 18.0).round() as i32;
+        let py = if self.settings.taskbar_top {
+            base_y - slide
+        } else {
+            base_y + slide
+        };
+
+        if t > 0.65 {
+            canvas.draw_soft_shadow(px, py, pw, ph, 14);
+        }
+        let panel_a = (((glass_a + 18).min(248) as f32) * t) as u8;
+        let stroke_a = ((border_a as f32) * t) as u8;
+        canvas.blend_rounded_rect(px, py, pw, ph, 14, 0x0E131E, panel_a);
+        canvas.draw_rounded_rect_alpha(px, py, pw, ph, 14, 0xFFFFFF, stroke_a);
+        canvas.blend_rect(px + 18, py + 1, pw - 36, 1, 0xFFFFFF, (32.0 * t) as u8);
+        if t < 0.25 {
+            return;
+        }
+
+        canvas.fill_aa_circle((px + 15) as f32, (py + 18) as f32, 3.0, accent, 255);
+        canvas.draw_text_clipped(
+            px + 24,
+            py + 11,
+            180,
+            tr(lang, "Центр управления", "Control Center"),
+            0xF8FAFC,
+            1,
+        );
+        let scale_tag = format!("{}%", self.settings.ui_scale_pct);
+        canvas.blend_rounded_rect(px + pw - 54, py + 9, 44, 18, 6, accent, 48);
+        canvas.draw_text_clipped(px + pw - 48, py + 12, 36, &scale_tag, 0xE2E8F0, 1);
+
+        let tiles = [
+            (0, 0, tr(lang, "Док", "Dock"), self.settings.floating_dock, 0xA855F7),
+            (1, 0, tr(lang, "Движение", "Motion"), self.settings.animations, accent),
+            (0, 1, tr(lang, "Джин", "Genie"), self.settings.genie_minimize, 0x2DD4BF),
+            (1, 1, tr(lang, "Сетка", "Grid"), self.settings.show_grid, 0xF59E0B),
+        ];
+        for (col, row, title, active, col_dot) in tiles {
+            let tx = px + 10 + col * 132;
+            let ty = py + 36 + row * 48;
+            let hov = self.cc_open
+                && self.mouse_x >= tx
+                && self.mouse_x <= tx + 124
+                && self.mouse_y >= ty
+                && self.mouse_y <= ty + 42;
+            if active {
+                canvas.blend_rounded_rect(tx, ty, 124, 42, 11, col_dot, if hov { 62 } else { 48 });
+                canvas.draw_rounded_rect_alpha(tx, ty, 124, 42, 11, col_dot, 130);
+                canvas.fill_aa_circle((tx + 18) as f32, (ty + 21) as f32, 10.0, col_dot, 220);
+                canvas.fill_aa_circle((tx + 18) as f32, (ty + 21) as f32, 4.0, 0xFFFFFF, 240);
+            } else {
+                canvas.blend_rounded_rect(tx, ty, 124, 42, 11, 0xFFFFFF, if hov { 20 } else { 12 });
+                canvas.draw_rounded_rect_alpha(tx, ty, 124, 42, 11, 0xFFFFFF, 26);
+                canvas.fill_aa_circle((tx + 18) as f32, (ty + 21) as f32, 10.0, 0xFFFFFF, 26);
+                canvas.fill_aa_circle((tx + 18) as f32, (ty + 21) as f32, 3.8, 0x94A3B8, 200);
+            }
+            canvas.draw_text_clipped(tx + 34, ty + 8, 84, title, 0xF1F5F9, 1);
+            canvas.draw_text_clipped(
+                tx + 34,
+                ty + 23,
+                84,
+                if active {
+                    tr(lang, "Вкл", "Active")
+                } else {
+                    tr(lang, "Выкл", "Off")
+                },
+                if active { 0xE2E8F0 } else { 0x94A3B8 },
+                1,
+            );
+        }
+
+        let glass_y = py + 136;
+        let glass_names = [
+            tr(lang, "Лёгкое", "Clear"),
+            tr(lang, "Мороз", "Frost"),
+            tr(lang, "Глубокое", "Blur+"),
+        ];
+        for (idx, lbl) in glass_names.iter().enumerate() {
+            let gx = px + 10 + (idx as i32) * 87;
+            let sel = self.settings.glass_level == idx as u8;
+            if sel {
+                canvas.blend_rounded_rect(gx, glass_y, 82, 26, 8, accent, 72);
+                canvas.draw_rounded_rect_alpha(gx, glass_y, 82, 26, 8, accent, 165);
+            } else {
+                canvas.blend_rounded_rect(gx, glass_y, 82, 26, 8, 0xFFFFFF, 12);
+                canvas.draw_rounded_rect_alpha(gx, glass_y, 82, 26, 8, 0xFFFFFF, 22);
+            }
+            canvas.draw_text_clipped(gx + 8, glass_y + 7, 68, lbl, if sel { 0xFFFFFF } else { 0xCBD5E1 }, 1);
+        }
+
+        let scale_y = py + 170;
+        for (idx, &pct) in UI_SCALES.iter().enumerate() {
+            let sx = px + 10 + (idx as i32) * 65;
+            let sel = self.settings.ui_scale_pct == pct;
+            if sel {
+                canvas.blend_rounded_rect(sx, scale_y, 61, 26, 8, accent, 78);
+                canvas.draw_rounded_rect_alpha(sx, scale_y, 61, 26, 8, accent, 170);
+            } else {
+                canvas.blend_rounded_rect(sx, scale_y, 61, 26, 8, 0xFFFFFF, 12);
+                canvas.draw_rounded_rect_alpha(sx, scale_y, 61, 26, 8, 0xFFFFFF, 22);
+            }
+            let txt = format!("{pct}%");
+            canvas.draw_text_clipped(sx + 10, scale_y + 7, 45, &txt, if sel { 0xFFFFFF } else { 0xCBD5E1 }, 1);
+        }
+
+        let foot_y = py + 204;
+        canvas.blend_rounded_rect(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 11);
+        canvas.draw_rounded_rect_alpha(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 22);
+        canvas.fill_aa_circle((px + 22) as f32, (foot_y + 12) as f32, 3.0, 0x3FB950, 255);
+        canvas.draw_text_clipped(
+            px + 30,
+            foot_y + 5,
+            pw - 48,
+            &format!("CPU {}%   RAM {}%", self.cpu_pct, self.mem.percent),
+            0xE2E8F0,
+            1,
+        );
+    }
+
+    fn draw_launcher(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let (glass_a, border_a) = self.settings.glass_alphas();
+        let raw_t = if self.settings.animations {
+            self.launcher_anim
+        } else {
+            1.0
+        };
+        let t = raw_t.clamp(0.0, 1.0);
+        if t <= 0.02 {
+            return;
+        }
+        // Subtle spotlight backdrop dim
+        canvas.blend_rect(0, 0, w, h, 0x05080F, (88.0 * t) as u8);
+
+        let (lx, base_y, lw, lh) = self.launcher_rect(w, h);
+        let ly = base_y + ((1.0 - raw_t) * 18.0).round() as i32;
+        if t > 0.55 {
+            canvas.draw_soft_shadow(lx, ly, lw, lh, 16);
+        }
+        let panel_a = (((glass_a + 24).min(250) as f32) * t) as u8;
+        let stroke_a = ((border_a.saturating_add(16) as f32) * t) as u8;
+        canvas.blend_rounded_rect(lx, ly, lw, lh, 16, 0x0C111C, panel_a);
+        canvas.draw_rounded_rect_alpha(lx, ly, lw, lh, 16, 0xFFFFFF, stroke_a);
+        canvas.blend_rect(lx + 20, ly + 1, lw - 40, 1, 0xFFFFFF, (42.0 * t) as u8);
+        if t < 0.25 {
+            return;
+        }
+
+        // Search box
+        let sx = lx + 12;
+        let sy = ly + 12;
+        let sw = lw - 24;
+        canvas.blend_rounded_rect(sx, sy, sw, 32, 10, 0xFFFFFF, 16);
+        canvas.draw_rounded_rect_alpha(sx, sy, sw, 32, 10, accent, 115);
+        canvas.fill_aa_circle((sx + 16) as f32, (sy + 15) as f32, 5.0, accent, 210);
+        canvas.fill_aa_circle((sx + 16) as f32, (sy + 15) as f32, 2.9, 0x101624, 255);
+        canvas.draw_aa_line((sx + 19) as f32, (sy + 18) as f32, (sx + 23) as f32, (sy + 22) as f32, 1.6, 0xE2E8F0, 235);
+
+        if self.launcher_query.is_empty() {
+            canvas.draw_text_clipped(
+                sx + 32,
+                sy + 9,
+                sw - 46,
+                tr(lang, "Поиск приложений, команд или 2+2...", "Search apps, actions or 2+2..."),
+                0x8B949E,
+                1,
+            );
+        } else {
+            canvas.draw_text_clipped(sx + 32, sy + 9, sw - 46, &self.launcher_query, 0xF8FAFC, 1);
+        }
+        if self.launcher_open && (self.tick / 15).is_multiple_of(2) {
+            let qlen = canvas.measure_text(&self.launcher_query, 1).min(sw - 50);
+            canvas.fill_rounded_rect(sx + 33 + qlen, sy + 7, 2, 17, 1, accent);
+        }
+
+        let entries = self.launcher_entries();
+        if entries.is_empty() {
+            canvas.draw_text_clipped(
+                lx + 24,
+                ly + 82,
+                lw - 48,
+                tr(lang, "Ничего не найдено", "No matches found"),
+                0x8B949E,
+                1,
+            );
+        } else {
+            for (i, item) in entries.iter().take(7).enumerate() {
+                let ry = ly + 52 + (i as i32) * 28;
+                let hov = self.launcher_open
+                    && self.mouse_x >= lx + 10
+                    && self.mouse_x <= lx + lw - 10
+                    && self.mouse_y >= ry
+                    && self.mouse_y < ry + 26;
+                let sel = i == self.launcher_sel || hov;
+                if sel {
+                    canvas.blend_rounded_rect(lx + 10, ry, lw - 20, 26, 8, accent, 52);
+                    canvas.draw_rounded_rect_alpha(lx + 10, ry, lw - 20, 26, 8, accent, 120);
+                    canvas.fill_rounded_rect(lx + 10, ry + 5, 3, 16, 1, accent);
+                }
+                canvas.fill_aa_circle((lx + 26) as f32, (ry + 13) as f32, 3.6, item.color, 255);
+                canvas.draw_text_clipped(
+                    lx + 38,
+                    ry + 6,
+                    lw - 134,
+                    &item.label,
+                    if sel { 0xF8FAFC } else { 0xCBD5E1 },
+                    1,
+                );
+                canvas.blend_rounded_rect(lx + lw - 92, ry + 4, 72, 18, 6, 0xFFFFFF, 15);
+                canvas.draw_text_clipped(lx + lw - 86, ry + 6, 62, item.badge, 0x94A3B8, 1);
+            }
+        }
+
+        canvas.blend_rect(lx + 14, ly + lh - 28, lw - 28, 1, 0xFFFFFF, 22);
+        canvas.draw_text_clipped(
+            lx + 18,
+            ly + lh - 21,
+            lw - 36,
+            tr(lang, "Alt+Space: поиск  |  Enter: запуск  |  Esc: закрыть", "↑↓ Select   Enter Run   Esc Close"),
+            0x7D8590,
+            1,
+        );
+    }
+
+    fn draw_toast(&self, canvas: &mut Canvas, w: i32, h: i32, toast: &Toast) {
+        let t = toast.anim.clamp(0.0, 1.0);
+        if t <= 0.02 {
+            return;
+        }
+        let tw = (canvas.measure_text(&toast.text, 1) + 42).clamp(132, (w - 32).max(132));
+        let th = 28;
+        let tx = (w - tw) / 2;
+        let ty = if self.settings.taskbar_top {
+            h - 42 + ((1.0 - t) * 28.0).round() as i32
+        } else {
+            10 - ((1.0 - t) * 28.0).round() as i32
+        };
+
+        if t > 0.5 {
+            canvas.draw_soft_shadow(tx, ty, tw, th, 14);
+        }
+        canvas.blend_rounded_rect(tx, ty, tw, th, 14, 0x090D16, (238.0 * t) as u8);
+        canvas.draw_rounded_rect_alpha(tx, ty, tw, th, 14, toast.color, (130.0 * t) as u8);
+        canvas.fill_aa_circle((tx + 15) as f32, (ty + 14) as f32, 3.6, toast.color, (255.0 * t) as u8);
+        if t > 0.35 {
+            canvas.draw_text_clipped(tx + 26, ty + 7, tw - 36, &toast.text, 0xF8FAFC, 1);
+        }
+        let frac = (toast.ttl as f32 / toast.max_ttl.max(1) as f32).clamp(0.0, 1.0);
+        let prog_w = (((tw - 28) as f32) * frac).round() as i32;
+        if prog_w > 2 {
+            canvas.blend_rect(tx + 14, ty + th - 3, prog_w, 1, toast.color, (185.0 * t) as u8);
+        }
+    }
+
     fn draw_context_menu(&self, canvas: &mut Canvas, cx: i32, cy: i32, accent: u32) {
         let lang = self.settings.lang;
         let (glass_a, border_a) = self.settings.glass_alphas();
         let t = if self.settings.animations {
-            Canvas::smoothstep(self.ctx_anim)
+            Canvas::ease_out_cubic(self.ctx_anim)
         } else {
             1.0
         };
-        let cy = cy + ((1.0 - t) * 7.0).round() as i32;
+        let cy = cy + ((1.0 - t) * 8.0).round() as i32;
         let items = [
             (tr(lang, "Открыть Терминал", "Open Terminal"), 0x3FB950),
             (tr(lang, "Сменить обои", "Next Wallpaper"), accent),
@@ -1373,12 +2542,12 @@ impl Desktop {
             (tr(lang, "Выход", "Exit"), 0xF85149),
         ];
         if t > 0.65 {
-            canvas.draw_soft_shadow(cx, cy, 184, 134, 9);
+            canvas.draw_soft_shadow(cx, cy, 184, 134, 11);
         }
-        let panel_a = (((glass_a + 12).min(248) as f32) * t) as u8;
+        let panel_a = (((glass_a + 14).min(248) as f32) * t) as u8;
         let stroke_a = ((border_a as f32) * t) as u8;
-        canvas.blend_rounded_rect(cx, cy, 184, 134, 9, 0x121620, panel_a);
-        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 9, 0xFFFFFF, stroke_a);
+        canvas.blend_rounded_rect(cx, cy, 184, 134, 11, 0x101520, panel_a);
+        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 11, 0xFFFFFF, stroke_a);
         if t < 0.30 {
             return;
         }
@@ -1393,7 +2562,7 @@ impl Desktop {
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 23
             {
-                canvas.blend_rounded_rect(cx + 4, iy, 176, 23, 6, accent, 52);
+                canvas.blend_rounded_rect(cx + 4, iy, 176, 23, 7, accent, 52);
             }
             canvas.fill_aa_circle((cx + 14) as f32, (iy + 11) as f32, 2.7, *dot_col, 255);
             let col = if i == 4 { 0xFF7B72 } else { 0xE2E8F0 };
@@ -1404,28 +2573,29 @@ impl Desktop {
     fn draw_start_menu(&self, canvas: &mut Canvas, dock_x: i32, task_y: i32, dock_h: i32, accent: u32) {
         let lang = self.settings.lang;
         let (glass_a, border_a) = self.settings.glass_alphas();
-        let t = if self.settings.animations {
-            self.start_anim.clamp(0.0, 1.0)
+        let raw_t = if self.settings.animations {
+            self.start_anim
         } else {
             1.0
         };
+        let t = raw_t.clamp(0.0, 1.0);
         let menu_w = 228;
         let menu_h = (START_ITEMS.len() as i32) * 24 + 42;
         let menu_x = dock_x + 8;
-        let slide = ((1.0 - t) * 12.0).round() as i32;
+        let slide = ((1.0 - raw_t) * 14.0).round() as i32;
         let menu_y = if self.settings.taskbar_top {
             task_y + dock_h + 2 - slide
         } else {
             task_y - menu_h - 4 + slide
         };
 
-        let panel_a = (((glass_a + 14).min(248) as f32) * t) as u8;
+        let panel_a = (((glass_a + 16).min(248) as f32) * t) as u8;
         let stroke_a = ((border_a as f32) * t) as u8;
         if t > 0.7 {
-            canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 11);
+            canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 13);
         }
-        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 11, 0x121620, panel_a);
-        canvas.draw_rounded_rect_alpha(menu_x, menu_y, menu_w, menu_h, 11, 0xFFFFFF, stroke_a);
+        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 13, 0x101520, panel_a);
+        canvas.draw_rounded_rect_alpha(menu_x, menu_y, menu_w, menu_h, 13, 0xFFFFFF, stroke_a);
 
         if t < 0.28 {
             return;
@@ -1452,7 +2622,7 @@ impl Desktop {
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 22;
             if hovered {
-                canvas.blend_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 6, 0xFFFFFF, 22);
+                canvas.blend_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 7, 0xFFFFFF, 22);
                 canvas.fill_rounded_rect(menu_x + 6, iy + 5, 3, 12, 1, accent);
             }
             let (label, col, dot_col) = match app_opt {
@@ -1491,24 +2661,24 @@ impl Desktop {
             canvas.draw_rounded_rect_alpha(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, bd_a);
         }
 
-        // Cohesive minimalist dark-glass squircle container + monoline vector glyphs
-        let bx = x + 14;
+        // Cohesive ColorOS dark-glass squircle container + monoline vector glyphs
+        let bx = x + 13;
         let by = y - lift;
-        let cx = bx as f32 + 19.0;
-        let cy = by as f32 + 19.0;
+        let cx = bx as f32 + 20.0;
+        let cy = by as f32 + 20.0;
 
-        canvas.draw_soft_shadow(bx, by, 38, 38, 11);
-        canvas.blend_rounded_rect(bx, by, 38, 38, 11, 0x11151F, (glass_a as i32 - 4).clamp(165, 248) as u8);
-        canvas.fill_aa_circle(cx, cy, 12.5 + hover_t * 4.5, accent, 26 + (hover_t * 34.0) as u8);
-        canvas.blend_rect(bx + 9, by + 1, 20, 1, 0xFFFFFF, 44);
+        canvas.draw_soft_shadow(bx, by, 40, 40, 12);
+        canvas.blend_rounded_rect(bx, by, 40, 40, 12, 0x101522, (glass_a as i32 - 4).clamp(165, 248) as u8);
+        canvas.fill_aa_circle(cx, cy, 13.5 + hover_t * 4.5, accent, 28 + (hover_t * 36.0) as u8);
+        canvas.blend_rect(bx + 10, by + 1, 20, 1, 0xFFFFFF, 46);
         canvas.draw_rounded_rect_alpha(
             bx,
             by,
-            38,
-            38,
-            11,
+            40,
+            40,
+            12,
             0xFFFFFF,
-            border_a.saturating_add((hover_t * 52.0) as u8),
+            border_a.saturating_add((hover_t * 54.0) as u8),
         );
 
         match id {
@@ -1518,7 +2688,6 @@ impl Desktop {
                 canvas.draw_aa_line(cx + 1.0, cy + 5.0, cx + 8.5, cy + 5.0, 1.8, 0xE2E8F0, 240);
             }
             AppId::PizGet => {
-                // Minimalist package tray + download arrow
                 canvas.draw_aa_line(cx, cy - 8.0, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
                 canvas.draw_aa_line(cx - 4.5, cy - 1.5, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
                 canvas.draw_aa_line(cx + 4.5, cy - 1.5, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
@@ -1527,7 +2696,6 @@ impl Desktop {
                 canvas.draw_aa_line(cx + 8.0, cy + 7.5, cx + 8.0, cy + 4.5, 1.7, 0xE2E8F0, 230);
             }
             AppId::Paint => {
-                // Minimalist stylus stroke + tri-color palette dots
                 canvas.draw_aa_line(cx - 7.5, cy + 6.5, cx + 6.5, cy - 7.5, 2.0, 0xA78BFA, 255);
                 canvas.fill_aa_circle(cx + 6.5, cy - 7.5, 2.0, 0xF472B6, 255);
                 canvas.fill_aa_circle(cx - 7.0, cy - 5.5, 2.2, 0x38BDF8, 255);
@@ -1535,7 +2703,6 @@ impl Desktop {
                 canvas.fill_aa_circle(cx + 7.5, cy + 3.0, 2.2, 0x4ADE80, 255);
             }
             AppId::Snake => {
-                // Sleek monoline snake path + target
                 canvas.draw_aa_line(cx - 8.0, cy + 6.0, cx - 1.0, cy + 6.0, 2.6, 0x4ADE80, 255);
                 canvas.draw_aa_line(cx - 1.0, cy + 6.0, cx - 1.0, cy - 5.0, 2.6, 0x4ADE80, 255);
                 canvas.draw_aa_line(cx - 1.0, cy - 5.0, cx + 7.5, cy - 5.0, 2.6, 0x86EFAC, 255);
@@ -1543,13 +2710,12 @@ impl Desktop {
                 canvas.fill_aa_circle(cx + 7.5, cy + 5.5, 2.6, 0xFB7185, 255);
             }
             AppId::Notepad => {
-                canvas.draw_rounded_rect_alpha(bx + 10, by + 9, 18, 20, 4, 0x93C5FD, 215);
+                canvas.draw_rounded_rect_alpha(bx + 11, by + 10, 18, 20, 4, 0x93C5FD, 215);
                 canvas.draw_aa_line(cx - 5.0, cy - 4.0, cx + 5.0, cy - 4.0, 1.5, 0xE2E8F0, 235);
                 canvas.draw_aa_line(cx - 5.0, cy, cx + 5.0, cy, 1.5, 0x94A3B8, 215);
                 canvas.draw_aa_line(cx - 5.0, cy + 4.0, cx + 2.0, cy + 4.0, 1.5, 0x94A3B8, 215);
             }
             AppId::Settings => {
-                // Clean 8-spoke monoline gear emblem
                 for k in 0..8 {
                     let ang = (k as f32) * std::f32::consts::FRAC_PI_4;
                     let x1 = cx + ang.cos() * 6.5;
@@ -1581,10 +2747,10 @@ impl Desktop {
             _ => {}
         }
 
-        let tw = crate::font::measure_text(label, 1).min(78);
+        let tw = canvas.measure_text(label, 1).min(78);
         let lx = x + 33 - tw / 2;
-        canvas.draw_text_clipped(lx + 1, y + 43, 80, label, 0x05080D, 1);
-        canvas.draw_text_clipped(lx, y + 42, 80, label, 0xE2E8F0, 1);
+        canvas.draw_text_clipped(lx + 1, y + 44, 80, label, 0x05080D, 1);
+        canvas.draw_text_clipped(lx, y + 43, 80, label, 0xE2E8F0, 1);
     }
 
     fn draw_window_frame(&self, canvas: &mut Canvas, win: &Window, focused: bool, is_onscreen: bool) {
@@ -1592,34 +2758,34 @@ impl Desktop {
         let accent = self.settings.active_accent();
 
         if is_onscreen {
-            canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 11);
+            canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 12);
         }
-        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 11, 0x131720);
+        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 12, 0x111622);
         canvas.draw_rounded_rect_alpha(
             win.x,
             win.y,
             win.w,
             win.h,
-            11,
+            12,
             0xFFFFFF,
-            if focused { 38 } else { 18 },
+            if focused { 42 } else { 18 },
         );
 
         let (tb_top, tb_bot) = if focused {
-            (0x1E2535, 0x161B27)
+            (0x1E2638, 0x151B29)
         } else {
-            (0x151923, 0x131720)
+            (0x151A25, 0x121621)
         };
-        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 10, tb_top, tb_bot);
-        canvas.blend_rect(win.x + 12, win.y + 1, (win.w - 24).max(0), 1, 0xFFFFFF, if focused { 36 } else { 14 });
+        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 11, tb_top, tb_bot);
+        canvas.blend_rect(win.x + 14, win.y + 1, (win.w - 28).max(0), 1, 0xFFFFFF, if focused { 40 } else { 14 });
         if focused {
-            canvas.blend_rect(win.x + 22, win.y, (win.w - 44).max(0), 1, accent, 72);
+            canvas.blend_rect(win.x + 24, win.y, (win.w - 48).max(0), 1, accent, 82);
         }
         canvas.blend_rect(win.x + 1, win.y + 27, win.w - 2, 1, 0xFFFFFF, 16);
         canvas.fill_aa_circle(
             (win.x + 14) as f32,
             (win.y + 14) as f32,
-            3.0,
+            3.2,
             win.id.color(),
             if focused { 245 } else { 125 },
         );
@@ -1632,7 +2798,6 @@ impl Desktop {
             1,
         );
 
-        // Minimalist flat monochrome window controls: ─, □, ×
         let btn_y = win.y + 5;
         let cy = btn_y + 9;
         let hover_y = is_onscreen && self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
@@ -1664,13 +2829,18 @@ impl Desktop {
         canvas.draw_aa_line((cls_x + 6) as f32, (cy - 4) as f32, (cls_x + 14) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
         canvas.draw_aa_line((cls_x + 14) as f32, (cy - 4) as f32, (cls_x + 6) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
 
+        let (hlx, hly) = if is_onscreen && focused {
+            (self.mouse_x - win.x, self.mouse_y - win.y)
+        } else {
+            (-1, -1)
+        };
         match win.id {
             AppId::System => self.draw_system_contents(canvas, win),
             AppId::PizGet => self.draw_pizget_contents(canvas, win),
             AppId::Files => self.draw_files_contents(canvas, win),
-            AppId::Terminal => self.terminal.draw(canvas, win.x, win.y, win.w, win.h),
-            AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h, lang),
-            AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h, lang),
+            AppId::Terminal => self.terminal.draw(canvas, win.x, win.y, win.w, win.h, accent),
+            AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h, lang, accent, hlx, hly),
+            AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.h, lang, self.tick),
             AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h, lang),
             AppId::Calc => self.calc.draw(canvas, win.x, win.y, win.w, win.h, accent),
             AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
@@ -1685,12 +2855,11 @@ impl Desktop {
                 self.cpu_pct,
                 &self.uptime,
                 self.tick,
-                if is_onscreen && focused { self.mouse_x - win.x } else { -1 },
-                if is_onscreen && focused { self.mouse_y - win.y } else { -1 },
+                hlx,
+                hly,
             ),
         }
 
-        // Subtle minimalist resize grip indicator at bottom-right corner
         if !win.maximized {
             let grip_hov = is_onscreen
                 && focused
@@ -1716,36 +2885,37 @@ impl Desktop {
         let y = win.y + 36;
         let iw = win.w - 28;
 
+        canvas.fill_rounded_rect(x - 4, y - 3, iw + 8, 34, 8, 0x0C111C);
+        canvas.draw_rounded_rect_alpha(x - 4, y - 3, iw + 8, 34, 8, 0xFFFFFF, 20);
         canvas.draw_text_clipped(
-            x,
+            x + 4,
             y,
-            iw,
+            iw - 8,
             &format!("{}: {}", tr(lang, "Ядро", "Kernel"), self.kernel),
             0xE6EDF3,
             1,
         );
         canvas.draw_text_clipped(
-            x,
-            y + 16,
-            iw,
+            x + 4,
+            y + 15,
+            iw - 8,
             &format!("{}: {}  |  Load: {}", tr(lang, "Аптайм", "Uptime"), self.uptime, self.loadavg),
-            0xE6EDF3,
+            0x94A3B8,
             1,
         );
 
         canvas.draw_text_clipped(x, y + 38, iw, &format!("CPU: {}%", self.cpu_pct), 0x79C0FF, 1);
-        canvas.draw_progress_bar(x, y + 52, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
+        canvas.draw_progress_bar(x, y + 52, iw, 14, self.cpu_pct, 0x2EA043, 0x0A0F16, 0x30363D);
 
-        // Live CPU Area Chart
         let gx = x;
         let gy = y + 72;
         let gh = 42;
-        canvas.fill_rounded_rect(gx, gy, iw, gh, 6, 0x0A0F16);
+        canvas.fill_rounded_rect(gx, gy, iw, gh, 8, 0x0A0F16);
         for pct_line in [1, 2, 3] {
             let ly = gy + (gh * pct_line) / 4;
             canvas.fill_rect(gx + 2, ly, iw - 4, 1, 0x1A222D);
         }
-        canvas.draw_rounded_rect_alpha(gx, gy, iw, gh, 6, 0xFFFFFF, 32);
+        canvas.draw_rounded_rect_alpha(gx, gy, iw, gh, 8, 0xFFFFFF, 26);
         let bar_w = (iw / 32).max(2);
         for (i, &val) in self.cpu_history.iter().enumerate() {
             let bh = (((val as i32) * (gh - 6)) / 100).max(2);
@@ -1788,7 +2958,7 @@ impl Desktop {
             14,
             self.mem.percent,
             0xD29922,
-            0x0D1117,
+            0x0A0F16,
             0x30363D,
         );
 
@@ -1829,11 +2999,14 @@ impl Desktop {
         let y = win.y + 36;
         let iw = win.w - 28;
 
+        canvas.fill_rounded_rect(x - 2, y - 2, iw + 4, (win.h - 82).max(40), 8, 0x0C111C);
+        canvas.draw_rounded_rect_alpha(x - 2, y - 2, iw + 4, (win.h - 82).max(40), 8, 0xFFFFFF, 20);
+
         if self.packages.is_empty() {
             canvas.draw_text_clipped(
-                x,
+                x + 6,
                 y + 8,
-                iw,
+                iw - 12,
                 tr(lang, "Нет пакетов (нажми Обновить)", "No packages (click Update)"),
                 0x8B949E,
                 1,
@@ -1844,7 +3017,7 @@ impl Desktop {
                 let ry = y + (i as i32) * 18;
                 let selected = i == self.pkg_sel;
                 if selected {
-                    canvas.fill_rounded_rect(x, ry, iw, 16, 4, 0x1F6FEB);
+                    canvas.fill_rounded_rect(x + 1, ry, iw - 2, 16, 6, 0x1F6FEB);
                 }
                 let tag = if p.installed { "[INST]" } else { "[AVAIL]" };
                 let color = if selected {
@@ -1877,13 +3050,15 @@ impl Desktop {
         let iw = win.w - 28;
 
         canvas.draw_text_clipped(x, y, iw, &format!("CWD: {}", self.cwd.display()), 0x79C0FF, 1);
+        canvas.fill_rounded_rect(x - 2, win.y + 52, iw + 4, (win.h - 68).max(40), 8, 0x0C111C);
+        canvas.draw_rounded_rect_alpha(x - 2, win.y + 52, iw + 4, (win.h - 68).max(40), 8, 0xFFFFFF, 20);
 
         let max_rows = ((win.h - 70) / 18).max(1) as usize;
         for (i, item) in self.files.iter().take(max_rows).enumerate() {
             let ry = win.y + 54 + (i as i32) * 18;
             let selected = i == self.file_sel;
             if selected {
-                canvas.fill_rounded_rect(x, ry, iw, 16, 4, 0x21262D);
+                canvas.fill_rounded_rect(x + 1, ry, iw - 2, 16, 6, 0x21262D);
             }
             let prefix = if item.is_dir { "[DIR]" } else { "     " };
             let color = if item.is_dir { 0x58A6FF } else { 0xE6EDF3 };

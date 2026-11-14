@@ -401,4 +401,153 @@ mod tests {
         }
         assert_eq!(desktop.dock_float_anim, 1.0);
     }
+
+    #[test]
+    fn test_vector_ui_scaling_and_non_linear_motion() {
+        // 1. HiDPI logical-to-physical vector canvas dimensions
+        let mut canvas = Canvas::new(1500, 900);
+        let mut desktop = Desktop::new(1500, 900);
+
+        desktop.settings.ui_scale_pct = 125;
+        canvas.set_ui_scale(desktop.settings.ui_scale());
+        assert_eq!(canvas.logical_width(), 1200);
+        assert_eq!(canvas.logical_height(), 720);
+        desktop.render(&mut canvas);
+        assert!(canvas.pixels.iter().any(|&p| p != 0));
+
+        // 2. Keyboard scale delta step + dynamic toast feedback
+        desktop.on_key(crate::apps::KeyEvent::ScaleDelta(1));
+        assert_eq!(desktop.settings.ui_scale_pct, 150);
+        assert!(desktop.toast.is_some());
+        canvas.set_ui_scale(desktop.settings.ui_scale());
+        assert_eq!(canvas.logical_width(), 1000);
+        assert_eq!(canvas.logical_height(), 600);
+        desktop.render(&mut canvas);
+
+        desktop.on_key(crate::apps::KeyEvent::ScaleDelta(0));
+        assert_eq!(desktop.settings.ui_scale_pct, 100);
+
+        // 3. Non-linear easing & damped spring overshoot/settlement
+        assert!(Canvas::ease_out_back(0.65) > 1.0);
+        assert!((Canvas::ease_in_out_cubic(0.5) - 0.5).abs() < 1e-5);
+        assert!(Canvas::ease_out_cubic(0.25) > 0.25);
+
+        let mut pos = 0.0f32;
+        let mut vel = 0.0f32;
+        for _ in 0..24 {
+            Canvas::step_spring(&mut pos, &mut vel, 1.0, 0.36, 0.52, 0.008);
+        }
+        assert_eq!(pos, 1.0);
+    }
+
+    #[test]
+    fn test_snap_zones_control_center_spotlight_and_toast() {
+        let mut canvas = Canvas::new(1160, 720);
+        let mut desktop = Desktop::new(1160, 720);
+
+        // 1. Window Snap Zone Left via dragging Settings titlebar to left edge
+        let sw = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(sw.x + 80, sw.y + 12, 1160, 720);
+        assert!(desktop.dragging.is_some());
+        desktop.on_mouse_move(6, 200, 1160, 720);
+        assert_eq!(desktop.snap_zone, Some(crate::desktop::SnapZone::Left));
+        desktop.on_tick();
+        desktop.render(&mut canvas);
+
+        desktop.on_mouse_up();
+        assert!(desktop.dragging.is_none());
+        let snapped = desktop.windows.last().unwrap().clone();
+        assert_eq!(snapped.x, 6);
+        assert!(snapped.w > 500 && snapped.w < 600);
+        assert!(desktop.toast.is_some());
+        for _ in 0..24 {
+            desktop.on_tick();
+        }
+        assert!((desktop.windows.last().unwrap().vis_rect[0] - 6.0).abs() < 1.0);
+
+        // 2. Spotlight Quick Launcher + live math parser + launching Paint
+        assert_eq!(crate::desktop::eval_quick_math("12 * (3 + 1)"), Some(48.0));
+        desktop.on_key(crate::apps::KeyEvent::ToggleLauncher);
+        assert!(desktop.launcher_open);
+        for ch in "12*4".chars() {
+            desktop.on_key(crate::apps::KeyEvent::Char(ch));
+        }
+        desktop.render(&mut canvas);
+        desktop.on_key(crate::apps::KeyEvent::Enter);
+        assert!(!desktop.launcher_open);
+        assert_eq!(desktop.calc.display, "48");
+
+        desktop.on_key(crate::apps::KeyEvent::ToggleLauncher);
+        for ch in "paint".chars() {
+            desktop.on_key(crate::apps::KeyEvent::Char(ch));
+        }
+        desktop.on_key(crate::apps::KeyEvent::Enter);
+        assert_eq!(
+            desktop.windows.last().unwrap().id,
+            crate::desktop::AppId::Paint
+        );
+
+        // 3. Control Center taskbar pill (on 1160px: lang_x = 1016, cc_x = 986..1011)
+        desktop.on_mouse_down(998, 700, 1160, 720);
+        assert!(desktop.cc_open);
+        for _ in 0..6 {
+            desktop.on_tick();
+        }
+        desktop.render(&mut canvas);
+        assert!(desktop.cc_anim > 0.3);
+        // Click UI Scale 125% inside Control Center (idx 1 -> px = 1160 - 276 - 8 = 876, sx = 876 + 10 + 65 = 951, py = 720 - 36 - 236 - 6 = 442, scale_y = 442 + 170 = 612)
+        desktop.on_mouse_down(965, 624, 1160, 720);
+        assert_eq!(desktop.settings.ui_scale_pct, 125);
+    }
+
+    #[test]
+    fn test_paint_tools_and_piznake_upgrades() {
+        let mut desktop = Desktop::new(1160, 720);
+
+        // 1. PizPaint size cycle, Flood Fill, Eraser & BMP export
+        desktop.focus_or_open(crate::desktop::AppId::Paint);
+        let p_wh = 268;
+        // Pick color index 1 (red) & cycle brush size from M(4) -> L(7) -> S(2)
+        desktop.paint.on_click(38, p_wh - 20, p_wh);
+        desktop.paint.on_click(170, p_wh - 20, p_wh);
+        assert_eq!(desktop.paint.brush, 7);
+        desktop.paint.on_click(170, p_wh - 20, p_wh);
+        assert_eq!(desktop.paint.brush, 2);
+        // Enable Flood Fill and click inside canvas
+        desktop.paint.on_click(260, p_wh - 20, p_wh);
+        assert!(desktop.paint.fill_mode);
+        desktop.paint.on_click(40, 60, p_wh);
+        desktop.paint.end_stroke();
+        assert_ne!(desktop.paint.buf[0], 0x0D1117);
+        // Save BMP and clean up temp file
+        if let crate::apps::PaintAction::Saved(fname) = desktop.paint.on_click(300, p_wh - 20, p_wh)
+        {
+            let tmp = std::env::temp_dir().join(&fname);
+            assert!(tmp.exists());
+            let _ = std::fs::remove_file(tmp);
+        } else {
+            panic!("expected PaintAction::Saved");
+        }
+        // Enable Eraser and clear canvas pixel
+        desktop.paint.on_click(210, p_wh - 20, p_wh);
+        assert!(desktop.paint.eraser);
+        desktop.paint.on_click(40, 60, p_wh);
+        let idx = (60 - 36) as usize * crate::apps::PAINT_W + (40 - 14) as usize;
+        assert_eq!(desktop.paint.buf[idx], 0x0D1117);
+
+        // 2. Pizмейка / Piznake portal walls wrap & interpolation
+        assert!(desktop.snake.wrap_walls);
+        desktop.snake.on_click(140, 278 - 20, 278);
+        assert!(!desktop.snake.wrap_walls);
+        desktop.snake.on_click(140, 278 - 20, 278);
+        assert!(desktop.snake.wrap_walls);
+        desktop.snake.body = vec![(0, 5), (1, 5), (2, 5)];
+        desktop.snake.prev_body = desktop.snake.body.clone();
+        desktop.snake.dir = (-1, 0);
+        desktop.snake.step();
+        assert!(!desktop.snake.game_over);
+        assert_eq!(desktop.snake.body[0].0, 19);
+        desktop.snake.step_interp(8, true);
+        assert!(desktop.snake.move_t > 0.0);
+    }
 }

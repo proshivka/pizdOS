@@ -87,6 +87,8 @@ mod linux_fb {
         let h = vinfo.yres as usize;
         let mut canvas = Canvas::new(w, h);
         let mut desktop = Desktop::new(w as i32, h as i32);
+        let mut prev_scale = desktop.settings.ui_scale();
+        canvas.set_ui_scale(prev_scale);
 
         let mut mice = File::open("/dev/input/mice").ok();
         if let Some(ref m) = mice {
@@ -98,6 +100,15 @@ mod linux_fb {
         let mut prev_right = false;
 
         while desktop.running {
+            let cur_scale = desktop.settings.ui_scale();
+            if (cur_scale - prev_scale).abs() > 0.001 {
+                canvas.set_ui_scale(cur_scale);
+                desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
+                prev_scale = cur_scale;
+            }
+            let log_w = canvas.logical_width();
+            let log_h = canvas.logical_height();
+
             if let Some(ref mut m) = mice {
                 let mut pkt = [0u8; 3];
                 while m.read_exact(&mut pkt).is_ok() {
@@ -109,14 +120,14 @@ mod linux_fb {
                     let left = (buttons & 1) != 0;
                     let right = (buttons & 2) != 0;
                     if left && !desktop.mouse_down {
-                        desktop.on_mouse_down(nx, ny, w as i32, h as i32);
+                        desktop.on_mouse_down(nx, ny, log_w, log_h);
                     } else if !left && desktop.mouse_down {
                         desktop.on_mouse_up();
                     } else {
-                        desktop.on_mouse_move(nx, ny, w as i32, h as i32);
+                        desktop.on_mouse_move(nx, ny, log_w, log_h);
                     }
                     if right && !prev_right {
-                        desktop.on_right_click(nx, ny, w as i32, h as i32);
+                        desktop.on_right_click(nx, ny, log_w, log_h);
                     }
                     prev_right = right;
                 }
@@ -157,17 +168,34 @@ mod win32 {
     const WM_PAINT: u32 = 0x000F;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_CHAR: u32 = 0x0102;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_SYSCHAR: u32 = 0x0106;
     const WM_MOUSEMOVE: u32 = 0x0200;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
     const WM_RBUTTONDOWN: u32 = 0x0204;
     const VK_BACK: usize = 0x08;
     const VK_RETURN: usize = 0x0D;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
     const VK_ESCAPE: usize = 0x1B;
+    const VK_SPACE: usize = 0x20;
     const VK_LEFT: usize = 0x25;
     const VK_UP: usize = 0x26;
     const VK_RIGHT: usize = 0x27;
     const VK_DOWN: usize = 0x28;
+    const VK_0: usize = 0x30;
+    const VK_G: usize = 0x47;
+    const VK_K: usize = 0x4B;
+    const VK_ADD: usize = 0x6B;
+    const VK_SUBTRACT: usize = 0x6D;
+    const VK_F1: usize = 0x70;
+    const VK_F2: usize = 0x71;
+    const VK_OEM_PLUS: usize = 0xBB;
+    const VK_OEM_MINUS: usize = 0xBD;
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const LOGPIXELSX: i32 = 88;
     const PM_REMOVE: u32 = 0x0001;
     const SRCCOPY: u32 = 0x00CC_0020;
 
@@ -267,10 +295,13 @@ mod win32 {
         fn ValidateRect(hwnd: Hwnd, lp_rect: *const Rect) -> i32;
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> isize;
         fn SetProcessDPIAware() -> i32;
+        fn GetSystemMetrics(n_index: i32) -> i32;
+        fn GetKeyState(n_virt_key: i32) -> i16;
     }
 
     #[link(name = "gdi32")]
     unsafe extern "system" {
+        fn GetDeviceCaps(hdc: Hdc, index: i32) -> i32;
         fn StretchDIBits(
             hdc: Hdc,
             x_dest: i32,
@@ -320,6 +351,33 @@ mod win32 {
     pub fn run_win32_gui() -> io::Result<()> {
         // Disable automatic Windows DPI bitmap stretching so every pixel matches native screen DPI 1:1.
         unsafe { SetProcessDPIAware() };
+        let scr_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let scr_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        let screen_dc = unsafe { GetDC(0) };
+        let dpi_x = if screen_dc != 0 {
+            let d = unsafe { GetDeviceCaps(screen_dc, LOGPIXELSX) };
+            unsafe { ReleaseDC(0, screen_dc) };
+            d
+        } else {
+            96
+        };
+        let init_scale_pct: u16 = if dpi_x >= 144 {
+            150
+        } else if dpi_x >= 120 || scr_w >= 1900 {
+            125
+        } else {
+            100
+        };
+        let init_w = if scr_w > 0 {
+            (scr_w * 78 / 100).clamp(1160, 1480)
+        } else {
+            1240
+        };
+        let init_h = if scr_h > 0 {
+            (scr_h * 82 / 100).clamp(720, 920)
+        } else {
+            800
+        };
 
         let class_name = utf16("PizsoftUIClass");
         let title = utf16("Pizsoft UI — pizdOS 2.0");
@@ -348,8 +406,8 @@ mod win32 {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                1160,
-                720,
+                init_w,
+                init_h,
                 0,
                 0,
                 h_inst,
@@ -360,14 +418,19 @@ mod win32 {
             return Err(io::Error::other("CreateWindowExW failed"));
         }
 
-        let mut canvas = Canvas::new(1160, 720);
-        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = Canvas::new(init_w as usize, init_h as usize);
+        let mut desktop = Desktop::new(init_w, init_h);
+        desktop.settings.ui_scale_pct = init_scale_pct;
+        let mut prev_scale = desktop.settings.ui_scale();
+        canvas.set_ui_scale(prev_scale);
+        desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
+
         let mut msg = Msg::default();
         let mut bmi = BitmapInfo {
             bmi_header: BitmapInfoHeader {
                 bi_size: mem::size_of::<BitmapInfoHeader>() as u32,
-                bi_width: 1160,
-                bi_height: -720, // top-down
+                bi_width: init_w,
+                bi_height: -init_h, // top-down
                 bi_planes: 1,
                 bi_bit_count: 32,
                 bi_compression: 0,
@@ -389,33 +452,78 @@ mod win32 {
                 }
                 let x = (msg.l_param & 0xFFFF) as i16 as i32;
                 let y = ((msg.l_param >> 16) & 0xFFFF) as i16 as i32;
+                let cur_scale = desktop.settings.ui_scale();
+                canvas.set_ui_scale(cur_scale);
+                let log_w = canvas.logical_width();
+                let log_h = canvas.logical_height();
+                let lx = (x as f32 / cur_scale).round() as i32;
+                let ly = (y as f32 / cur_scale).round() as i32;
+
+                let mut swallow = false;
                 match msg.message {
-                    WM_MOUSEMOVE => {
-                        desktop.on_mouse_move(x, y, canvas.width as i32, canvas.height as i32)
-                    }
-                    WM_LBUTTONDOWN => {
-                        desktop.on_mouse_down(x, y, canvas.width as i32, canvas.height as i32)
-                    }
+                    WM_MOUSEMOVE => desktop.on_mouse_move(lx, ly, log_w, log_h),
+                    WM_LBUTTONDOWN => desktop.on_mouse_down(lx, ly, log_w, log_h),
                     WM_LBUTTONUP => desktop.on_mouse_up(),
-                    WM_RBUTTONDOWN => {
-                        desktop.on_right_click(x, y, canvas.width as i32, canvas.height as i32)
+                    WM_RBUTTONDOWN => desktop.on_right_click(lx, ly, log_w, log_h),
+                    WM_SYSKEYDOWN => {
+                        let alt_down =
+                            (msg.l_param & (1 << 29)) != 0 || unsafe { GetKeyState(VK_MENU) } < 0;
+                        if alt_down && msg.w_param == VK_SPACE {
+                            desktop.on_key(KeyEvent::ToggleLauncher);
+                            swallow = true;
+                        }
                     }
-                    WM_KEYDOWN => match msg.w_param {
-                        VK_ESCAPE => {
-                            if !desktop.on_escape() {
-                                desktop.running = false;
+                    WM_SYSCHAR => {
+                        swallow = true;
+                    }
+                    WM_KEYDOWN => {
+                        let ctrl_down = unsafe { GetKeyState(VK_CONTROL) } < 0;
+                        let alt_down =
+                            (msg.l_param & (1 << 29)) != 0 || unsafe { GetKeyState(VK_MENU) } < 0;
+                        if (alt_down && msg.w_param == VK_SPACE)
+                            || msg.w_param == VK_F2
+                            || (ctrl_down && msg.w_param == VK_K)
+                        {
+                            desktop.on_key(KeyEvent::ToggleLauncher);
+                            swallow = true;
+                        } else if msg.w_param == VK_F1 || (ctrl_down && msg.w_param == VK_G) {
+                            desktop.on_key(KeyEvent::ToggleControlCenter);
+                            swallow = true;
+                        } else if ctrl_down && (msg.w_param == VK_OEM_PLUS || msg.w_param == VK_ADD)
+                        {
+                            desktop.on_key(KeyEvent::ScaleDelta(1));
+                            swallow = true;
+                        } else if ctrl_down
+                            && (msg.w_param == VK_OEM_MINUS || msg.w_param == VK_SUBTRACT)
+                        {
+                            desktop.on_key(KeyEvent::ScaleDelta(-1));
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_0 {
+                            desktop.on_key(KeyEvent::ScaleDelta(0));
+                            swallow = true;
+                        } else {
+                            match msg.w_param {
+                                VK_ESCAPE => {
+                                    if !desktop.on_escape() {
+                                        desktop.running = false;
+                                    }
+                                }
+                                VK_LEFT => desktop.on_key(KeyEvent::Left),
+                                VK_UP => desktop.on_key(KeyEvent::Up),
+                                VK_RIGHT => desktop.on_key(KeyEvent::Right),
+                                VK_DOWN => desktop.on_key(KeyEvent::Down),
+                                VK_BACK => desktop.on_key(KeyEvent::Backspace),
+                                VK_RETURN => desktop.on_key(KeyEvent::Enter),
+                                _ => {}
                             }
                         }
-                        VK_LEFT => desktop.on_key(KeyEvent::Left),
-                        VK_UP => desktop.on_key(KeyEvent::Up),
-                        VK_RIGHT => desktop.on_key(KeyEvent::Right),
-                        VK_DOWN => desktop.on_key(KeyEvent::Down),
-                        VK_BACK => desktop.on_key(KeyEvent::Backspace),
-                        VK_RETURN => desktop.on_key(KeyEvent::Enter),
-                        _ => {}
-                    },
+                    }
                     WM_CHAR => {
-                        if let Some(ch) = char::from_u32(msg.w_param as u32)
+                        let alt_down = (msg.l_param & (1 << 29)) != 0;
+                        let ctrl_down = unsafe { GetKeyState(VK_CONTROL) } < 0;
+                        if !alt_down
+                            && !ctrl_down
+                            && let Some(ch) = char::from_u32(msg.w_param as u32)
                             && !ch.is_control()
                         {
                             desktop.on_key(KeyEvent::Char(ch));
@@ -423,9 +531,11 @@ mod win32 {
                     }
                     _ => {}
                 }
-                unsafe {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                if !swallow {
+                    unsafe {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
                 }
             }
 
@@ -433,11 +543,15 @@ mod win32 {
             unsafe { GetClientRect(hwnd, &mut rect) };
             let cw = (rect.right - rect.left).max(320) as usize;
             let ch = (rect.bottom - rect.top).max(240) as usize;
-            if cw != canvas.width || ch != canvas.height {
+            let cur_scale = desktop.settings.ui_scale();
+            if cw != canvas.width || ch != canvas.height || (cur_scale - prev_scale).abs() > 0.001
+            {
                 canvas.resize(cw, ch);
-                desktop.on_viewport_resize(cw as i32, ch as i32);
+                canvas.set_ui_scale(cur_scale);
+                desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
                 bmi.bmi_header.bi_width = cw as i32;
                 bmi.bmi_header.bi_height = -(ch as i32);
+                prev_scale = cur_scale;
             }
 
             desktop.on_tick();
