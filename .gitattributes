@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.asm text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+inittab text eol=lf
+issue text eol=lf
+motd text eol=lf
+hostname text eol=lf
+interfaces text eol=lf

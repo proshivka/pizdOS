@@ -48,6 +48,10 @@ mkdir -p "$OVERLAY_DIR/usr/bin"
 mkdir -p "$OVERLAY_DIR/bin"
 cp -f "$PIZGET_BIN" "$OVERLAY_DIR/usr/bin/piz-get"
 cp -f "$PIZUI_BIN" "$OVERLAY_DIR/usr/bin/pizsoft"
+
+# Убираем все CRLF из текстовых файлов намертво
+find "$OVERLAY_DIR" -type f -exec dos2unix -q {} + 2>/dev/null || true
+
 chmod +x "$OVERLAY_DIR/usr/bin/piz-get" "$OVERLAY_DIR/usr/bin/pizsoft"
 chmod +x "$OVERLAY_DIR/bin/"* 2>/dev/null || true
 chmod +x "$OVERLAY_DIR/usr/bin/"* 2>/dev/null || true
@@ -84,12 +88,14 @@ INITRD /boot/initramfs-virt
 APPEND modules=loop,squashfs,sd-mod,usb-storage console=tty0 quiet
 EOF
 
+dos2unix -q "$ISO_WORK/boot/syslinux/syslinux.cfg" 2>/dev/null || true
 cp -f "$ISO_WORK/boot/syslinux/syslinux.cfg" "$ISO_WORK/boot/syslinux/isolinux.cfg"
 cp -f "$ISO_WORK/boot/syslinux/syslinux.cfg" "$ISO_WORK/isolinux/isolinux.cfg"
 cp -f "$ISO_WORK/boot/syslinux/syslinux.cfg" "$ISO_WORK/isolinux.cfg"
 
 if [ -f "$ISO_WORK/boot/grub/grub.cfg" ]; then
     sed -i 's/Alpine Linux/pizdOS 2.0 (PDOS 2)/g' "$ISO_WORK/boot/grub/grub.cfg"
+    dos2unix -q "$ISO_WORK/boot/grub/grub.cfg" 2>/dev/null || true
 fi
 
 # 7. Сборка bootable ISO через xorriso
