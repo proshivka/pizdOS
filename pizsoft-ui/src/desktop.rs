@@ -245,6 +245,7 @@ pub struct Desktop {
     pub ctx_menu: Option<(i32, i32)>,
     pub ctx_anim: f32,
     pub last_ctx_menu: Option<(i32, i32)>,
+    pub dock_float_anim: f32,
     pub icon_hover: [f32; 8],
     pub mouse_x: i32,
     pub mouse_y: i32,
@@ -305,6 +306,7 @@ impl Desktop {
             ctx_menu: None,
             ctx_anim: 0.0,
             last_ctx_menu: None,
+            dock_float_anim: 0.0,
             icon_hover: [0.0; 8],
             mouse_x: width / 2,
             mouse_y: height / 2,
@@ -455,6 +457,9 @@ impl Desktop {
             self.start_menu_open = false;
             return true;
         }
+        if self.settings.display_picker.take().is_some() {
+            return true;
+        }
         if self.settings.editing_device {
             self.settings.on_key(KeyEvent::Escape);
             return true;
@@ -464,15 +469,17 @@ impl Desktop {
 
     #[inline]
     fn taskbar_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32, bool) {
-        if self.settings.floating_dock {
-            let dw = (canvas_w - 28).max(260);
-            let dx = (canvas_w - dw) / 2;
-            let dy = if self.settings.taskbar_top { 6 } else { canvas_h - 42 };
-            (dx, dy, dw, 36, true)
+        let t = Canvas::smoothstep(self.dock_float_anim);
+        let target_w = (canvas_w - 28).max(260);
+        let dw = canvas_w - ((canvas_w - target_w) as f32 * t).round() as i32;
+        let dx = (canvas_w - dw) / 2;
+        let base_y = if self.settings.taskbar_top { 0 } else { canvas_h - 36 };
+        let dy = if self.settings.taskbar_top {
+            base_y + (6.0 * t).round() as i32
         } else {
-            let dy = if self.settings.taskbar_top { 0 } else { canvas_h - 36 };
-            (0, dy, canvas_w, 36, false)
-        }
+            base_y - (6.0 * t).round() as i32
+        };
+        (dx, dy, dw, 36, t > 0.01)
     }
 
     fn taskbar_pill_rect(&self, canvas_w: i32, canvas_h: i32, id: AppId) -> (i32, i32, i32) {
@@ -494,11 +501,13 @@ impl Desktop {
 
         let start_tgt = if self.start_menu_open { 1.0 } else { 0.0 };
         let ctx_tgt = if self.ctx_menu.is_some() { 1.0 } else { 0.0 };
+        let dock_tgt = if self.settings.floating_dock { 1.0 } else { 0.0 };
         let genie_step = if self.settings.genie_minimize { 0.072 } else { 0.095 };
 
         if !self.settings.animations {
             self.start_anim = start_tgt;
             self.ctx_anim = ctx_tgt;
+            self.dock_float_anim = dock_tgt;
             if self.ctx_menu.is_none() {
                 self.last_ctx_menu = None;
             }
@@ -533,6 +542,13 @@ impl Desktop {
                 }
             } else {
                 self.ctx_anim += cd * 0.36;
+            }
+
+            let dd = dock_tgt - self.dock_float_anim;
+            if dd.abs() < 0.01 {
+                self.dock_float_anim = dock_tgt;
+            } else {
+                self.dock_float_anim += dd * 0.24;
             }
 
             for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
@@ -928,6 +944,7 @@ impl Desktop {
                 return;
             }
 
+            self.paint.end_stroke();
             self.handle_window_click(&win, x - win.x, y - win.y);
             return;
         }
@@ -947,6 +964,7 @@ impl Desktop {
         self.mouse_down = false;
         self.dragging = None;
         self.resizing = None;
+        self.paint.end_stroke();
     }
 
     fn handle_window_click(&mut self, win: &Window, lx: i32, ly: i32) {
@@ -1145,13 +1163,32 @@ impl Desktop {
             }
         }
 
-        // 4. Minimalist Dark Frosted Taskbar or Floating Minimal Dock (ONLY open windows)
+        // 4. Minimalist Dark Frosted Taskbar or Animated Floating Minimal Dock (ONLY open windows)
         let (dock_x, task_y, dock_w, dock_h, floating) = self.taskbar_rect(w, h);
+        let dock_t = Canvas::smoothstep(self.dock_float_anim);
         if floating {
-            canvas.draw_soft_shadow(dock_x, task_y, dock_w, dock_h, 13);
-            canvas.blend_rounded_rect(dock_x, task_y, dock_w, dock_h, 13, 0x0B0E14, glass_a);
-            canvas.draw_rounded_rect_alpha(dock_x, task_y, dock_w, dock_h, 13, 0xFFFFFF, border_a);
-            canvas.blend_rect(dock_x + 14, task_y + 1, (dock_w - 28).max(0), 1, 0xFFFFFF, 22);
+            let r = (13.0 * dock_t).round() as i32;
+            if dock_t > 0.15 {
+                canvas.draw_soft_shadow(dock_x, task_y, dock_w, dock_h, r);
+            }
+            canvas.blend_rounded_rect(dock_x, task_y, dock_w, dock_h, r, 0x0B0E14, glass_a);
+            canvas.draw_rounded_rect_alpha(
+                dock_x,
+                task_y,
+                dock_w,
+                dock_h,
+                r,
+                0xFFFFFF,
+                (border_a as f32 * dock_t).round() as u8,
+            );
+            canvas.blend_rect(
+                dock_x + r + 1,
+                task_y + 1,
+                (dock_w - (r + 1) * 2).max(0),
+                1,
+                0xFFFFFF,
+                (22.0 * dock_t).round() as u8,
+            );
         } else {
             canvas.blend_rect(0, task_y, w, dock_h, 0x0B0E14, glass_a);
             let rim_y = if self.settings.taskbar_top { task_y + 35 } else { task_y };

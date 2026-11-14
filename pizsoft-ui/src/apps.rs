@@ -168,6 +168,7 @@ pub struct PaintState {
     pub buf: Vec<u32>,
     pub color_idx: usize,
     pub brush: i32,
+    pub last_pos: Option<(i32, i32)>,
 }
 
 impl PaintState {
@@ -176,19 +177,22 @@ impl PaintState {
             buf: vec![0x0D1117; PAINT_W * PAINT_H],
             color_idx: 1,
             brush: 3,
+            last_pos: None,
         }
     }
 
-    pub fn paint_at(&mut self, lx: i32, ly: i32) {
-        let cx = lx - 14;
-        let cy = ly - 36;
-        if cx < 0 || cy < 0 || cx >= PAINT_W as i32 || cy >= PAINT_H as i32 {
-            return;
-        }
-        let color = PALETTE[self.color_idx];
+    pub fn end_stroke(&mut self) {
+        self.last_pos = None;
+    }
+
+    fn stamp_brush(&mut self, cx: i32, cy: i32, color: u32) {
         let r = self.brush / 2;
+        let r2 = r * r + r;
         for dy in -r..=r {
             for dx in -r..=r {
+                if r > 1 && dx * dx + dy * dy > r2 {
+                    continue;
+                }
                 let px = cx + dx;
                 let py = cy + dy;
                 if px >= 0 && py >= 0 && px < PAINT_W as i32 && py < PAINT_H as i32 {
@@ -196,6 +200,29 @@ impl PaintState {
                 }
             }
         }
+    }
+
+    pub fn paint_at(&mut self, lx: i32, ly: i32) {
+        let cx = lx - 14;
+        let cy = ly - 36;
+        if cx < 0 || cy < 0 || cx >= PAINT_W as i32 || cy >= PAINT_H as i32 {
+            self.last_pos = None;
+            return;
+        }
+        let color = PALETTE[self.color_idx];
+        if let Some((x0, y0)) = self.last_pos {
+            let dx = cx - x0;
+            let dy = cy - y0;
+            let steps = dx.abs().max(dy.abs()).max(1);
+            for i in 1..=steps {
+                let px = x0 + (dx * i) / steps;
+                let py = y0 + (dy * i) / steps;
+                self.stamp_brush(px, py, color);
+            }
+        } else {
+            self.stamp_brush(cx, cy, color);
+        }
+        self.last_pos = Some((cx, cy));
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) {
@@ -222,11 +249,7 @@ impl PaintState {
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, _ww: i32, wh: i32, lang: Lang) {
         let ox = wx + 14;
         let oy = wy + 36;
-        for py in 0..PAINT_H {
-            for px in 0..PAINT_W {
-                canvas.set_pixel(ox + px as i32, oy + py as i32, self.buf[py * PAINT_W + px]);
-            }
-        }
+        canvas.blit_rgb_rect(ox, oy, PAINT_W as i32, PAINT_H as i32, &self.buf);
         canvas.draw_rect(ox - 1, oy - 1, PAINT_W as i32 + 2, PAINT_H as i32 + 2, 0x30363D);
 
         let by = wy + wh - 34;
@@ -700,6 +723,12 @@ impl ThemePreset {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayPicker {
+    Theme,
+    Lang,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsAction {
     None,
     RefreshMetrics,
@@ -744,6 +773,9 @@ pub struct SettingsState {
     pub license_alt: bool,
     pub tab_pill_y: f32,
     pub toggle_anim: [f32; 8],
+    pub display_picker: Option<DisplayPicker>,
+    pub picker_anim: f32,
+    pub last_picker: Option<DisplayPicker>,
     hero_cache: RefCell<Option<HeroCache>>,
 }
 
@@ -770,6 +802,9 @@ impl SettingsState {
             license_alt: false,
             tab_pill_y: 90.0,
             toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+            display_picker: None,
+            picker_anim: 0.0,
+            last_picker: None,
             hero_cache: RefCell::new(None),
         }
     }
@@ -818,12 +853,26 @@ impl SettingsState {
             self.show_clock,
             self.genie_minimize,
         ];
+        let p_tgt = if self.display_picker.is_some() { 1.0 } else { 0.0 };
         if !self.animations {
             self.tab_pill_y = target_pill;
+            self.picker_anim = p_tgt;
+            if self.display_picker.is_none() {
+                self.last_picker = None;
+            }
             for (slot, &on) in self.toggle_anim.iter_mut().zip(targets.iter()) {
                 *slot = if on { 1.0 } else { 0.0 };
             }
             return;
+        }
+        let pd = p_tgt - self.picker_anim;
+        if pd.abs() < 0.015 {
+            self.picker_anim = p_tgt;
+            if self.display_picker.is_none() {
+                self.last_picker = None;
+            }
+        } else {
+            self.picker_anim += pd * 0.35;
         }
         let diff = target_pill - self.tab_pill_y;
         if diff.abs() < 0.25 {
@@ -917,6 +966,7 @@ impl SettingsState {
         if (10..=136).contains(&lx) && ly >= 36 {
             let idx = (ly - 36) / 30;
             self.editing_device = false;
+            self.display_picker = None;
             match idx {
                 0 => self.page = SettingsPage::Display,
                 1 => self.page = SettingsPage::Taskbar,
@@ -928,6 +978,7 @@ impl SettingsState {
         }
 
         if lx < 146 {
+            self.display_picker = None;
             return SettingsAction::None;
         }
 
@@ -935,18 +986,58 @@ impl SettingsState {
         match self.page {
             SettingsPage::Display => {
                 self.editing_device = false;
+                if let Some(picker) = self.display_picker {
+                    match picker {
+                        DisplayPicker::Theme => {
+                            let pw = 192;
+                            let ph = 132;
+                            let px = (ww - pw - 16).max(146);
+                            let py = 94;
+                            if (px..px + pw).contains(&lx) && (py..py + ph).contains(&ly) {
+                                let idx = ((ly - (py + 6)) / 30).clamp(0, 3) as usize;
+                                let presets = [
+                                    ThemePreset::AuroraPeaks,
+                                    ThemePreset::CrimsonSunset,
+                                    ThemePreset::MatrixGlow,
+                                    ThemePreset::OceanGlass,
+                                ];
+                                self.theme = presets[idx];
+                                self.display_picker = None;
+                                return SettingsAction::None;
+                            }
+                        }
+                        DisplayPicker::Lang => {
+                            let pw = 172;
+                            let ph = 76;
+                            let px = (ww - pw - 16).max(146);
+                            let py = 128;
+                            if (px..px + pw).contains(&lx) && (py..py + ph).contains(&ly) {
+                                let idx = ((ly - (py + 8)) / 30).clamp(0, 1);
+                                self.lang = if idx == 0 { Lang::Ru } else { Lang::En };
+                                self.display_picker = None;
+                                return SettingsAction::None;
+                            }
+                        }
+                    }
+                    // Dismiss on outside click; switch directly if clicking the other picker row
+                    if (60..94).contains(&ly) && picker != DisplayPicker::Theme {
+                        self.display_picker = Some(DisplayPicker::Theme);
+                        self.last_picker = Some(DisplayPicker::Theme);
+                    } else if (94..128).contains(&ly) && picker != DisplayPicker::Lang {
+                        self.display_picker = Some(DisplayPicker::Lang);
+                        self.last_picker = Some(DisplayPicker::Lang);
+                    } else {
+                        self.display_picker = None;
+                    }
+                    return SettingsAction::None;
+                }
+
                 if (60..94).contains(&ly) {
-                    self.theme = match self.theme {
-                        ThemePreset::AuroraPeaks => ThemePreset::CrimsonSunset,
-                        ThemePreset::CrimsonSunset => ThemePreset::MatrixGlow,
-                        ThemePreset::MatrixGlow => ThemePreset::OceanGlass,
-                        ThemePreset::OceanGlass => ThemePreset::AuroraPeaks,
-                    };
+                    self.display_picker = Some(DisplayPicker::Theme);
+                    self.last_picker = Some(DisplayPicker::Theme);
                 } else if (94..128).contains(&ly) {
-                    self.lang = match self.lang {
-                        Lang::Ru => Lang::En,
-                        Lang::En => Lang::Ru,
-                    };
+                    self.display_picker = Some(DisplayPicker::Lang);
+                    self.last_picker = Some(DisplayPicker::Lang);
                 } else if (138..172).contains(&ly) {
                     self.show_grid = !self.show_grid;
                 } else if (172..206).contains(&ly) {
@@ -1197,7 +1288,8 @@ impl SettingsState {
                     accent,
                     tr(lang, "Тема и обои", "Wallpaper"),
                     self.theme.name(lang),
-                    in_content && (60..94).contains(&hover_ly),
+                    (in_content && (60..94).contains(&hover_ly))
+                        || self.display_picker == Some(DisplayPicker::Theme),
                     false,
                 );
                 Self::draw_spec_row(
@@ -1209,7 +1301,8 @@ impl SettingsState {
                     0x38BDF8,
                     tr(lang, "Язык интерфейса", "Language"),
                     tr(lang, "Русский (RU)", "English (EN)"),
-                    in_content && (94..128).contains(&hover_ly),
+                    (in_content && (94..128).contains(&hover_ly))
+                        || self.display_picker == Some(DisplayPicker::Lang),
                     true,
                 );
 
@@ -1781,6 +1874,154 @@ impl SettingsState {
                     }
                 }
             }
+        }
+
+        // Animated ColorOS 15/16 Floating Dropdown Picker on Display Tab
+        if self.page == SettingsPage::Display
+            && self.picker_anim > 0.02
+            && let Some(picker) = self.display_picker.or(self.last_picker)
+        {
+                let p = Canvas::smoothstep(self.picker_anim);
+                let bg_alpha = (242.0 * p).round() as u8;
+                let slide_y = ((1.0 - p) * -6.0).round() as i32;
+                match picker {
+                    DisplayPicker::Theme => {
+                        let pw = 192;
+                        let ph = 132;
+                        let px = wx + (ww - pw - 16).max(146);
+                        let py = wy + 94 + slide_y;
+                        canvas.draw_soft_shadow(px, py, pw, ph, 12);
+                        canvas.blend_rounded_rect(px, py, pw, ph, 12, 0x161D2E, bg_alpha);
+                        canvas.draw_rounded_rect_alpha(
+                            px,
+                            py,
+                            pw,
+                            ph,
+                            12,
+                            0x475569,
+                            (185.0 * p).round() as u8,
+                        );
+                        let presets = [
+                            (ThemePreset::AuroraPeaks, 0x38BDF8),
+                            (ThemePreset::CrimsonSunset, 0xF43F5E),
+                            (ThemePreset::MatrixGlow, 0x3FB950),
+                            (ThemePreset::OceanGlass, 0x6366F1),
+                        ];
+                        for (idx, (preset, swatch)) in presets.iter().enumerate() {
+                            let ry = py + 6 + (idx as i32) * 30;
+                            let r_ly = 94 + 6 + (idx as i32) * 30;
+                            let active = self.theme == *preset;
+                            let hov = hover_lx >= (px - wx)
+                                && hover_lx < (px - wx + pw)
+                                && hover_ly >= r_ly
+                                && hover_ly < r_ly + 28;
+                            if active {
+                                canvas.blend_rounded_rect(
+                                    px + 6,
+                                    ry,
+                                    pw - 12,
+                                    28,
+                                    8,
+                                    accent,
+                                    (54.0 * p).round() as u8,
+                                );
+                            } else if hov {
+                                canvas.blend_rounded_rect(
+                                    px + 6,
+                                    ry,
+                                    pw - 12,
+                                    28,
+                                    8,
+                                    0x334155,
+                                    (140.0 * p).round() as u8,
+                                );
+                            }
+                            let dot_a = (255.0 * p).round() as u8;
+                            canvas.fill_aa_circle((px + 19) as f32, (ry + 14) as f32, 5.0, *swatch, dot_a);
+                            canvas.draw_text(
+                                px + 32,
+                                ry + 8,
+                                preset.name(lang),
+                                if active { 0xFFFFFF } else { 0xE2E8F0 },
+                                1,
+                            );
+                            if active {
+                                canvas.fill_aa_circle((px + pw - 16) as f32, (ry + 14) as f32, 3.0, accent, dot_a);
+                            }
+                        }
+                    }
+                    DisplayPicker::Lang => {
+                        let pw = 172;
+                        let ph = 76;
+                        let px = wx + (ww - pw - 16).max(146);
+                        let py = wy + 128 + slide_y;
+                        canvas.draw_soft_shadow(px, py, pw, ph, 12);
+                        canvas.blend_rounded_rect(px, py, pw, ph, 12, 0x161D2E, bg_alpha);
+                        canvas.draw_rounded_rect_alpha(
+                            px,
+                            py,
+                            pw,
+                            ph,
+                            12,
+                            0x475569,
+                            (185.0 * p).round() as u8,
+                        );
+                        let langs = [
+                            (Lang::Ru, "RU", "Русский (RU)"),
+                            (Lang::En, "EN", "English (EN)"),
+                        ];
+                        for (idx, (item_lang, code, label)) in langs.iter().enumerate() {
+                            let ry = py + 8 + (idx as i32) * 30;
+                            let r_ly = 128 + 8 + (idx as i32) * 30;
+                            let active = self.lang == *item_lang;
+                            let hov = hover_lx >= (px - wx)
+                                && hover_lx < (px - wx + pw)
+                                && hover_ly >= r_ly
+                                && hover_ly < r_ly + 28;
+                            if active {
+                                canvas.blend_rounded_rect(
+                                    px + 6,
+                                    ry,
+                                    pw - 12,
+                                    28,
+                                    8,
+                                    accent,
+                                    (54.0 * p).round() as u8,
+                                );
+                            } else if hov {
+                                canvas.blend_rounded_rect(
+                                    px + 6,
+                                    ry,
+                                    pw - 12,
+                                    28,
+                                    8,
+                                    0x334155,
+                                    (140.0 * p).round() as u8,
+                                );
+                            }
+                            canvas.fill_rounded_rect(
+                                px + 13,
+                                ry + 6,
+                                22,
+                                16,
+                                5,
+                                if active { accent } else { 0x263147 },
+                            );
+                            canvas.draw_text(px + 18, ry + 8, code, 0xFFFFFF, 1);
+                            canvas.draw_text(
+                                px + 42,
+                                ry + 8,
+                                label,
+                                if active { 0xFFFFFF } else { 0xE2E8F0 },
+                                1,
+                            );
+                            if active {
+                                let dot_a = (255.0 * p).round() as u8;
+                                canvas.fill_aa_circle((px + pw - 16) as f32, (ry + 14) as f32, 3.0, accent, dot_a);
+                            }
+                        }
+                    }
+                }
         }
     }
 }

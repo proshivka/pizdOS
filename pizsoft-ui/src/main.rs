@@ -335,4 +335,70 @@ mod tests {
         assert!(ca > 0.5 && ca < 1.0);
         desktop.render(&mut canvas);
     }
+
+    #[test]
+    fn test_paint_continuous_stroke_display_picker_and_dock_anim() {
+        let mut desktop = Desktop::new(1160, 720);
+
+        // 1. PizPaint continuous line interpolation across fast mouse jump
+        desktop.paint.paint_at(24, 46);
+        desktop.paint.paint_at(124, 86);
+        // Midpoint along (24,46) -> (124,86) is (74, 66); canvas offset inside Paint is (14, 36)
+        let mid_idx = (66 - 36) as usize * crate::apps::PAINT_W + (74 - 14) as usize;
+        assert_ne!(
+            desktop.paint.buf[mid_idx], 0x0D1117,
+            "midpoint of fast paint drag should be interpolated without gaps"
+        );
+        // end_stroke() stops connecting subsequent clicks
+        desktop.paint.end_stroke();
+        desktop.paint.paint_at(24, 126);
+        let gap_idx = (106 - 36) as usize * crate::apps::PAINT_W + (24 - 14) as usize;
+        assert_eq!(
+            desktop.paint.buf[gap_idx], 0x0D1117,
+            "after end_stroke(), new stroke must not connect from previous stroke"
+        );
+
+        // 2. DisplayPicker popup in Settings -> Экран и язык
+        assert!(desktop.settings.display_picker.is_none());
+        // Switch to Display tab (idx 0 at x=60, y=46)
+        desktop.settings.on_click(60, 46, 520, 344);
+        assert_eq!(desktop.settings.page, crate::apps::SettingsPage::Display);
+        // Click "Тема и обои" row (lx=220, ly=76)
+        desktop.settings.on_click(220, 76, 520, 344);
+        assert_eq!(
+            desktop.settings.display_picker,
+            Some(crate::apps::DisplayPicker::Theme)
+        );
+        // Select 2nd option (Crimson Sunset) at px = 520 - 192 - 16 = 312, py = 94; row 1 at y = 94 + 6 + 30 + 10 = 140
+        desktop.settings.on_click(340, 140, 520, 344);
+        assert_eq!(desktop.settings.theme, crate::apps::ThemePreset::CrimsonSunset);
+        assert!(desktop.settings.display_picker.is_none());
+
+        // Click "Язык интерфейса" row (lx=220, ly=110)
+        desktop.settings.on_click(220, 110, 520, 344);
+        assert_eq!(
+            desktop.settings.display_picker,
+            Some(crate::apps::DisplayPicker::Lang)
+        );
+        // Select 2nd option (English EN) at px = 520 - 172 - 16 = 332, py = 128; row 1 at y = 128 + 8 + 30 + 10 = 176
+        desktop.settings.on_click(360, 176, 520, 344);
+        assert_eq!(desktop.settings.lang, crate::apps::Lang::En);
+        assert!(desktop.settings.display_picker.is_none());
+
+        // 3. Animated Floating Dock transition
+        assert_eq!(desktop.dock_float_anim, 0.0);
+        desktop.settings.floating_dock = true;
+        for _ in 0..3 {
+            desktop.on_tick();
+        }
+        assert!(
+            desktop.dock_float_anim > 0.1 && desktop.dock_float_anim < 0.9,
+            "unexpected mid dock_float_anim: {}",
+            desktop.dock_float_anim
+        );
+        for _ in 0..25 {
+            desktop.on_tick();
+        }
+        assert_eq!(desktop.dock_float_anim, 1.0);
+    }
 }
