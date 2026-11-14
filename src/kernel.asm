@@ -8,13 +8,7 @@ kernel_main:
     mov es, ax
 
     ; Устанавливаем текстовый видеорежим 80x25, 16 цветов
-    mov ax, 0x0003
-    int 0x10
-
-    ; Прячем курсор или делаем нормальным (скан-линии 6-7)
-    mov ah, 0x01
-    mov cx, 0x0607
-    int 0x10
+    call set_mode_80x25
 
     ; Приветственный баннер pizdOS
     call show_banner
@@ -26,7 +20,6 @@ shell_loop:
     call print_colored
 
     ; Считываем строку в input_buffer
-    mov di, input_buffer
     call read_line
 
     ; Перевод строки
@@ -41,7 +34,49 @@ shell_loop:
     jmp shell_loop
 
 ; ========================================================
-; ПОДПРОГРАММЫ ВЫВОДА И КЛАВИАТУРЫ
+; РЕЖИМЫ ЭКРАНА И РАЗРЕШЕНИЕ
+; ========================================================
+
+set_mode_80x25:
+    mov ax, 0x0003
+    int 0x10
+    ; Нормальный курсор
+    mov ah, 0x01
+    mov cx, 0x0607
+    int 0x10
+    mov byte [screen_rows], 25
+    ret
+
+set_mode_80x50:
+    ; Сначала 80x25
+    mov ax, 0x0003
+    int 0x10
+    ; Загрузка 8x8 шрифта (50 строк)
+    mov ax, 0x1112
+    xor bl, bl
+    int 0x10
+    ; Настройка курсора под 8x8 шрифт
+    mov ah, 0x01
+    mov cx, 0x0607
+    int 0x10
+    mov byte [screen_rows], 50
+    ret
+
+set_mode_80x28:
+    mov ax, 0x0003
+    int 0x10
+    ; Загрузка 8x14 шрифта (28 строк)
+    mov ax, 0x1111
+    xor bl, bl
+    int 0x10
+    mov ah, 0x01
+    mov cx, 0x0B0C
+    int 0x10
+    mov byte [screen_rows], 28
+    ret
+
+; ========================================================
+; ВЫВОД ТЕКСТА
 ; ========================================================
 
 ; Печать строки из DS:SI с цветом BL (через BIOS int 10h)
@@ -61,7 +96,6 @@ print_colored:
     mov bh, 0           ; Страница 0
     mov cx, 1           ; 1 символ
     int 0x10
-    ; Двигаем курсор вправо
     call advance_cursor
     jmp .loop
 .handle_cr:
@@ -76,7 +110,6 @@ print_colored:
     pop ax
     ret
 
-; Движение курсора на 1 позицию вперед
 advance_cursor:
     push ax
     push bx
@@ -90,11 +123,12 @@ advance_cursor:
     jb .set_pos
     xor dl, dl
     inc dh
-    cmp dh, 25
+    mov al, [screen_rows]
+    cmp dh, al
     jb .set_pos
-    ; Скролл экрана
     call scroll_up
-    mov dh, 24
+    dec al
+    mov dh, al
 .set_pos:
     mov ah, 0x02
     mov bh, 0
@@ -129,15 +163,18 @@ line_feed:
     mov bh, 0
     int 0x10
     inc dh
-    cmp dh, 25
+    mov al, [screen_rows]
+    cmp dh, al
     jb .set_pos
     call scroll_up
-    mov dh, 24
+    dec al
+    mov dh, al
 .set_pos:
     mov ah, 0x02
     mov bh, 0
     int 0x10
     pop dx
+    pop cx
     pop bx
     pop ax
     ret
@@ -148,10 +185,12 @@ scroll_up:
     push cx
     push dx
     mov ah, 0x06
-    mov al, 1           ; Скролл на 1 строку
-    mov bh, [color_text] ; Атрибут заполнения
-    xor cx, cx          ; Верхний левый угол (0, 0)
-    mov dx, 0x184F      ; Нижний правый угол (24, 79)
+    mov al, 1
+    mov bh, [color_text]
+    xor cx, cx
+    mov dl, 79
+    mov dh, [screen_rows]
+    dec dh
     int 0x10
     pop dx
     pop cx
@@ -167,38 +206,49 @@ print_newline:
     pop si
     ret
 
-; Чтение строки с эхо и поддержкой Backspace
+; ========================================================
+; ВВОД С КЛАВИАТУРЫ (ПОФИКШЕННЫЙ И НЕУБИВАЕМЫЙ BACKSPACE)
+; ========================================================
 read_line:
     push ax
     push bx
     push cx
     push dx
-    xor cx, cx          ; Длина введенного
+    mov di, input_buffer
+    xor cx, cx          ; CX = текущая длина строки в буфере
+
 .read_char:
     mov ah, 0x00
-    int 0x16            ; Ждем нажатия клавиши: AL = ASCII, AH = scancode
+    int 0x16            ; AL = ASCII, AH = scancode
 
-    cmp al, 13          ; Enter
+    ; Нажат Enter (ASCII 13)
+    cmp al, 13
     je .done_input
 
-    cmp al, 8           ; Backspace
+    ; Нажат Backspace (ASCII 8 или scancode 0x0E или ASCII 127)
+    cmp al, 8
+    je .handle_backspace
+    cmp al, 127
+    je .handle_backspace
+    cmp ah, 0x0E
     je .handle_backspace
 
-    cmp al, 32          ; Печатные символы
+    ; Игнорируем непечатные символы
+    cmp al, 32
     jb .read_char
     cmp al, 126
     ja .read_char
 
-    ; Проверка переполнения буфера (макс 64 символа)
-    cmp cx, 63
+    ; Защита от переполнения буфера (макс 60 символов)
+    cmp cx, 60
     jae .read_char
 
-    ; Сохраняем символ
+    ; Записываем символ в буфер
     mov [di], al
     inc di
     inc cx
 
-    ; Выводим символ на экран
+    ; Выводим символ с текущим цветом текста
     mov bl, [color_text]
     push ax
     mov ah, 0x09
@@ -212,31 +262,32 @@ read_line:
     jmp .read_char
 
 .handle_backspace:
-    jcxz .read_char     ; Буфер пуст - ничего не стираем
+    ; ЕСЛИ СТРОКА ПУСТАЯ — СТРОГО ИГНОРИРУЕМ! НИКАКОГО УДАЛЕНИЯ PROMPT!
+    cmp cx, 0
+    jbe .read_char
+
+    ; Уменьшаем размер и откатываем указатель
     dec di
     dec cx
 
-    ; Смещаем курсор назад
-    mov ah, 0x03
-    mov bh, 0
-    int 0x10            ; DH = row, DL = col
-    dec dl
-    mov ah, 0x02
-    mov bh, 0
+    ; Стандартный надежный метод стирания в BIOS Teletype:
+    ; 1) Сдвиг назад (BS = 8)
+    mov ah, 0x0E
+    mov al, 8
+    int 0x10
+    ; 2) Затираем пробелом (' ')
+    mov ah, 0x0E
+    mov al, ' '
+    int 0x10
+    ; 3) Сдвиг назад (BS = 8)
+    mov ah, 0x0E
+    mov al, 8
     int 0x10
 
-    ; Стираем пробелом
-    mov ah, 0x09
-    mov al, ' '
-    mov bh, 0
-    push cx
-    mov cx, 1
-    int 0x10
-    pop cx
     jmp .read_char
 
 .done_input:
-    mov byte [di], 0    ; Терминирующий ноль
+    mov byte [di], 0    ; Завершающий ноль
     pop dx
     pop cx
     pop bx
@@ -260,13 +311,12 @@ show_banner:
 ; ПАРСИНГ И ВЫПОЛНЕНИЕ КОМАНД
 ; ========================================================
 execute_command:
-    ; Команда: help
+    ; Команда: help / huelp
     mov si, input_buffer
     mov di, cmd_help
     call strcmp
     jz do_help
 
-    ; Команда: huelp
     mov si, input_buffer
     mov di, cmd_huelp
     call strcmp
@@ -282,6 +332,17 @@ execute_command:
     mov di, cmd_nahuy
     call strcmp
     jz do_clear
+
+    ; Команда: res / screen
+    mov si, input_buffer
+    mov di, cmd_res
+    call strstartswith
+    jz do_res
+
+    mov si, input_buffer
+    mov di, cmd_screen
+    call strstartswith
+    jz do_res_screen
 
     ; Команда: echo / pizdi
     mov si, input_buffer
@@ -373,7 +434,7 @@ execute_command:
 
     ; Неизвестная команда
     mov si, err_unknown
-    mov bl, 0x0C        ; Красный
+    mov bl, 0x0C
     call print_colored
     ret
 
@@ -383,17 +444,82 @@ execute_command:
 
 do_help:
     mov si, msg_help
-    mov bl, 0x0A        ; Зеленый
+    mov bl, 0x0A
     call print_colored
     ret
 
 do_clear:
-    mov ax, 0x0003
-    int 0x10
+    mov al, [screen_rows]
+    cmp al, 50
+    je .clr50
+    cmp al, 28
+    je .clr28
+    call set_mode_80x25
+    ret
+.clr50:
+    call set_mode_80x50
+    ret
+.clr28:
+    call set_mode_80x28
+    ret
+
+do_res:
+    ; Пропускаем "res"
+    mov si, input_buffer + 3
+    jmp handle_res_arg
+
+do_res_screen:
+    ; Пропускаем "screen"
+    mov si, input_buffer + 6
+    jmp handle_res_arg
+
+handle_res_arg:
+    call skip_spaces
+    lodsb
+    or al, al
+    jz .show_usage
+
+    cmp al, '1'
+    je .set25
+    cmp al, '2'
+    je .set50
+    cmp al, '3'
+    je .set28
+
+    ; Проверяем ввод "50"
+    cmp al, '5'
+    je .set50
+    cmp al, '2'
+    je .set25
+
+.show_usage:
+    mov si, msg_res_info
+    mov bl, 0x0E
+    call print_colored
+    ret
+
+.set25:
+    call set_mode_80x25
+    mov si, msg_res_25_ok
+    mov bl, 0x0A
+    call print_colored
+    ret
+
+.set50:
+    call set_mode_80x50
+    mov si, msg_res_50_ok
+    mov bl, 0x0A
+    call print_colored
+    ret
+
+.set28:
+    call set_mode_80x28
+    mov si, msg_res_28_ok
+    mov bl, 0x0A
+    call print_colored
     ret
 
 do_echo:
-    ; Пропускаем "echo " (5 символов)
     mov si, input_buffer + 5
     call skip_spaces
     mov bl, [color_text]
@@ -402,7 +528,6 @@ do_echo:
     ret
 
 do_echo_pizdi:
-    ; Пропускаем "pizdi " (6 символов)
     mov si, input_buffer + 6
     call skip_spaces
     mov bl, [color_text]
@@ -412,10 +537,22 @@ do_echo_pizdi:
 
 do_info:
     mov si, msg_info
-    mov bl, 0x0B        ; Бирюзовый
+    mov bl, 0x0B
     call print_colored
 
-    ; Получаем размер доступной базовой памяти (в КБ) через int 12h
+    ; Текущее разрешение
+    mov si, msg_curr_res
+    mov bl, 0x0E
+    call print_colored
+    mov dl, [screen_rows]
+    xor dh, dh
+    call print_number
+    mov si, msg_rows_suffix
+    mov bl, 0x0E
+    call print_colored
+    call print_newline
+
+    ; RAM
     clc
     int 0x12
     mov dx, ax
@@ -430,8 +567,6 @@ do_info:
     ret
 
 do_time:
-    ; Читаем RTC время: AH = 02h, INT 1Ah
-    ; Возвращает: CH = часы (BCD), CL = минуты (BCD), DH = секунды (BCD)
     mov ah, 0x02
     int 0x1A
     jc .err_rtc
@@ -440,19 +575,16 @@ do_time:
     mov bl, 0x0E
     call print_colored
 
-    ; Часы
     mov al, ch
     call print_bcd
     mov al, ':'
     call print_char_raw
 
-    ; Минуты
     mov al, cl
     call print_bcd
     mov al, ':'
     call print_char_raw
 
-    ; Секунды
     mov al, dh
     call print_bcd
     call print_newline
@@ -469,18 +601,15 @@ do_beep:
     mov bl, 0x0D
     call print_colored
 
-    ; Включаем PC Speaker
     in al, 0x61
     or al, 3
     out 0x61, al
 
-    ; Простая задержка
     mov cx, 0x000F
     mov dx, 0x4240
     mov ah, 0x86
     int 0x15
 
-    ; Выключаем спикер
     in al, 0x61
     and al, 0xFC
     out 0x61, al
@@ -501,7 +630,6 @@ apply_color:
     lodsb
     or al, al
     jz .done
-    ; Преобразуем hex символ в число
     call hex_char_to_val
     mov [color_text], al
     mov si, msg_color_ok
@@ -513,7 +641,7 @@ apply_color:
 hex_char_to_val:
     cmp al, '9'
     jbe .digit
-    or al, 0x20     ; к нижнему регистру
+    or al, 0x20
     sub al, 'a' - 10
     ret
 .digit:
@@ -521,58 +649,50 @@ hex_char_to_val:
     ret
 
 do_matrix:
-    ; Очистка экрана
-    mov ax, 0x0003
-    int 0x10
-
+    call do_clear
     mov si, msg_matrix_exit
     mov bl, 0x02
     call print_colored
 
 .matrix_loop:
-    ; Проверяем, нажата ли клавиша
     mov ah, 0x01
     int 0x16
     jnz .matrix_exit
 
-    ; Получаем случайный символ и позицию через timer tick
     xor ax, ax
-    int 0x1A        ; DX = ticks
+    int 0x1A
 
-    ; Случайная колонка 0..79
     mov ax, dx
     xor dx, dx
     mov bx, 80
-    div bx          ; DX = колонка 0..79
-    push dx         ; сохраняем колонку
+    div bx
+    push dx
 
-    ; Случайная строка 1..24
-    in al, 0x40     ; Чтение таймера PIT
+    in al, 0x40
     xor ah, ah
-    mov bl, 23
+    mov bl, [screen_rows]
+    dec bl
+    dec bl
     div bl
-    inc ah          ; AH = строка 1..23
+    inc ah
     mov dh, ah
-    pop ax          ; Восстанавливаем колонку
+    pop ax
     mov dl, al
 
-    ; Ставим курсор
     mov ah, 0x02
     mov bh, 0
     int 0x10
 
-    ; Случайный зеленый символ
     in al, 0x40
     and al, 0x3F
-    add al, 33      ; Символы от '!' до 'Z'
+    add al, 33
 
     mov ah, 0x09
     mov bh, 0
-    mov bl, 0x0A    ; Ярко-зеленый
+    mov bl, 0x0A
     mov cx, 1
     int 0x10
 
-    ; Короткая пауза
     mov cx, 0x0000
     mov dx, 0x2000
     mov ah, 0x86
@@ -581,24 +701,21 @@ do_matrix:
     jmp .matrix_loop
 
 .matrix_exit:
-    ; Очищаем нажатую клавишу
     mov ah, 0x00
     int 0x16
-    ; Очищаем экран
-    mov ax, 0x0003
-    int 0x10
+    call do_clear
     ret
 
 do_panic:
-    ; Синий экран смерти pizdOS
     mov ah, 0x06
     xor al, al
-    mov bh, 0x1F        ; Белый на синем
+    mov bh, 0x1F
     xor cx, cx
-    mov dx, 0x184F
+    mov dl, 79
+    mov dh, [screen_rows]
+    dec dh
     int 0x10
 
-    ; Курсор в (2, 2)
     mov ah, 0x02
     mov bh, 0
     mov dx, 0x0202
@@ -608,13 +725,9 @@ do_panic:
     mov bl, 0x1F
     call print_colored
 
-    ; Ждем любой клавиши
     mov ah, 0x00
     int 0x16
-
-    ; Возвращаем нормальный экран
-    mov ax, 0x0003
-    int 0x10
+    call do_clear
     ret
 
 do_reboot:
@@ -622,17 +735,13 @@ do_reboot:
     mov bl, 0x0C
     call print_colored
 
-    ; Задержка 1 секунда
     mov cx, 0x000F
     mov dx, 0x4240
     mov ah, 0x86
     int 0x15
 
-    ; Перезагрузка через контроллер клавиатуры 8042
     mov al, 0xFE
     out 0x64, al
-
-    ; Если не сработало - прыгаем на BIOS POST
     jmp 0xFFFF:0x0000
 
 ; ========================================================
@@ -648,7 +757,6 @@ skip_spaces:
 .done:
     ret
 
-; Сравнение строк DS:SI и ES:DI
 strcmp:
     push si
     push di
@@ -665,15 +773,14 @@ strcmp:
 .equal:
     pop di
     pop si
-    xor ax, ax          ; ZF = 1
+    xor ax, ax
     ret
 .diff:
     pop di
     pop si
-    mov ax, 1           ; ZF = 0
+    mov ax, 1
     ret
 
-; Проверка начинается ли DS:SI с ES:DI
 strstartswith:
     push si
     push di
@@ -690,12 +797,12 @@ strstartswith:
 .matched:
     pop di
     pop si
-    xor ax, ax          ; ZF = 1
+    xor ax, ax
     ret
 .nomatch:
     pop di
     pop si
-    mov ax, 1           ; ZF = 0
+    mov ax, 1
     ret
 
 print_bcd:
@@ -754,8 +861,9 @@ print_number:
 ; ========================================================
 ; ДАННЫЕ И СТРОКИ
 ; ========================================================
-color_text:     db 0x0A     ; Светло-зеленый по умолчанию
-color_prompt:   db 0x0E     ; Желтый по умолчанию
+screen_rows:    db 25       ; Текущее число строк (25, 28 или 50)
+color_text:     db 0x0A     ; Светло-зеленый
+color_prompt:   db 0x0E     ; Желтый
 
 newline_str:    db 13, 10, 0
 prompt_str:     db 13, 10, "pizdOS> ", 0
@@ -777,9 +885,10 @@ banner_desc:
 msg_help:
     db "=== SPISOK CHETKIH KOMAND pizdOS ===", 13, 10
     db "  help / huelp      - Pokazat etu spravku nafig", 13, 10
+    db "  res [1|2|3]       - Nastroika razresheniya ekrana (25, 50, 28 strok)", 13, 10
     db "  clear / nahuy     - Ochistit ekran k chertej materi", 13, 10
     db "  echo / pizdi <msg>- Povtorit vash gniloy bazar", 13, 10
-    db "  info / poyasni    - Poyasnit za sistemu i pamyat", 13, 10
+    db "  info / poyasni    - Poyasnit za sistemu, pamyat i razreshenie", 13, 10
     db "  time / vremya     - Realnoe vremya iz CMOS", 13, 10
     db "  beep / pikni      - Podat zvuk cherez PC speaker", 13, 10
     db "  color / mast <hex>- Smenit mast (1=Sin, 2=Zel, 4=Kras, E=Zhelt)", 13, 10
@@ -787,12 +896,24 @@ msg_help:
     db "  panic / pizdec    - Sinij ekran smerti (BSOD pizdOS)", 13, 10
     db "  reboot / vpizdu   - Perezagruzit komp k huam", 13, 10, 0
 
+msg_res_info:
+    db "=== NASTROYKA RAZRESHENIYA EKRANA ===", 13, 10
+    db "  res 1  (ili res 25) - Standart 80x25 (klassika, bolshie bukvy)", 13, 10
+    db "  res 2  (ili res 50) - Vysokie Chetkoe 80x50 (chotkiy melkiy shrift!)", 13, 10
+    db "  res 3  (ili res 28) - Srednee 80x28 (EGA 8x14)", 13, 10, 0
+
+msg_res_25_ok:      db "Vklyuchen rezhim 80x25!", 13, 10, 0
+msg_res_50_ok:      db "Vklyucheno vysokoe razreshenie 80x50, bratishka!", 13, 10, 0
+msg_res_28_ok:      db "Vklyuchen rezhim 80x28!", 13, 10, 0
+
 msg_info:
     db "=== POYASNENIE ZA pizdOS ===", 13, 10
-    db " Razrabotchiki : Bratukha & Antigravity AI", 13, 10
+    db " Razrabotchiki : Bratukha, Lowyk & Antigravity AI", 13, 10
     db " Arhitektura   : 16-bit Real Mode x86 ASM", 13, 10
     db " Stabilnost    : 100% zheleznaya, bez tormozov", 13, 10, 0
 
+msg_curr_res:       db " Tekuschee razreshenie: 80x", 0
+msg_rows_suffix:    db " strok", 0
 msg_ram:            db " Dostupnaya pamyat RAM: ", 0
 msg_kb:             db " KB", 0
 msg_time_prefix:    db "Vremya po poniyatiyam: ", 0
@@ -821,6 +942,8 @@ err_unknown:
 ; Имена команд
 cmd_help:       db "help", 0
 cmd_huelp:      db "huelp", 0
+cmd_res:        db "res", 0
+cmd_screen:     db "screen", 0
 cmd_clear:      db "clear", 0
 cmd_nahuy:      db "nahuy", 0
 cmd_echo:       db "echo ", 0
@@ -843,5 +966,5 @@ cmd_vpizdu:     db "vpizdu", 0
 ; Буфер ввода
 input_buffer:   times 64 db 0
 
-; Добиваем размер ядра до 16 КБ (32 сектора = 16384 байт)
+; Добиваем ядро до 16 КБ
 times 16384 - ($ - $$) db 0
