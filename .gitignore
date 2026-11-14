@@ -3,3 +3,5 @@ build/
 *.img
 *.ppm
 test_boot.py
+target/
+piz-get/target/
