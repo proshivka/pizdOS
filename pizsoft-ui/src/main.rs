@@ -270,4 +270,69 @@ mod tests {
         desktop.render(&mut canvas);
         assert!(canvas.pixels.iter().any(|&p| p != 0));
     }
+
+    #[test]
+    fn test_macos_genie_minimize_restore_and_window_morph() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+        assert!(desktop.settings.genie_minimize);
+
+        // Hover over top-left desktop icon (Terminal at 18, 42) -> icon_hover[0] rises
+        desktop.on_mouse_move(36, 62, 1160, 720);
+        for _ in 0..12 {
+            desktop.on_tick();
+        }
+        assert!(desktop.icon_hover[0] > 0.8);
+
+        // 1. Click minimize button [_] on Settings (370, 90, 520, 344) -> win.x + win.w - 62, win.y + 14
+        let sw = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(sw.x + sw.w - 62, sw.y + 14, 1160, 720);
+        assert!(desktop.windows.last().unwrap().minimized);
+        // Step halfway through Genie minimize and verify intermediate warp frame renders
+        for _ in 0..6 {
+            desktop.on_tick();
+        }
+        let mid_anim = desktop.windows.last().unwrap().min_anim;
+        assert!(mid_anim > 0.2 && mid_anim < 0.8, "unexpected mid min_anim: {mid_anim}");
+        desktop.render(&mut canvas);
+        for _ in 0..15 {
+            desktop.on_tick();
+        }
+        assert_eq!(desktop.windows.last().unwrap().min_anim, 0.0);
+
+        // 2. Restore Settings via taskbar pill -> Genie unminimize smoothly opens back to 1.0
+        // Open windows order: System (0), Settings (1) -> pill 1 at x = 102 + pill_w + 4
+        desktop.on_mouse_down(250, 700, 1160, 720);
+        assert!(!desktop.windows.last().unwrap().minimized);
+        for _ in 0..5 {
+            desktop.on_tick();
+        }
+        let restore_mid = desktop.windows.last().unwrap().min_anim;
+        assert!(restore_mid > 0.1 && restore_mid < 0.9, "unexpected restore min_anim: {restore_mid}");
+        desktop.render(&mut canvas);
+        for _ in 0..15 {
+            desktop.on_tick();
+        }
+        assert_eq!(desktop.windows.last().unwrap().min_anim, 1.0);
+
+        // 3. Maximize Settings [□] -> target snaps immediately while vis_rect glides smoothly
+        let sw2 = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(sw2.x + sw2.w - 39, sw2.y + 14, 1160, 720);
+        assert!(desktop.windows.last().unwrap().maximized);
+        assert_eq!(desktop.windows.last().unwrap().w, 1160);
+        assert!(desktop.windows.last().unwrap().vis_rect[2] < 600.0);
+        for _ in 0..25 {
+            desktop.on_tick();
+        }
+        assert!((desktop.windows.last().unwrap().vis_rect[2] - 1160.0).abs() < 1.0);
+
+        // 4. Close Settings [×] -> open becomes false while close_anim fades out
+        let max_w = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(max_w.x + max_w.w - 16, max_w.y + 14, 1160, 720);
+        assert!(!desktop.windows.last().unwrap().open);
+        desktop.on_tick();
+        let ca = desktop.windows.last().unwrap().close_anim;
+        assert!(ca > 0.5 && ca < 1.0);
+        desktop.render(&mut canvas);
+    }
 }

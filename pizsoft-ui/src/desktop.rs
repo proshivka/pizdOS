@@ -171,6 +171,9 @@ pub struct Window {
     pub maximized: bool,
     pub saved_rect: (i32, i32, i32, i32),
     pub open_anim: f32,
+    pub min_anim: f32,
+    pub close_anim: f32,
+    pub vis_rect: [f32; 4],
 }
 
 impl Window {
@@ -186,7 +189,15 @@ impl Window {
             maximized: false,
             saved_rect: (x, y, w, h),
             open_anim: 1.0,
+            min_anim: if open { 1.0 } else { 0.0 },
+            close_anim: if open { 1.0 } else { 0.0 },
+            vis_rect: [x as f32, y as f32, w as f32, h as f32],
         }
+    }
+
+    #[inline]
+    fn sync_vis_rect(&mut self) {
+        self.vis_rect = [self.x as f32, self.y as f32, self.w as f32, self.h as f32];
     }
 }
 
@@ -232,6 +243,9 @@ pub struct Desktop {
     pub start_menu_open: bool,
     pub start_anim: f32,
     pub ctx_menu: Option<(i32, i32)>,
+    pub ctx_anim: f32,
+    pub last_ctx_menu: Option<(i32, i32)>,
+    pub icon_hover: [f32; 8],
     pub mouse_x: i32,
     pub mouse_y: i32,
     pub mouse_down: bool,
@@ -272,6 +286,7 @@ pub struct Desktop {
     pub matrix: MatrixState,
 
     wp_cache: RefCell<WallpaperCache>,
+    anim_canvas: RefCell<Canvas>,
 }
 
 impl Desktop {
@@ -288,6 +303,9 @@ impl Desktop {
             start_menu_open: false,
             start_anim: 0.0,
             ctx_menu: None,
+            ctx_anim: 0.0,
+            last_ctx_menu: None,
+            icon_hover: [0.0; 8],
             mouse_x: width / 2,
             mouse_y: height / 2,
             mouse_down: false,
@@ -338,10 +356,12 @@ impl Desktop {
                 key: (0, 0, ThemePreset::AuroraPeaks, false),
                 pixels: Vec::new(),
             }),
+            anim_canvas: RefCell::new(Canvas::new(1, 1)),
         };
 
         if let Some(sys) = d.windows.iter_mut().find(|w| w.id == AppId::System) {
             sys.minimized = true;
+            sys.min_anim = 0.0;
         }
         d.reload_packages();
         d.reload_files();
@@ -405,18 +425,25 @@ impl Desktop {
         self.procs = list_processes();
     }
 
+    #[inline]
+    fn dock_reserve(&self) -> i32 {
+        if self.settings.floating_dock { 46 } else { 36 }
+    }
+
     pub fn on_viewport_resize(&mut self, canvas_w: i32, canvas_h: i32) {
-        let top_bar = if self.settings.taskbar_top { 36 } else { 0 };
+        let reserve = self.dock_reserve();
+        let top_bar = if self.settings.taskbar_top { reserve } else { 0 };
         for win in &mut self.windows {
             if win.maximized {
                 win.x = 0;
                 win.y = top_bar;
                 win.w = canvas_w.max(200);
-                win.h = (canvas_h - 36).max(160);
+                win.h = (canvas_h - reserve).max(160);
             } else {
                 win.x = win.x.clamp(0, (canvas_w - 80).max(0));
                 win.y = win.y.clamp(top_bar, (canvas_h - 60).max(top_bar));
             }
+            win.sync_vis_rect();
         }
     }
 
@@ -448,15 +475,47 @@ impl Desktop {
         }
     }
 
+    fn taskbar_pill_rect(&self, canvas_w: i32, canvas_h: i32, id: AppId) -> (i32, i32, i32) {
+        let (dock_x, task_y, dock_w, _, _) = self.taskbar_rect(canvas_w, canvas_h);
+        let open_count = self.windows.iter().filter(|w| w.open).count();
+        let pill_w = self.taskbar_pill_width(dock_w, open_count);
+        let pos = self
+            .windows
+            .iter()
+            .filter(|w| w.open)
+            .position(|w| w.id == id)
+            .unwrap_or(0) as i32;
+        (dock_x + 102 + pos * (pill_w + 4), task_y + 6, pill_w)
+    }
+
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.settings.step_anim();
 
         let start_tgt = if self.start_menu_open { 1.0 } else { 0.0 };
+        let ctx_tgt = if self.ctx_menu.is_some() { 1.0 } else { 0.0 };
+        let genie_step = if self.settings.genie_minimize { 0.072 } else { 0.095 };
+
         if !self.settings.animations {
             self.start_anim = start_tgt;
+            self.ctx_anim = ctx_tgt;
+            if self.ctx_menu.is_none() {
+                self.last_ctx_menu = None;
+            }
+            for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
+                let hov = self.ctx_menu.is_none()
+                    && !self.start_menu_open
+                    && self.mouse_x >= ix - 4
+                    && self.mouse_x <= ix + 74
+                    && self.mouse_y >= iy - 2
+                    && self.mouse_y <= iy + 58;
+                self.icon_hover[i] = if hov { 1.0 } else { 0.0 };
+            }
             for w in &mut self.windows {
                 w.open_anim = 1.0;
+                w.min_anim = if w.open && !w.minimized { 1.0 } else { 0.0 };
+                w.close_anim = if w.open { 1.0 } else { 0.0 };
+                w.sync_vis_rect();
             }
         } else {
             let sd = start_tgt - self.start_anim;
@@ -465,13 +524,55 @@ impl Desktop {
             } else {
                 self.start_anim += sd * 0.34;
             }
+
+            let cd = ctx_tgt - self.ctx_anim;
+            if cd.abs() < 0.015 {
+                self.ctx_anim = ctx_tgt;
+                if self.ctx_menu.is_none() {
+                    self.last_ctx_menu = None;
+                }
+            } else {
+                self.ctx_anim += cd * 0.36;
+            }
+
+            for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
+                let hov = self.ctx_menu.is_none()
+                    && !self.start_menu_open
+                    && self.mouse_x >= ix - 4
+                    && self.mouse_x <= ix + 74
+                    && self.mouse_y >= iy - 2
+                    && self.mouse_y <= iy + 58;
+                let tgt = if hov { 1.0 } else { 0.0 };
+                let d = tgt - self.icon_hover[i];
+                if d.abs() < 0.02 {
+                    self.icon_hover[i] = tgt;
+                } else {
+                    self.icon_hover[i] += d * 0.30;
+                }
+            }
+
             for w in &mut self.windows {
-                if w.open && !w.minimized && w.open_anim < 1.0 {
-                    let wd = 1.0 - w.open_anim;
-                    if wd < 0.015 {
-                        w.open_anim = 1.0;
+                if !w.open {
+                    w.close_anim = (w.close_anim - 0.13).max(0.0);
+                    w.min_anim = 0.0;
+                } else {
+                    w.close_anim = 1.0;
+                    if w.minimized {
+                        w.min_anim = (w.min_anim - genie_step).max(0.0);
                     } else {
-                        w.open_anim += wd * 0.30;
+                        w.min_anim = (w.min_anim + genie_step * 1.12).min(1.0);
+                    }
+                    if w.open_anim < 1.0 {
+                        w.open_anim = (w.open_anim + 0.14).min(1.0);
+                    }
+                }
+                let targets = [w.x as f32, w.y as f32, w.w as f32, w.h as f32];
+                for (vr, tgt) in w.vis_rect.iter_mut().zip(targets.iter()) {
+                    let d = tgt - *vr;
+                    if d.abs() < 0.8 {
+                        *vr = *tgt;
+                    } else {
+                        *vr += d * 0.36;
                     }
                 }
             }
@@ -502,11 +603,21 @@ impl Desktop {
     pub fn focus_or_open(&mut self, id: AppId) {
         if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
             let mut win = self.windows.remove(pos);
-            let was_visible = win.open && !win.minimized;
+            let was_open = win.open;
+            let was_min = win.minimized;
             win.open = true;
             win.minimized = false;
-            if !was_visible {
+            win.close_anim = 1.0;
+            if !was_open {
+                win.min_anim = 1.0;
                 win.open_anim = if self.settings.animations { 0.0 } else { 1.0 };
+                win.sync_vis_rect();
+            } else if was_min {
+                if !self.settings.animations {
+                    win.min_anim = 1.0;
+                }
+                win.open_anim = 1.0;
+                win.sync_vis_rect();
             }
             self.windows.push(win);
         }
@@ -530,6 +641,8 @@ impl Desktop {
     }
 
     fn toggle_maximize(&mut self, idx: usize, canvas_w: i32, canvas_h: i32) {
+        let reserve = self.dock_reserve();
+        let top_bar = if self.settings.taskbar_top { reserve } else { 0 };
         let win = &mut self.windows[idx];
         if win.maximized {
             let (sx, sy, sw, sh) = win.saved_rect;
@@ -541,9 +654,9 @@ impl Desktop {
         } else {
             win.saved_rect = (win.x, win.y, win.w, win.h);
             win.x = 0;
-            win.y = if self.settings.taskbar_top { 36 } else { 0 };
+            win.y = top_bar;
             win.w = canvas_w;
-            win.h = (canvas_h - 36).max(160);
+            win.h = (canvas_h - reserve).max(160);
             win.maximized = true;
         }
     }
@@ -582,39 +695,41 @@ impl Desktop {
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
 
-        if let Some(rz) = self.resizing
-            && let Some(win) = self.windows.iter_mut().find(|w| w.id == rz.id)
-        {
-            if !win.maximized {
-                let (min_w, min_h) = win.id.min_size();
-                let (sx, sy, sw, sh) = rz.start_rect;
-                let dx = self.mouse_x - rz.start_mx;
-                let dy = self.mouse_y - rz.start_my;
-                let top_min = if self.settings.taskbar_top { 36 } else { 0 };
-                let bot_max = if self.settings.taskbar_top {
-                    canvas_h
-                } else {
-                    (canvas_h - 36).max(top_min + min_h)
-                };
+        if let Some(rz) = self.resizing {
+            let reserve = self.dock_reserve();
+            if let Some(win) = self.windows.iter_mut().find(|w| w.id == rz.id) {
+                if !win.maximized {
+                    let (min_w, min_h) = win.id.min_size();
+                    let (sx, sy, sw, sh) = rz.start_rect;
+                    let dx = self.mouse_x - rz.start_mx;
+                    let dy = self.mouse_y - rz.start_my;
+                    let top_min = if self.settings.taskbar_top { reserve } else { 0 };
+                    let bot_max = if self.settings.taskbar_top {
+                        canvas_h
+                    } else {
+                        (canvas_h - reserve).max(top_min + min_h)
+                    };
 
-                if rz.edge.right {
-                    win.w = (sw + dx).clamp(min_w, (canvas_w - sx).max(min_w));
+                    if rz.edge.right {
+                        win.w = (sw + dx).clamp(min_w, (canvas_w - sx).max(min_w));
+                    }
+                    if rz.edge.bottom {
+                        win.h = (sh + dy).clamp(min_h, (bot_max - sy).max(min_h));
+                    }
+                    if rz.edge.left {
+                        let nx = (sx + dx).clamp(0, (sx + sw - min_w).max(0));
+                        win.w = (sx + sw - nx).max(min_w);
+                        win.x = nx;
+                    }
+                    if rz.edge.top {
+                        let ny = (sy + dy).clamp(top_min, (sy + sh - min_h).max(top_min));
+                        win.h = (sy + sh - ny).max(min_h);
+                        win.y = ny;
+                    }
+                    win.sync_vis_rect();
                 }
-                if rz.edge.bottom {
-                    win.h = (sh + dy).clamp(min_h, (bot_max - sy).max(min_h));
-                }
-                if rz.edge.left {
-                    let nx = (sx + dx).clamp(0, (sx + sw - min_w).max(0));
-                    win.w = (sx + sw - nx).max(min_w);
-                    win.x = nx;
-                }
-                if rz.edge.top {
-                    let ny = (sy + dy).clamp(top_min, (sy + sh - min_h).max(top_min));
-                    win.h = (sy + sh - ny).max(min_h);
-                    win.y = ny;
-                }
+                return;
             }
-            return;
         }
 
         if let Some((id, off_x, off_y)) = self.dragging
@@ -623,6 +738,7 @@ impl Desktop {
             if !win.maximized {
                 win.x = (self.mouse_x - off_x).clamp(0, (canvas_w - 60).max(0));
                 win.y = (self.mouse_y - off_y).clamp(0, (canvas_h - 60).max(0));
+                win.sync_vis_rect();
             }
             return;
         }
@@ -643,6 +759,7 @@ impl Desktop {
         let mx = x.min((canvas_w - 190).max(0));
         let my = y.min((canvas_h - 170).max(0));
         self.ctx_menu = Some((mx, my));
+        self.last_ctx_menu = Some((mx, my));
     }
 
     fn taskbar_pill_width(&self, canvas_w: i32, open_count: usize) -> i32 {
@@ -923,14 +1040,14 @@ impl Desktop {
             canvas.pixels.copy_from_slice(&wp.pixels);
         }
 
-        // 2. Desktop Icons
+        // 2. Desktop Icons (with smooth spring hover lift)
         if self.settings.show_icons {
-            for &(id, ix, iy, col) in &DESKTOP_ICONS {
-                self.draw_desktop_icon(canvas, ix, iy, id, id.title(lang), col);
+            for (idx, &(id, ix, iy, col)) in DESKTOP_ICONS.iter().enumerate() {
+                self.draw_desktop_icon(canvas, idx, ix, iy, id, id.title(lang), col);
             }
         }
 
-        // 3. Visible Windows
+        // 3. Visible & Animating Windows (macOS Genie / Scale / Close / Maximize Morph)
         let top_vis = self
             .windows
             .iter()
@@ -940,10 +1057,92 @@ impl Desktop {
             .map(|(i, _)| i);
 
         for (idx, win) in self.windows.iter().enumerate() {
-            if !win.open || win.minimized {
+            let focused = Some(idx) == top_vis;
+            let anim = self.settings.animations;
+            if !win.open {
+                if anim && win.close_anim > 0.01 {
+                    let s = Canvas::smoothstep(win.close_anim);
+                    let scale = 0.88 + 0.12 * s;
+                    let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
+                    let vw = win.vis_rect[2].round().max(80.0) as i32;
+                    let vh = win.vis_rect[3].round().max(60.0) as i32;
+                    let mut cap = self.anim_canvas.borrow_mut();
+                    cap.resize(vw as usize, vh as usize);
+                    cap.pixels.fill(0xFF0B_0E16);
+                    let mut cap_win = win.clone();
+                    cap_win.x = 0;
+                    cap_win.y = 0;
+                    cap_win.w = vw;
+                    cap_win.h = vh;
+                    self.draw_window_frame(&mut cap, &cap_win, focused, false);
+                    let cx = win.vis_rect[0] + win.vis_rect[2] * 0.5;
+                    let cy = win.vis_rect[1] + win.vis_rect[3] * 0.5;
+                    canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                }
                 continue;
             }
-            self.draw_window(canvas, win, Some(idx) == top_vis);
+
+            if win.minimized && (!anim || win.min_anim <= 0.01) {
+                continue;
+            }
+
+            let is_genie_or_scale = anim && win.min_anim < 0.999;
+            let is_fresh_open = anim && !win.minimized && win.open_anim < 0.999;
+            let vx = win.vis_rect[0].round() as i32;
+            let vy = win.vis_rect[1].round() as i32;
+            let vw = win.vis_rect[2].round().max(80.0) as i32;
+            let vh = win.vis_rect[3].round().max(60.0) as i32;
+
+            if is_genie_or_scale || is_fresh_open {
+                let mut cap = self.anim_canvas.borrow_mut();
+                cap.resize(vw as usize, vh as usize);
+                cap.pixels.fill(0xFF0B_0E16);
+                let mut cap_win = win.clone();
+                cap_win.x = 0;
+                cap_win.y = 0;
+                cap_win.w = vw;
+                cap_win.h = vh;
+                self.draw_window_frame(&mut cap, &cap_win, focused, false);
+
+                if is_genie_or_scale {
+                    let pill_rect = self.taskbar_pill_rect(w, h, win.id);
+                    if self.settings.genie_minimize {
+                        canvas.blit_genie_rect(
+                            &cap.pixels,
+                            (vw, vh),
+                            (vx, vy),
+                            pill_rect,
+                            win.min_anim,
+                            self.settings.taskbar_top,
+                        );
+                    } else {
+                        let s = Canvas::smoothstep(win.min_anim);
+                        let win_cx = vx as f32 + vw as f32 * 0.5;
+                        let win_cy = vy as f32 + vh as f32 * 0.5;
+                        let pill_cx = pill_rect.0 as f32 + pill_rect.2 as f32 * 0.5;
+                        let pill_cy = pill_rect.1 as f32 + 12.0;
+                        let cx = pill_cx + (win_cx - pill_cx) * s;
+                        let cy = pill_cy + (win_cy - pill_cy) * s;
+                        let scale = 0.14 + 0.86 * s;
+                        let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
+                        canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                    }
+                } else {
+                    let s = Canvas::smoothstep(win.open_anim);
+                    let scale = 0.93 + 0.07 * s;
+                    let alpha = (s * 255.0).clamp(0.0, 255.0) as u8;
+                    let cx = vx as f32 + vw as f32 * 0.5;
+                    let cy = vy as f32 + vh as f32 * 0.5 + (1.0 - s) * 10.0;
+                    canvas.blit_scaled_alpha_rect(&cap.pixels, (vw, vh), (cx, cy), scale, alpha);
+                }
+            } else {
+                let mut vis_win = win.clone();
+                vis_win.x = vx;
+                vis_win.y = vy;
+                vis_win.w = vw;
+                vis_win.h = vh;
+                self.draw_window_frame(canvas, &vis_win, focused, true);
+            }
         }
 
         // 4. Minimalist Dark Frosted Taskbar or Floating Minimal Dock (ONLY open windows)
@@ -952,6 +1151,7 @@ impl Desktop {
             canvas.draw_soft_shadow(dock_x, task_y, dock_w, dock_h, 13);
             canvas.blend_rounded_rect(dock_x, task_y, dock_w, dock_h, 13, 0x0B0E14, glass_a);
             canvas.draw_rounded_rect_alpha(dock_x, task_y, dock_w, dock_h, 13, 0xFFFFFF, border_a);
+            canvas.blend_rect(dock_x + 14, task_y + 1, (dock_w - 28).max(0), 1, 0xFFFFFF, 22);
         } else {
             canvas.blend_rect(0, task_y, w, dock_h, 0x0B0E14, glass_a);
             let rim_y = if self.settings.taskbar_top { task_y + 35 } else { task_y };
@@ -992,9 +1192,15 @@ impl Desktop {
                 && self.mouse_x <= bx + pill_w
                 && self.mouse_y >= task_y + 6
                 && self.mouse_y <= task_y + 30;
+            let genie_pulse = if self.settings.animations && win.min_anim > 0.02 && win.min_anim < 0.98 {
+                ((1.0 - (win.min_anim - 0.5).abs() * 2.0) * 70.0) as u8
+            } else {
+                0
+            };
             if is_top {
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 24);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 34);
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 26);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 38);
+                canvas.blend_rect(bx + 10, task_y + 7, (pill_w - 20).max(0), 1, 0xFFFFFF, 22);
             } else if win.minimized {
                 let a = if pill_hovered { 16 } else { 7 };
                 canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
@@ -1002,6 +1208,10 @@ impl Desktop {
                 let a = if pill_hovered { 20 } else { 12 };
                 canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
                 canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 18);
+            }
+            if genie_pulse > 0 {
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, accent, genie_pulse);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, accent, (genie_pulse * 2).min(180));
             }
 
             let fg = if win.minimized {
@@ -1031,16 +1241,26 @@ impl Desktop {
         canvas.blend_rounded_rect(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 15);
         canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 26);
         canvas.draw_text_clipped(lang_x + 10, task_y + 11, 26, lang_lbl, 0xE2E8F0, 1);
-        canvas.fill_aa_circle((lang_x + 46) as f32, (task_y + 18) as f32, 2.5, 0x3FB950, 255);
+
+        let tray_x = lang_x + 40;
+        let tray_w = (dock_x + dock_w - 6 - tray_x).max(40);
+        canvas.blend_rounded_rect(tray_x, task_y + 6, tray_w, 24, 6, 0xFFFFFF, 11);
+        canvas.draw_rounded_rect_alpha(tray_x, task_y + 6, tray_w, 24, 6, 0xFFFFFF, 20);
+        let pulse_a = if self.settings.animations {
+            (205.0 + 50.0 * ((self.tick as f32) * 0.08).sin()).clamp(150.0, 255.0) as u8
+        } else {
+            255
+        };
+        canvas.fill_aa_circle((lang_x + 49) as f32, (task_y + 18) as f32, 2.5, 0x3FB950, pulse_a);
         let tray_txt = if self.settings.show_clock {
             &self.clock_str
         } else {
             &self.uptime
         };
         canvas.draw_text_clipped(
-            lang_x + 54,
+            lang_x + 58,
             task_y + 11,
-            (dock_x + dock_w - lang_x - 60).max(20),
+            (tray_w - 22).max(20),
             tray_txt,
             0xCBD5E1,
             1,
@@ -1051,8 +1271,13 @@ impl Desktop {
             self.draw_start_menu(canvas, dock_x, task_y, dock_h, accent);
         }
 
-        // 6. Right-click Context Menu
-        if let Some((cx, cy)) = self.ctx_menu {
+        // 6. Right-click Context Menu (with smooth fade & slide)
+        let anim_ctx = if self.settings.animations && self.ctx_anim > 0.04 {
+            self.last_ctx_menu
+        } else {
+            None
+        };
+        if let Some((cx, cy)) = self.ctx_menu.or(anim_ctx) {
             self.draw_context_menu(canvas, cx, cy, accent);
         }
 
@@ -1097,6 +1322,12 @@ impl Desktop {
     fn draw_context_menu(&self, canvas: &mut Canvas, cx: i32, cy: i32, accent: u32) {
         let lang = self.settings.lang;
         let (glass_a, border_a) = self.settings.glass_alphas();
+        let t = if self.settings.animations {
+            Canvas::smoothstep(self.ctx_anim)
+        } else {
+            1.0
+        };
+        let cy = cy + ((1.0 - t) * 7.0).round() as i32;
         let items = [
             (tr(lang, "Открыть Терминал", "Open Terminal"), 0x3FB950),
             (tr(lang, "Сменить обои", "Next Wallpaper"), accent),
@@ -1104,15 +1335,23 @@ impl Desktop {
             (tr(lang, "Обновить", "Refresh"), 0xD29922),
             (tr(lang, "Выход", "Exit"), 0xF85149),
         ];
-        canvas.draw_soft_shadow(cx, cy, 184, 134, 9);
-        canvas.blend_rounded_rect(cx, cy, 184, 134, 9, 0x121620, (glass_a + 12).min(248));
-        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 9, 0xFFFFFF, border_a);
+        if t > 0.65 {
+            canvas.draw_soft_shadow(cx, cy, 184, 134, 9);
+        }
+        let panel_a = (((glass_a + 12).min(248) as f32) * t) as u8;
+        let stroke_a = ((border_a as f32) * t) as u8;
+        canvas.blend_rounded_rect(cx, cy, 184, 134, 9, 0x121620, panel_a);
+        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 9, 0xFFFFFF, stroke_a);
+        if t < 0.30 {
+            return;
+        }
         for (i, (label, dot_col)) in items.iter().enumerate() {
             let iy = cy + 4 + (i as i32) * 25;
             if i == 4 {
                 canvas.blend_rect(cx + 10, iy - 1, 164, 1, 0xFFFFFF, 18);
             }
-            if self.mouse_x >= cx
+            if self.ctx_menu.is_some()
+                && self.mouse_x >= cx
                 && self.mouse_x <= cx + 184
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 23
@@ -1188,9 +1427,11 @@ impl Desktop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_desktop_icon(
         &self,
         canvas: &mut Canvas,
+        idx: usize,
         x: i32,
         y: i32,
         id: AppId,
@@ -1198,24 +1439,31 @@ impl Desktop {
         accent: u32,
     ) {
         let (glass_a, border_a) = self.settings.glass_alphas();
-        let hovered = self.mouse_x >= x - 4
-            && self.mouse_x <= x + 74
-            && self.mouse_y >= y - 2
-            && self.mouse_y <= y + 58;
-        if hovered {
-            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, 20);
-            canvas.draw_rounded_rect_alpha(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, 40);
+        let hover_t = self.icon_hover.get(idx).copied().unwrap_or(0.0);
+        let lift = if self.settings.animations {
+            (hover_t * 3.0).round() as i32
+        } else if hover_t > 0.5 {
+            2
+        } else {
+            0
+        };
+        if hover_t > 0.03 {
+            let bg_a = (hover_t * 24.0) as u8;
+            let bd_a = (hover_t * 46.0) as u8;
+            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, bg_a);
+            canvas.draw_rounded_rect_alpha(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, bd_a);
         }
 
         // Cohesive minimalist dark-glass squircle container + monoline vector glyphs
         let bx = x + 14;
-        let by = y;
+        let by = y - lift;
         let cx = bx as f32 + 19.0;
         let cy = by as f32 + 19.0;
 
         canvas.draw_soft_shadow(bx, by, 38, 38, 11);
         canvas.blend_rounded_rect(bx, by, 38, 38, 11, 0x11151F, (glass_a as i32 - 4).clamp(165, 248) as u8);
-        canvas.fill_aa_circle(cx, cy, 12.5, accent, 26);
+        canvas.fill_aa_circle(cx, cy, 12.5 + hover_t * 4.5, accent, 26 + (hover_t * 34.0) as u8);
+        canvas.blend_rect(bx + 9, by + 1, 20, 1, 0xFFFFFF, 44);
         canvas.draw_rounded_rect_alpha(
             bx,
             by,
@@ -1223,7 +1471,7 @@ impl Desktop {
             38,
             11,
             0xFFFFFF,
-            if hovered { 68 } else { border_a },
+            border_a.saturating_add((hover_t * 52.0) as u8),
         );
 
         match id {
@@ -1302,19 +1550,13 @@ impl Desktop {
         canvas.draw_text_clipped(lx, y + 42, 80, label, 0xE2E8F0, 1);
     }
 
-    fn draw_window(&self, canvas: &mut Canvas, orig_win: &Window, focused: bool) {
+    fn draw_window_frame(&self, canvas: &mut Canvas, win: &Window, focused: bool, is_onscreen: bool) {
         let lang = self.settings.lang;
         let accent = self.settings.active_accent();
-        let slide_y = if self.settings.animations && orig_win.open_anim < 0.99 {
-            ((1.0 - orig_win.open_anim) * 14.0).round() as i32
-        } else {
-            0
-        };
-        let mut shifted = orig_win.clone();
-        shifted.y += slide_y;
-        let win = &shifted;
 
-        canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 11);
+        if is_onscreen {
+            canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 11);
+        }
         canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 11, 0x131720);
         canvas.draw_rounded_rect_alpha(
             win.x,
@@ -1323,11 +1565,19 @@ impl Desktop {
             win.h,
             11,
             0xFFFFFF,
-            if focused { 36 } else { 18 },
+            if focused { 38 } else { 18 },
         );
 
-        let tb_col = if focused { 0x181D29 } else { 0x141822 };
-        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 10, tb_col, tb_col);
+        let (tb_top, tb_bot) = if focused {
+            (0x1E2535, 0x161B27)
+        } else {
+            (0x151923, 0x131720)
+        };
+        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 10, tb_top, tb_bot);
+        canvas.blend_rect(win.x + 12, win.y + 1, (win.w - 24).max(0), 1, 0xFFFFFF, if focused { 36 } else { 14 });
+        if focused {
+            canvas.blend_rect(win.x + 22, win.y, (win.w - 44).max(0), 1, accent, 72);
+        }
         canvas.blend_rect(win.x + 1, win.y + 27, win.w - 2, 1, 0xFFFFFF, 16);
         canvas.fill_aa_circle(
             (win.x + 14) as f32,
@@ -1348,7 +1598,7 @@ impl Desktop {
         // Minimalist flat monochrome window controls: ─, □, ×
         let btn_y = win.y + 5;
         let cy = btn_y + 9;
-        let hover_y = self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
+        let hover_y = is_onscreen && self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
         let min_x = win.x + win.w - 72;
         let max_x = win.x + win.w - 49;
         let cls_x = win.x + win.w - 26;
@@ -1398,14 +1648,15 @@ impl Desktop {
                 self.cpu_pct,
                 &self.uptime,
                 self.tick,
-                if focused { self.mouse_x - win.x } else { -1 },
-                if focused { self.mouse_y - win.y } else { -1 },
+                if is_onscreen && focused { self.mouse_x - win.x } else { -1 },
+                if is_onscreen && focused { self.mouse_y - win.y } else { -1 },
             ),
         }
 
         // Subtle minimalist resize grip indicator at bottom-right corner
         if !win.maximized {
-            let grip_hov = focused
+            let grip_hov = is_onscreen
+                && focused
                 && self.mouse_x >= win.x + win.w - 16
                 && self.mouse_y >= win.y + win.h - 16
                 && self.mouse_x <= win.x + win.w + 4

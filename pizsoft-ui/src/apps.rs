@@ -733,6 +733,7 @@ pub struct SettingsState {
     pub taskbar_top: bool,
     pub floating_dock: bool,
     pub animations: bool,
+    pub genie_minimize: bool,
     pub glass_level: u8,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
@@ -742,7 +743,7 @@ pub struct SettingsState {
     pub update_taps: u8,
     pub license_alt: bool,
     pub tab_pill_y: f32,
-    pub toggle_anim: [f32; 7],
+    pub toggle_anim: [f32; 8],
     hero_cache: RefCell<Option<HeroCache>>,
 }
 
@@ -758,6 +759,7 @@ impl SettingsState {
             taskbar_top: false,
             floating_dock: false,
             animations: true,
+            genie_minimize: true,
             glass_level: 0,
             crosshair_cursor: false,
             show_clock: true,
@@ -767,7 +769,7 @@ impl SettingsState {
             update_taps: 0,
             license_alt: false,
             tab_pill_y: 90.0,
-            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
             hero_cache: RefCell::new(None),
         }
     }
@@ -814,6 +816,7 @@ impl SettingsState {
             self.animations,
             self.crosshair_cursor,
             self.show_clock,
+            self.genie_minimize,
         ];
         if !self.animations {
             self.tab_pill_y = target_pill;
@@ -985,6 +988,8 @@ impl SettingsState {
                     self.crosshair_cursor = !self.crosshair_cursor;
                 } else if (196..230).contains(&ly) {
                     self.show_clock = !self.show_clock;
+                } else if (230..264).contains(&ly) {
+                    self.genie_minimize = !self.genie_minimize;
                 }
             }
             SettingsPage::System => {
@@ -1323,7 +1328,7 @@ impl SettingsState {
                 );
 
                 let c_y = wy + 60;
-                Self::draw_card_frame(canvas, x, c_y, iw, 170, 12);
+                Self::draw_card_frame(canvas, x, c_y, iw, 204, 12);
                 Self::draw_toggle_row(
                     canvas,
                     x,
@@ -1389,15 +1394,28 @@ impl SettingsState {
                     in_content && (196..230).contains(&hover_ly),
                     true,
                 );
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 170,
+                    iw,
+                    34,
+                    0xF43F5E,
+                    tr(lang, "Эффект Джинна (macOS)", "macOS Genie Minimize"),
+                    self.toggle_anim[7],
+                    accent,
+                    in_content && (230..264).contains(&hover_ly),
+                    true,
+                );
 
-                let tip_y = wy + 240;
-                if tip_y + 46 <= wy + wh - 8 {
-                    Self::draw_card_frame(canvas, x, tip_y, iw, 46, 12);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 23) as f32, 6.0, accent, 36);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 23) as f32, 2.5, accent, 240);
+                let tip_y = wy + 272;
+                if tip_y + 42 <= wy + wh - 6 {
+                    Self::draw_card_frame(canvas, x, tip_y, iw, 42, 12);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 6.0, accent, 36);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 2.5, accent, 240);
                     canvas.draw_text_clipped(
                         x + 32,
-                        tip_y + 8,
+                        tip_y + 7,
                         iw - 44,
                         tr(lang, "Управление окнами", "Window Controls"),
                         0xF1F5F9,
@@ -1405,7 +1423,7 @@ impl SettingsState {
                     );
                     canvas.draw_text_clipped(
                         x + 32,
-                        tip_y + 25,
+                        tip_y + 23,
                         iw - 44,
                         tr(
                             lang,

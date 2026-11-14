@@ -838,6 +838,178 @@ impl Canvas {
         }
     }
 
+    #[inline]
+    pub fn smoothstep(x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    }
+
+    #[inline]
+    fn blit_warped_row(
+        &mut self,
+        src_row: &[u32],
+        py: i32,
+        row_l: f32,
+        row_r: f32,
+        alpha: u8,
+    ) {
+        if py < 0
+            || py >= self.height as i32
+            || alpha == 0
+            || row_r <= row_l + 0.5
+            || src_row.is_empty()
+        {
+            return;
+        }
+        let x0 = (row_l.floor() as i32).max(0);
+        let x1 = (row_r.ceil() as i32).min(self.width as i32 - 1);
+        if x0 > x1 {
+            return;
+        }
+        let sw = src_row.len();
+        let sw_f = sw as f32;
+        let span = (row_r - row_l).max(1.0);
+        let step_fp = ((sw_f / span) * 65536.0) as i64;
+        let mut sx_fp = (((x0 as f32 + 0.5 - row_l) / span) * sw_f * 65536.0) as i64;
+        let max_sx = (sw - 1) as i64;
+        let dst_off = (py as usize) * self.width;
+        let edge_fade = span > 8.0;
+
+        for px in x0..=x1 {
+            let sx = (sx_fp >> 16).clamp(0, max_sx) as usize;
+            sx_fp += step_fp;
+            let src_px = src_row[sx];
+            if (src_px >> 24) != 0 {
+                continue;
+            }
+            let pix_a = if edge_fade {
+                let cov = (px as f32 + 1.0 - row_l)
+                    .clamp(0.0, 1.0)
+                    .min((row_r - px as f32).clamp(0.0, 1.0));
+                ((alpha as f32) * cov) as u8
+            } else {
+                alpha
+            };
+            let idx = dst_off + px as usize;
+            if pix_a == 255 {
+                self.pixels[idx] = src_px;
+            } else if pix_a > 0 {
+                self.pixels[idx] = blend_rgb(self.pixels[idx], src_px, pix_a);
+            }
+        }
+    }
+
+    /// Warp an offscreen window capture (`0xFF______` = transparent) along a macOS-style
+    /// S-curve funnel into `target_pill (px, py, pw)`. `t = 1.0` open -> `0.0` minimized.
+    pub fn blit_genie_rect(
+        &mut self,
+        src: &[u32],
+        src_size: (i32, i32),
+        win_pos: (i32, i32),
+        target_pill: (i32, i32, i32),
+        t: f32,
+        top_dock: bool,
+    ) {
+        let (sw, sh) = src_size;
+        if sw <= 1 || sh <= 1 || src.len() < (sw as usize) * (sh as usize) {
+            return;
+        }
+        let t = t.clamp(0.0, 1.0);
+        if t <= 0.005 {
+            return;
+        }
+        let p = 1.0 - t;
+        let funnel = Self::smoothstep(p / 0.48);
+        let slide = Self::smoothstep((p - 0.14) / 0.86);
+        let pull_near = Self::smoothstep(p * 1.32);
+
+        let wx = win_pos.0 as f32;
+        let wy = win_pos.1 as f32;
+        let sw_f = sw as f32;
+        let sh_f = sh as f32;
+        let wr = wx + sw_f;
+
+        let px_f = target_pill.0 as f32;
+        let pr_f = px_f + (target_pill.2.max(12)) as f32;
+        let dock_anchor = target_pill.1 as f32 + if top_dock { 18.0 } else { 14.0 };
+
+        let near_l = wx + (px_f - wx) * funnel;
+        let near_r = wr + (pr_f - wr) * funnel;
+        let far_k = slide * slide;
+        let far_l = wx + (px_f - wx) * far_k;
+        let far_r = wr + (pr_f - wr) * far_k;
+
+        let (top_y, bot_y) = if top_dock {
+            (
+                wy + (dock_anchor - wy) * pull_near,
+                (wy + sh_f) + (dock_anchor + 4.0 - (wy + sh_f)) * slide,
+            )
+        } else {
+            (
+                wy + (dock_anchor - 4.0 - wy) * slide,
+                (wy + sh_f) + (dock_anchor - (wy + sh_f)) * pull_near,
+            )
+        };
+        if bot_y <= top_y + 1.0 {
+            return;
+        }
+        let y0 = (top_y.round() as i32).max(0);
+        let y1 = (bot_y.round() as i32).min(self.height as i32 - 1);
+        if y0 > y1 {
+            return;
+        }
+        let alpha = if t < 0.28 {
+            ((t / 0.28) * 255.0).clamp(0.0, 255.0) as u8
+        } else {
+            255
+        };
+        let span_y = (bot_y - top_y).max(1.0);
+        let sw_u = sw as usize;
+
+        for py in y0..=y1 {
+            let v = ((py as f32 + 0.5 - top_y) / span_y).clamp(0.0, 1.0);
+            let curve_t = if top_dock { 1.0 - v } else { v };
+            let s_curve = 0.5 - 0.5 * (curve_t * core::f32::consts::PI).cos();
+            let row_l = far_l + (near_l - far_l) * s_curve;
+            let row_r = far_r + (near_r - far_r) * s_curve;
+            let sy = ((v * (sh - 1) as f32).round() as i32).clamp(0, sh - 1) as usize;
+            let src_row = &src[sy * sw_u..(sy + 1) * sw_u];
+            self.blit_warped_row(src_row, py, row_l, row_r, alpha);
+        }
+    }
+
+    /// Blit a captured offscreen window scaled around `dst_center` with uniform opacity `alpha`.
+    pub fn blit_scaled_alpha_rect(
+        &mut self,
+        src: &[u32],
+        src_size: (i32, i32),
+        dst_center: (f32, f32),
+        scale: f32,
+        alpha: u8,
+    ) {
+        let (sw, sh) = src_size;
+        if sw <= 1 || sh <= 1 || scale <= 0.02 || alpha == 0 || src.len() < (sw as usize) * (sh as usize) {
+            return;
+        }
+        let dw = (sw as f32) * scale;
+        let dh = (sh as f32) * scale;
+        let row_l = dst_center.0 - dw * 0.5;
+        let row_r = row_l + dw;
+        let top_y = dst_center.1 - dh * 0.5;
+        let bot_y = top_y + dh;
+        let y0 = (top_y.round() as i32).max(0);
+        let y1 = (bot_y.round() as i32).min(self.height as i32 - 1);
+        let span_y = (bot_y - top_y).max(1.0);
+        let sw_u = sw as usize;
+
+        for py in y0..=y1 {
+            let v = ((py as f32 + 0.5 - top_y) / span_y).clamp(0.0, 1.0);
+            let sy = ((v * (sh - 1) as f32).round() as i32).clamp(0, sh - 1) as usize;
+            let src_row = &src[sy * sw_u..(sy + 1) * sw_u];
+            self.blit_warped_row(src_row, py, row_l, row_r, alpha);
+        }
+    }
+
     /// Writes a standard uncompressed 24-bit BMP image for offline inspection.
     pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
         let w = self.width as u32;
