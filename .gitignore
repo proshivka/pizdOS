@@ -1,7 +1,10 @@
 build/
 *.bin
 *.img
+*.iso
 *.ppm
 test_boot.py
 target/
 piz-get/target/
+pizdos2/initrd_work/
+pizdos2/overlay/usr/bin/piz-get
