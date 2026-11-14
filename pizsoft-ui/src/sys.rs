@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CpuSample {
@@ -204,17 +202,6 @@ pub fn list_processes() -> Vec<ProcInfo> {
 
     procs.sort_by_key(|p| p.pid);
     procs
-}
-
-pub fn kill_process(pid: u32) -> io::Result<()> {
-    let status = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("kill -9 {pid} failed")))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
