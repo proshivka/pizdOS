@@ -1215,6 +1215,34 @@ impl Canvas {
         }
     }
 
+    /// Applies a gentle warm amber evening filter across the framebuffer.
+    pub fn apply_night_shift(&mut self) {
+        for px in &mut self.pixels {
+            let c = *px;
+            let r = ((c >> 16) & 0xFF).saturating_add(10).min(255);
+            let g = (((c >> 8) & 0xFF) * 244) >> 8;
+            let b = ((c & 0xFF) * 196) >> 8;
+            *px = (r << 16) | (g << 8) | b;
+        }
+    }
+
+    /// Applies subtle retro CRT scanlines every other physical row.
+    pub fn apply_crt_scanlines(&mut self) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        for py in (1..self.height).step_by(2) {
+            let row = py * self.width;
+            for px in &mut self.pixels[row..row + self.width] {
+                let c = *px;
+                let r = (((c >> 16) & 0xFF) * 218) >> 8;
+                let g = (((c >> 8) & 0xFF) * 218) >> 8;
+                let b = ((c & 0xFF) * 222) >> 8;
+                *px = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     /// Writes a standard uncompressed 24-bit BMP image for offline inspection.
     pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
         let w = self.width as u32;

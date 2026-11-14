@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::gfx::{Canvas, lerp_rgb};
@@ -19,7 +20,7 @@ pub fn tr<'a>(lang: Lang, ru: &'a str, en: &'a str) -> &'a str {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyEvent {
     Char(char),
     Enter,
@@ -29,88 +30,262 @@ pub enum KeyEvent {
     Down,
     Left,
     Right,
+    Tab,
+    Copy,
+    Paste(String),
+    Save,
+    Find,
+    Undo,
+    ShowDesktop,
+    Workspace(u8),
     ToggleLauncher,
     ToggleControlCenter,
+    SwitchWindows,
+    LockScreen,
     ScaleDelta(i8),
 }
 
 // ---------------------------------------------------------------------------
 // 1. Terminal
 // ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermAction {
+    None,
+    SetTheme(u8),
+    SetScale(u16),
+}
+
 pub struct TerminalState {
     pub lines: Vec<String>,
     pub input: String,
+    pub history: Vec<String>,
+    pub hist_idx: Option<usize>,
+    pub cwd: PathBuf,
 }
 
 impl TerminalState {
     pub fn new(lang: Lang) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             lines: vec![
                 String::from(tr(
                     lang,
-                    "pizdOS 2.0 Терминал (0% GNU)",
-                    "pizdOS 2.0 Terminal (0% GNU)",
+                    "pizdOS 2.1(00) Терминал (0% GNU)",
+                    "pizdOS 2.1(00) Terminal (0% GNU)",
                 )),
                 String::from(tr(
                     lang,
-                    "Введи 'help', 'poyasni' или любую команду:",
-                    "Type 'help', 'poyasni' or any shell command:",
+                    "Введи 'help', 'pizfetch' или любую команду (Up/Down/Tab):",
+                    "Type 'help', 'pizfetch' or any command (Up/Down/Tab):",
                 )),
             ],
             input: String::new(),
+            history: Vec::new(),
+            hist_idx: None,
+            cwd,
         }
     }
 
     pub fn push_line(&mut self, line: String) {
         self.lines.push(line);
-        if self.lines.len() > 64 {
-            let drain = self.lines.len() - 64;
+        if self.lines.len() > 96 {
+            let drain = self.lines.len() - 96;
             self.lines.drain(0..drain);
         }
     }
 
-    pub fn on_key(&mut self, key: KeyEvent, kernel: &str, mem: &MemInfo) {
+    pub fn on_key(&mut self, key: KeyEvent, kernel: &str, mem: &MemInfo) -> TermAction {
         match key {
             KeyEvent::Char(c) => {
-                if self.input.chars().count() < 56 {
+                self.hist_idx = None;
+                if self.input.chars().count() < 64 {
                     self.input.push(c);
                 }
             }
+            KeyEvent::Paste(txt) => {
+                self.hist_idx = None;
+                let line = txt.lines().next().unwrap_or("");
+                for c in line.chars() {
+                    if !c.is_control() && self.input.chars().count() < 64 {
+                        self.input.push(c);
+                    }
+                }
+            }
             KeyEvent::Backspace => {
+                self.hist_idx = None;
                 self.input.pop();
+            }
+            KeyEvent::Up => {
+                if !self.history.is_empty() {
+                    let next = match self.hist_idx {
+                        None => self.history.len() - 1,
+                        Some(i) => i.saturating_sub(1),
+                    };
+                    self.hist_idx = Some(next);
+                    self.input = self.history[next].clone();
+                }
+            }
+            KeyEvent::Down => {
+                if let Some(i) = self.hist_idx {
+                    if i + 1 < self.history.len() {
+                        self.hist_idx = Some(i + 1);
+                        self.input = self.history[i + 1].clone();
+                    } else {
+                        self.hist_idx = None;
+                        self.input.clear();
+                    }
+                }
+            }
+            KeyEvent::Tab => {
+                self.autocomplete();
             }
             KeyEvent::Enter => {
                 let cmd = self.input.trim().to_string();
                 self.input.clear();
+                self.hist_idx = None;
                 self.push_line(format!("pizdOS# {cmd}"));
-                self.exec_cmd(&cmd, kernel, mem);
+                if !cmd.is_empty() && self.history.last() != Some(&cmd) {
+                    self.history.push(cmd.clone());
+                    if self.history.len() > 40 {
+                        self.history.remove(0);
+                    }
+                }
+                return self.exec_cmd(&cmd, kernel, mem);
             }
             _ => {}
         }
+        TermAction::None
     }
 
-    fn exec_cmd(&mut self, cmd: &str, kernel: &str, mem: &MemInfo) {
-        if cmd.is_empty() {
-            return;
-        }
-        match cmd {
-            "help" | "huelp" => {
-                self.push_line(String::from("help, poyasni, clear/nahuy, whoami, <cmd>"));
+    fn autocomplete(&mut self) {
+        let builtins = [
+            "help", "pizfetch", "poyasni", "clear", "nahuy", "whoami", "pwd", "ls", "cd", "cat",
+            "theme", "scale",
+        ];
+        if let Some(space) = self.input.rfind(' ') {
+            let prefix = &self.input[space + 1..];
+            if let Ok(rd) = fs::read_dir(&self.cwd) {
+                let mut matches: Vec<String> = rd
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.starts_with(prefix))
+                    .collect();
+                matches.sort();
+                if let Some(first) = matches.first() {
+                    self.input.truncate(space + 1);
+                    self.input.push_str(first);
+                }
             }
-            "clear" | "nahuy" => {
+        } else {
+            let prefix = self.input.trim();
+            if let Some(found) = builtins.iter().find(|b| b.starts_with(prefix)) {
+                self.input = String::from(*found);
+            }
+        }
+    }
+
+    fn exec_cmd(&mut self, cmd: &str, kernel: &str, mem: &MemInfo) -> TermAction {
+        if cmd.is_empty() {
+            return TermAction::None;
+        }
+        let mut parts = cmd.splitn(2, char::is_whitespace);
+        let head = parts.next().unwrap_or("");
+        let rest = parts.next().map(str::trim).unwrap_or("");
+
+        match head {
+            "help" | "huelp" => {
+                self.push_line(String::from("help, pizfetch, poyasni, clear/nahuy, pwd, ls, cd, cat"));
+                self.push_line(String::from("theme <0-3>, scale <100|125|150|175>, whoami, <shell>"));
+            }
+            "clear" | "nahuy" | "cls" => {
                 self.lines.clear();
             }
-            "poyasni" => {
-                self.push_line(format!("pizdOS 2.0 | {kernel} | RAM {}MB", mem.total_mb));
+            "poyasni" | "pizfetch" => {
+                self.push_line(String::from("  /\\_/\\   OS: pizdOS 2.1(00) [NO GNU]"));
+                self.push_line(format!(" ( o.o )  Kernel: {kernel}"));
+                self.push_line(format!("  > ^ <   RAM: {}/{} MB ({}%)", mem.used_mb, mem.total_mb, mem.percent));
+                self.push_line(format!("          CWD: {}", self.cwd.display()));
             }
             "whoami" => {
                 self.push_line(String::from("root (bratukha)"));
             }
+            "pwd" => {
+                self.push_line(format!("{}", self.cwd.display()));
+            }
+            "cd" => {
+                let target = if rest.is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                } else {
+                    self.cwd.join(rest)
+                };
+                if target.is_dir() {
+                    if let Ok(canon) = fs::canonicalize(&target) {
+                        self.cwd = canon;
+                    } else {
+                        self.cwd = target;
+                    }
+                    self.push_line(format!("-> {}", self.cwd.display()));
+                } else {
+                    self.push_line(format!("cd: not found: {}", target.display()));
+                }
+            }
+            "ls" | "dir" => {
+                let dir = if rest.is_empty() { self.cwd.clone() } else { self.cwd.join(rest) };
+                match fs::read_dir(&dir) {
+                    Ok(rd) => {
+                        let mut names: Vec<String> = rd
+                            .flatten()
+                            .map(|e| {
+                                let suffix = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { "/" } else { "" };
+                                format!("{}{}", e.file_name().to_string_lossy(), suffix)
+                            })
+                            .collect();
+                        names.sort();
+                        for chunk in names.chunks(4).take(6) {
+                            self.push_line(chunk.join("  "));
+                        }
+                    }
+                    Err(e) => self.push_line(format!("ls: {e}")),
+                }
+            }
+            "cat" => {
+                if rest.is_empty() {
+                    self.push_line(String::from("usage: cat <file>"));
+                } else {
+                    let p = self.cwd.join(rest);
+                    match fs::read_to_string(&p) {
+                        Ok(txt) => {
+                            for l in txt.lines().take(14) {
+                                self.push_line(l.to_string());
+                            }
+                        }
+                        Err(e) => self.push_line(format!("cat: {e}")),
+                    }
+                }
+            }
+            "theme" => {
+                if let Ok(n) = rest.parse::<u8>()
+                    && n < 4
+                {
+                    self.push_line(format!("theme -> #{n}"));
+                    return TermAction::SetTheme(n);
+                }
+                self.push_line(String::from("usage: theme <0..3>"));
+            }
+            "scale" => {
+                if let Ok(pct) = rest.parse::<u16>()
+                    && [100, 125, 150, 175].contains(&pct)
+                {
+                    self.push_line(format!("scale -> {pct}%"));
+                    return TermAction::SetScale(pct);
+                }
+                self.push_line(String::from("usage: scale <100|125|150|175>"));
+            }
             _ => {
                 #[cfg(windows)]
-                let out = Command::new("cmd").args(["/C", cmd]).output();
+                let out = Command::new("cmd").args(["/C", cmd]).current_dir(&self.cwd).output();
                 #[cfg(not(windows))]
-                let out = Command::new("sh").args(["-c", cmd]).output();
+                let out = Command::new("sh").args(["-c", cmd]).current_dir(&self.cwd).output();
 
                 match out {
                     Ok(res) => {
@@ -129,6 +304,7 @@ impl TerminalState {
                 }
             }
         }
+        TermAction::None
     }
 
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
@@ -176,12 +352,45 @@ pub enum PaintAction {
     SaveErr(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintShape {
+    Free,
+    Line,
+    Rect,
+    Circle,
+}
+
+impl PaintShape {
+    fn next(self) -> Self {
+        match self {
+            PaintShape::Free => PaintShape::Line,
+            PaintShape::Line => PaintShape::Rect,
+            PaintShape::Rect => PaintShape::Circle,
+            PaintShape::Circle => PaintShape::Free,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PaintShape::Free => "Free",
+            PaintShape::Line => "Line",
+            PaintShape::Rect => "Rect",
+            PaintShape::Circle => "Circ",
+        }
+    }
+}
+
 pub struct PaintState {
     pub buf: Vec<u32>,
+    pub undo_buf: Option<Vec<u32>>,
     pub color_idx: usize,
+    pub custom_color: Option<u32>,
     pub brush: i32,
     pub eraser: bool,
     pub fill_mode: bool,
+    pub eyedropper: bool,
+    pub shape: PaintShape,
+    pub shape_start: Option<(i32, i32)>,
     pub brush_tier: u8,
     pub last_pos: Option<(i32, i32)>,
 }
@@ -190,24 +399,83 @@ impl PaintState {
     pub fn new() -> Self {
         Self {
             buf: vec![0x0D1117; PAINT_W * PAINT_H],
+            undo_buf: None,
             color_idx: 1,
+            custom_color: None,
             brush: 4,
             eraser: false,
             fill_mode: false,
+            eyedropper: false,
+            shape: PaintShape::Free,
+            shape_start: None,
             brush_tier: 1,
             last_pos: None,
         }
     }
 
+    fn snapshot_undo(&mut self) {
+        self.undo_buf = Some(self.buf.clone());
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo_buf.take() {
+            self.buf = prev;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn end_stroke(&mut self) {
+        if let Some((x0, y0)) = self.shape_start.take() {
+            let (x1, y1) = self.last_pos.unwrap_or((x0, y0));
+            let col = self.active_color();
+            match self.shape {
+                PaintShape::Line => self.draw_line_buf(x0, y0, x1, y1, col),
+                PaintShape::Rect => {
+                    let (lx, rx) = (x0.min(x1), x0.max(x1));
+                    let (ty, by) = (y0.min(y1), y0.max(y1));
+                    self.draw_line_buf(lx, ty, rx, ty, col);
+                    self.draw_line_buf(lx, by, rx, by, col);
+                    self.draw_line_buf(lx, ty, lx, by, col);
+                    self.draw_line_buf(rx, ty, rx, by, col);
+                }
+                PaintShape::Circle => {
+                    let r = (((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) as f32).sqrt().round() as i32;
+                    let steps = (r * 6).clamp(16, 180);
+                    let mut prev = None;
+                    for i in 0..=steps {
+                        let a = (i as f32 / steps as f32) * std::f32::consts::TAU;
+                        let px = x0 + (a.cos() * r as f32).round() as i32;
+                        let py = y0 + (a.sin() * r as f32).round() as i32;
+                        if let Some((qx, qy)) = prev {
+                            self.draw_line_buf(qx, qy, px, py, col);
+                        }
+                        prev = Some((px, py));
+                    }
+                }
+                PaintShape::Free => {}
+            }
+        }
         self.last_pos = None;
+    }
+
+    fn draw_line_buf(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let steps = (dx.abs().max(dy.abs()) * 2).max(1);
+        for i in 0..=steps {
+            let px = x0 + (dx * i) / steps;
+            let py = y0 + (dy * i) / steps;
+            self.stamp_brush(px, py, color);
+        }
     }
 
     fn active_color(&self) -> u32 {
         if self.eraser {
             0x0D1117
         } else {
-            PALETTE[self.color_idx]
+            self.custom_color.unwrap_or(PALETTE[self.color_idx])
         }
     }
 
@@ -267,23 +535,34 @@ impl PaintState {
             self.last_pos = None;
             return;
         }
+        if self.eyedropper {
+            self.custom_color = Some(self.buf[(cy as usize) * PAINT_W + (cx as usize)]);
+            self.eraser = false;
+            self.eyedropper = false;
+            return;
+        }
         let color = self.active_color();
         if self.fill_mode {
             if self.last_pos.is_none() {
+                self.snapshot_undo();
                 self.flood_fill(cx, cy, color);
                 self.last_pos = Some((cx, cy));
             }
             return;
         }
-        if let Some((x0, y0)) = self.last_pos {
-            let dx = cx - x0;
-            let dy = cy - y0;
-            let steps = (dx.abs().max(dy.abs()) * 2).max(1);
-            for i in 1..=steps {
-                let px = x0 + (dx * i) / steps;
-                let py = y0 + (dy * i) / steps;
-                self.stamp_brush(px, py, color);
+        if self.shape != PaintShape::Free {
+            if self.shape_start.is_none() {
+                self.snapshot_undo();
+                self.shape_start = Some((cx, cy));
             }
+            self.last_pos = Some((cx, cy));
+            return;
+        }
+        if self.last_pos.is_none() {
+            self.snapshot_undo();
+        }
+        if let Some((x0, y0)) = self.last_pos {
+            self.draw_line_buf(x0, y0, cx, cy, color);
         } else {
             self.stamp_brush(cx, cy, color);
         }
@@ -305,12 +584,31 @@ impl PaintState {
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) -> PaintAction {
+        if ly >= wh - 66 && ly <= wh - 40 {
+            if (14..=66).contains(&lx) {
+                self.undo();
+            } else if (70..=126).contains(&lx) {
+                self.eyedropper = !self.eyedropper;
+                if self.eyedropper {
+                    self.eraser = false;
+                    self.fill_mode = false;
+                }
+            } else if (130..=214).contains(&lx) {
+                self.shape = self.shape.next();
+                self.eraser = false;
+                self.fill_mode = false;
+                self.eyedropper = false;
+            }
+            return PaintAction::None;
+        }
         if ly >= wh - 38 && ly <= wh - 8 {
             for i in 0..PALETTE.len() {
                 let bx = 14 + (i as i32) * 20;
                 if lx >= bx && lx <= bx + 18 {
                     self.color_idx = i;
+                    self.custom_color = None;
                     self.eraser = false;
+                    self.eyedropper = false;
                     return PaintAction::None;
                 }
             }
@@ -327,6 +625,7 @@ impl PaintState {
                 self.eraser = !self.eraser;
                 if self.eraser {
                     self.fill_mode = false;
+                    self.eyedropper = false;
                 }
                 return PaintAction::None;
             }
@@ -334,6 +633,7 @@ impl PaintState {
                 self.fill_mode = !self.fill_mode;
                 if self.fill_mode {
                     self.eraser = false;
+                    self.eyedropper = false;
                 }
                 return PaintAction::None;
             }
@@ -344,6 +644,7 @@ impl PaintState {
                 };
             }
             if (322..=362).contains(&lx) {
+                self.snapshot_undo();
                 self.buf.fill(0x0D1117);
                 return PaintAction::None;
             }
@@ -370,21 +671,85 @@ impl PaintState {
         canvas.blit_rgb_rect(ox, oy, PAINT_W as i32, PAINT_H as i32, &self.buf);
         canvas.draw_rounded_rect_alpha(ox - 1, oy - 1, PAINT_W as i32 + 2, PAINT_H as i32 + 2, 6, 0xFFFFFF, 32);
 
+        if let Some((x0, y0)) = self.shape_start {
+            let (x1, y1) = self.last_pos.unwrap_or((x0, y0));
+            let col = self.active_color();
+            match self.shape {
+                PaintShape::Line => {
+                    canvas.draw_aa_line((ox + x0) as f32, (oy + y0) as f32, (ox + x1) as f32, (oy + y1) as f32, self.brush as f32, col, 210);
+                }
+                PaintShape::Rect => {
+                    let (rx0, rx1) = (x0.min(x1), x0.max(x1));
+                    let (ry0, ry1) = (y0.min(y1), y0.max(y1));
+                    canvas.draw_rounded_rect_alpha(
+                        ox + rx0,
+                        oy + ry0,
+                        (rx1 - rx0).max(1),
+                        (ry1 - ry0).max(1),
+                        0,
+                        col,
+                        220,
+                    );
+                }
+                PaintShape::Circle => {
+                    let r = (((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) as f32).sqrt().max(2.0);
+                    canvas.fill_aa_circle((ox + x0) as f32, (oy + y0) as f32, r, col, 110);
+                }
+                PaintShape::Free => {}
+            }
+        }
+
         // Live brush ring preview over canvas
         let cx = hover_lx - 14;
         let cy = hover_ly - 36;
         if cx >= 0 && cy >= 0 && cx < PAINT_W as i32 && cy < PAINT_H as i32 {
-            let preview_col = if self.eraser { 0xF87171 } else { PALETTE[self.color_idx] };
+            let preview_col = self.active_color();
             let r = (self.brush as f32 * 0.5).max(1.5);
             canvas.fill_aa_circle((wx + hover_lx) as f32, (wy + hover_ly) as f32, r + 1.0, 0xFFFFFF, 90);
             canvas.fill_aa_circle((wx + hover_lx) as f32, (wy + hover_ly) as f32, r, preview_col, 145);
         }
 
+        let r2_y = wy + wh - 62;
+        canvas.draw_button(
+            wx + 14,
+            r2_y,
+            52,
+            20,
+            tr(lang, "Отм", "Undo"),
+            if self.undo_buf.is_some() { 0x1E293B } else { 0x111520 },
+            if self.undo_buf.is_some() { 0xF8FAFC } else { 0x64748B },
+            if self.undo_buf.is_some() { accent } else { 0x334155 },
+        );
+        canvas.draw_button(
+            wx + 70,
+            r2_y,
+            56,
+            20,
+            tr(lang, "Пип.", "Pick"),
+            if self.eyedropper { accent } else { 0x1E293B },
+            0xFFFFFF,
+            if self.eyedropper { 0xFFFFFF } else { 0x475569 },
+        );
+        canvas.draw_button(
+            wx + 130,
+            r2_y,
+            84,
+            20,
+            &format!("{} {}", tr(lang, "Ф:", "Sh:"), self.shape.label()),
+            if self.shape != PaintShape::Free { accent } else { 0x1E293B },
+            0xFFFFFF,
+            accent,
+        );
+        let active_c = self.active_color();
+        canvas.fill_rounded_rect(wx + 220, r2_y + 2, 16, 16, 4, active_c);
+        canvas.draw_rounded_rect_alpha(wx + 220, r2_y + 2, 16, 16, 4, 0xFFFFFF, 85);
+        canvas.draw_text_clipped(wx + 242, r2_y + 4, 120, &format!("#{active_c:06X}"), 0xCBD5E1, 1);
+
         let by = wy + wh - 34;
         for (i, &col) in PALETTE.iter().enumerate() {
             let cx_p = (wx + 23 + (i as i32) * 20) as f32;
             let cy_p = (by + 11) as f32;
-            let sel = !self.eraser && i == self.color_idx;
+            let sel = !self.eraser && self.custom_color.is_none() && i == self.color_idx;
             if sel {
                 canvas.fill_aa_circle(cx_p, cy_p, 8.8, 0xFFFFFF, 225);
                 canvas.fill_aa_circle(cx_p, cy_p, 7.2, 0x131720, 255);
@@ -741,18 +1106,24 @@ impl SnakeState {
 }
 
 // ---------------------------------------------------------------------------
-// 4. PizPad (Funny Notepad)
+// 4. PizPad (Pro Text Editor)
 // ---------------------------------------------------------------------------
 pub struct NotepadState {
     pub lines: Vec<String>,
     pub saved_msg: String,
+    pub file_path: Option<PathBuf>,
+    pub undo_stack: Vec<Vec<String>>,
+    pub search_query: String,
+    pub search_mode: bool,
+    pub scroll: usize,
+    pub dirty: bool,
 }
 
 impl NotepadState {
     pub fn new(lang: Lang) -> Self {
         Self {
             lines: vec![
-                String::from("=== PIZPAD v0.2 (Top Secret) ==="),
+                String::from("=== PIZPAD v2.1(00) ==="),
                 String::from(tr(
                     lang,
                     "1. Не трогай то, что работает.",
@@ -766,54 +1137,183 @@ impl NotepadState {
                 String::from(tr(lang, "3. GNU пошёл нахуй!", "3. Zero GNU, zero bugs!")),
                 String::new(),
             ],
-            saved_msg: String::from(tr(lang, "Печатай прямо сюда...", "Type right here...")),
+            saved_msg: String::from(tr(lang, "Печатай или Ctrl+S...", "Type or Ctrl+S...")),
+            file_path: None,
+            undo_stack: Vec::new(),
+            search_query: String::new(),
+            search_mode: false,
+            scroll: 0,
+            dirty: false,
         }
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) {
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.lines.clone());
+        if self.undo_stack.len() > 24 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.lines = prev;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn open_file(&mut self, path: &Path, lang: Lang) -> Result<String, String> {
+        let data = fs::read_to_string(path).map_err(|e| format!("Read err: {e}"))?;
+        self.push_undo();
+        let mut lines: Vec<String> = data
+            .lines()
+            .take(300)
+            .map(|l| l.trim_end_matches('\r').chars().take(64).collect())
+            .collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        self.lines = lines;
+        self.file_path = Some(path.to_path_buf());
+        self.scroll = 0;
+        self.dirty = false;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("file"));
+        let msg = format!("{}: {name}", tr(lang, "Открыт", "Opened"));
+        self.saved_msg = msg.clone();
+        Ok(msg)
+    }
+
+    pub fn save_current(&mut self, lang: Lang) -> Option<String> {
+        let target = self
+            .file_path
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("pizpad_note.txt"));
+        let text = self.lines.join("\n");
+        match fs::write(&target, text) {
+            Ok(()) => {
+                self.dirty = false;
+                let fname = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| String::from("pizpad_note.txt"));
+                let msg = format!("{}: {fname}", tr(lang, "Сохранено", "Saved"));
+                self.saved_msg = msg.clone();
+                Some(msg)
+            }
+            Err(e) => {
+                self.saved_msg = format!("Err: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent, lang: Lang) -> Option<String> {
+        if self.search_mode {
+            match key {
+                KeyEvent::Escape | KeyEvent::Find | KeyEvent::Enter => {
+                    self.search_mode = false;
+                }
+                KeyEvent::Backspace => {
+                    self.search_query.pop();
+                }
+                KeyEvent::Char(c) if !c.is_control() && self.search_query.chars().count() < 28 => {
+                    self.search_query.push(c);
+                }
+                _ => {}
+            }
+            return None;
+        }
         match key {
+            KeyEvent::Save => return self.save_current(lang),
+            KeyEvent::Find => {
+                self.search_mode = true;
+            }
+            KeyEvent::Undo => {
+                if self.undo() {
+                    self.saved_msg = String::from(tr(lang, "Отменено", "Undone"));
+                }
+            }
+            KeyEvent::Up => {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+            KeyEvent::Down => {
+                if self.scroll + 1 < self.lines.len() {
+                    self.scroll += 1;
+                }
+            }
+            KeyEvent::Paste(txt) => {
+                self.push_undo();
+                for (i, line) in txt.lines().enumerate() {
+                    let clean: String = line.chars().filter(|c| !c.is_control()).take(60).collect();
+                    if i == 0 {
+                        if self.lines.is_empty() {
+                            self.lines.push(String::new());
+                        }
+                        if let Some(last) = self.lines.last_mut() {
+                            for ch in clean.chars() {
+                                if last.chars().count() < 60 {
+                                    last.push(ch);
+                                }
+                            }
+                        }
+                    } else if self.lines.len() < 300 {
+                        self.lines.push(clean);
+                    }
+                }
+                self.dirty = true;
+            }
             KeyEvent::Char(c) => {
+                self.push_undo();
                 if self.lines.is_empty() {
                     self.lines.push(String::new());
                 }
                 if let Some(last) = self.lines.last_mut()
-                    && last.chars().count() < 50
+                    && last.chars().count() < 60
                 {
                     last.push(c);
+                    self.dirty = true;
                 }
             }
             KeyEvent::Enter => {
-                if self.lines.len() < 14 {
+                if self.lines.len() < 300 {
+                    self.push_undo();
                     self.lines.push(String::new());
+                    self.dirty = true;
                 }
             }
             KeyEvent::Backspace => {
+                self.push_undo();
                 if let Some(last) = self.lines.last_mut()
                     && last.pop().is_none()
                     && self.lines.len() > 1
                 {
                     self.lines.pop();
                 }
+                self.dirty = true;
             }
             _ => {}
         }
+        None
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32, lang: Lang) -> Option<String> {
         if ly >= wh - 34 && ly <= wh - 10 {
-            if (14..=114).contains(&lx) {
-                let text = self.lines.join("\n");
-                let path = std::env::temp_dir().join("pizpad_note.txt");
-                match fs::write(&path, text) {
-                    Ok(()) => {
-                        let msg = tr(lang, "Сохранено в pizpad_note.txt", "Saved to pizpad_note.txt");
-                        self.saved_msg = String::from(msg);
-                        return Some(String::from(msg));
-                    }
-                    Err(e) => self.saved_msg = format!("Err: {e}"),
-                }
-            } else if (122..=212).contains(&lx) {
+            if (14..=86).contains(&lx) {
+                return self.save_current(lang);
+            } else if (92..=154).contains(&lx) {
+                self.search_mode = !self.search_mode;
+            } else if (160..=218).contains(&lx) {
+                self.undo();
+            } else if (224..=284).contains(&lx) {
+                self.push_undo();
                 self.lines = vec![String::new()];
+                self.scroll = 0;
+                self.dirty = true;
                 self.saved_msg = String::from(tr(lang, "Очищено!", "Cleared!"));
             }
         }
@@ -822,48 +1322,77 @@ impl NotepadState {
 
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, lang: Lang) {
         let x = wx + 12;
-        let y = wy + 34;
+        let top_off = if self.search_mode || !self.search_query.is_empty() { 58 } else { 34 };
+        let y = wy + top_off;
         let iw = ww - 24;
-        let ih = wh - 76;
+        let ih = (wh - top_off - 42).max(40);
+        if top_off > 34 {
+            canvas.fill_rounded_rect(x, wy + 33, iw, 20, 6, 0x161D2C);
+            canvas.draw_rounded_rect_alpha(
+                x,
+                wy + 33,
+                iw,
+                20,
+                6,
+                if self.search_mode { 0xF59E0B } else { 0x475569 },
+                140,
+            );
+            canvas.draw_text_clipped(
+                x + 8,
+                wy + 36,
+                iw - 16,
+                &format!("{}: {}_", tr(lang, "Поиск", "Find"), self.search_query),
+                0xFCD34D,
+                1,
+            );
+        }
         canvas.fill_rounded_rect(x, y, iw, ih, 10, 0x0B0E15);
         canvas.draw_rounded_rect_alpha(x, y, iw, ih, 10, 0xFFFFFF, 24);
         canvas.blend_rect(x + 12, y + 1, (iw - 24).max(0), 1, 0xFFFFFF, 16);
+        canvas.blend_rect(x + 28, y + 4, 1, (ih - 8).max(0), 0xFFFFFF, 14);
 
         let max_lines = ((ih - 8) / 15).max(1) as usize;
-        for (i, line) in self.lines.iter().take(max_lines).enumerate() {
-            let cursor = if i + 1 == self.lines.len() { "_" } else { "" };
+        let start = self.scroll.min(self.lines.len().saturating_sub(1));
+        for (row, line) in self.lines.iter().skip(start).take(max_lines).enumerate() {
+            let line_no = start + row + 1;
+            let ry = y + 8 + (row as i32) * 15;
+            let hit = !self.search_query.is_empty()
+                && line.to_lowercase().contains(&self.search_query.to_lowercase());
+            if hit {
+                canvas.blend_rect(x + 30, ry - 1, (iw - 34).max(0), 14, 0xF59E0B, 42);
+            }
+            canvas.draw_text_clipped(x + 4, ry, 22, &format!("{line_no:>2}"), 0x64748B, 1);
+            let cursor = if line_no == self.lines.len() && !self.search_mode { "_" } else { "" };
             canvas.draw_text_clipped(
-                x + 10,
-                y + 8 + (i as i32) * 15,
-                iw - 20,
+                x + 34,
+                ry,
+                iw - 40,
                 &format!("{line}{cursor}"),
-                0xE6EDF3,
+                if hit { 0xFDE68A } else { 0xE6EDF3 },
                 1,
             );
         }
 
         let by = wy + wh - 34;
+        canvas.draw_button(wx + 14, by, 72, 22, tr(lang, "Сохр.", "Save"), 0x238636, 0xFFFFFF, 0x3FB950);
         canvas.draw_button(
-            wx + 14,
+            wx + 92,
             by,
-            100,
+            62,
             22,
-            tr(lang, "Сохранить", "Save"),
-            0x238636,
+            tr(lang, "Поиск", "Find"),
+            if self.search_mode { 0xD97706 } else { 0x21262D },
             0xFFFFFF,
-            0x3FB950,
+            0xF59E0B,
         );
-        canvas.draw_button(
-            wx + 122,
-            by,
-            90,
-            22,
-            tr(lang, "Очистить", "Clear"),
-            0x21262D,
-            0xFFFFFF,
-            0x58A6FF,
-        );
-        canvas.draw_text_clipped(wx + 220, by + 5, ww - 230, &self.saved_msg, 0x8B949E, 1);
+        canvas.draw_button(wx + 160, by, 58, 22, tr(lang, "Отм.", "Undo"), 0x21262D, 0xFFFFFF, 0x8B5CF6);
+        canvas.draw_button(wx + 224, by, 60, 22, tr(lang, "Сбр.", "Clr"), 0x21262D, 0xFFFFFF, 0x58A6FF);
+
+        let chars: usize = self.lines.iter().map(|l| l.chars().count()).sum();
+        let words: usize = self.lines.iter().map(|l| l.split_whitespace().count()).sum();
+        let mark = if self.dirty { "*" } else { "" };
+        let stat = format!("{}L{} {}W {}C · {}", mark, self.lines.len(), words, chars, self.saved_msg);
+        canvas.draw_text_clipped(wx + 290, by + 5, (ww - 298).max(40), &stat, 0x94A3B8, 1);
     }
 }
 
@@ -1050,6 +1579,7 @@ pub enum SettingsAction {
     RefreshMetrics,
     OpenTerminal,
     OpenPizGet,
+    ResetDefaults,
 }
 
 pub const ACCENT_PALETTE: [u32; 5] = [
@@ -1091,6 +1621,11 @@ pub struct SettingsState {
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub persistent_island: bool,
+    pub aero_stars: bool,
+    pub vista_sidebar: bool,
+    pub night_shift: bool,
+    pub crt_scanlines: bool,
+    pub macos_buttons: bool,
     pub snake_tick_div: u64,
     pub device_name: String,
     pub editing_device: bool,
@@ -1099,7 +1634,7 @@ pub struct SettingsState {
     pub tab_pill_y: f32,
     pub tab_pill_vel: f32,
     pub tab_fade: f32,
-    pub toggle_anim: [f32; 9],
+    pub toggle_anim: [f32; 10],
     pub display_picker: Option<DisplayPicker>,
     pub picker_anim: f32,
     pub last_picker: Option<DisplayPicker>,
@@ -1124,6 +1659,11 @@ impl SettingsState {
             crosshair_cursor: false,
             show_clock: true,
             persistent_island: false,
+            aero_stars: true,
+            vista_sidebar: true,
+            night_shift: false,
+            crt_scanlines: false,
+            macos_buttons: false,
             snake_tick_div: 10,
             device_name: String::from("pizdOS PC"),
             editing_device: false,
@@ -1132,7 +1672,7 @@ impl SettingsState {
             tab_pill_y: 90.0,
             tab_pill_vel: 0.0,
             tab_fade: 1.0,
-            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0],
             display_picker: None,
             picker_anim: 0.0,
             last_picker: None,
@@ -1198,6 +1738,7 @@ impl SettingsState {
             self.show_clock,
             self.genie_minimize,
             self.persistent_island,
+            self.macos_buttons,
         ];
         let p_tgt = if self.display_picker.is_some() { 1.0 } else { 0.0 };
         if !self.animations {
@@ -1459,6 +2000,8 @@ impl SettingsState {
                     self.genie_minimize = !self.genie_minimize;
                 } else if (264..298).contains(&ly) {
                     self.persistent_island = !self.persistent_island;
+                } else if (298..332).contains(&ly) {
+                    self.macos_buttons = !self.macos_buttons;
                 }
             }
             SettingsPage::System => {
@@ -1473,6 +2016,8 @@ impl SettingsState {
                     self.glass_level = (self.glass_level + 1) % 3;
                 } else if (240..274).contains(&ly) {
                     return SettingsAction::RefreshMetrics;
+                } else if (282..310).contains(&ly) {
+                    return SettingsAction::ResetDefaults;
                 }
             }
             SettingsPage::About => {
@@ -1852,7 +2397,7 @@ impl SettingsState {
                 );
 
                 let c_y = wy + 60;
-                Self::draw_card_frame(canvas, x, c_y, iw, 238, 12);
+                Self::draw_card_frame(canvas, x, c_y, iw, 272, 12);
                 Self::draw_toggle_row(
                     canvas,
                     x,
@@ -1944,33 +2489,19 @@ impl SettingsState {
                     in_content && (264..298).contains(&hover_ly),
                     true,
                 );
-
-                let tip_y = wy + 306;
-                if tip_y + 38 <= wy + wh - 6 {
-                    Self::draw_card_frame(canvas, x, tip_y, iw, 42, 12);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 6.0, accent, 36);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 2.5, accent, 240);
-                    canvas.draw_text_clipped(
-                        x + 32,
-                        tip_y + 7,
-                        iw - 44,
-                        tr(lang, "Управление окнами", "Window Controls"),
-                        0xF1F5F9,
-                        1,
-                    );
-                    canvas.draw_text_clipped(
-                        x + 32,
-                        tip_y + 23,
-                        iw - 44,
-                        tr(
-                            lang,
-                            "Тяни любой край или угол окна для изменения размера",
-                            "Drag any window edge or corner to resize dynamically",
-                        ),
-                        0x8B949E,
-                        1,
-                    );
-                }
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 238,
+                    iw,
+                    34,
+                    0xFB7185,
+                    tr(lang, "Кнопки окон macOS", "macOS Traffic Lights"),
+                    self.toggle_anim[9],
+                    accent,
+                    in_content && (298..332).contains(&hover_ly),
+                    true,
+                );
             }
             SettingsPage::System => {
                 canvas.draw_text_clipped(
@@ -2095,6 +2626,18 @@ impl SettingsState {
                     in_content && (240..274).contains(&hover_ly),
                     true,
                 );
+                if wy + 310 <= wy + wh {
+                    canvas.draw_button(
+                        x,
+                        wy + 282,
+                        iw.min(180),
+                        26,
+                        tr(lang, "Сбросить настройки", "Reset Defaults"),
+                        0x7F1D1D,
+                        0xFECACA,
+                        0xF87171,
+                    );
+                }
             }
             SettingsPage::About => {
                 let (_, _, _, _, _, wp_rib) = self.theme.mesh_palette();
@@ -2125,10 +2668,10 @@ impl SettingsState {
                 canvas.draw_text_clipped(x + 18, y + 13, iw - 126, "pizdOS", 0xFFFFFF, 2);
                 let title_w = canvas.measure_text("pizdOS", 2);
                 let pill_x = x + 18 + title_w + 8;
-                if pill_x + 42 < x + iw - 96 {
-                    canvas.blend_rounded_rect(pill_x, y + 16, 36, 19, 9, 0xFFFFFF, 28);
-                    canvas.draw_rounded_rect_alpha(pill_x, y + 16, 36, 19, 9, 0xFFFFFF, 82);
-                    canvas.draw_text_clipped(pill_x + 9, y + 18, 24, "2.0", 0xFFFFFF, 1);
+                if pill_x + 62 < x + iw - 96 {
+                    canvas.blend_rounded_rect(pill_x, y + 16, 56, 19, 9, 0xFFFFFF, 28);
+                    canvas.draw_rounded_rect_alpha(pill_x, y + 16, 56, 19, 9, 0xFFFFFF, 82);
+                    canvas.draw_text_clipped(pill_x + 7, y + 18, 46, "2.1(00)", 0xFFFFFF, 1);
                 }
 
                 let sub_msg = if self.update_taps >= 5 {
@@ -2472,7 +3015,7 @@ impl SettingsState {
 
 
 // ---------------------------------------------------------------------------
-// 6. Calculator
+// 6. Calculator (Pro + Sci + History + OxygenOS Never Settle)
 // ---------------------------------------------------------------------------
 pub struct CalcState {
     pub display: String,
@@ -2481,6 +3024,7 @@ pub struct CalcState {
     pub clear_next: bool,
     pub never_settle: bool,
     pub flash: Option<(usize, f32)>,
+    pub history: Vec<String>,
 }
 
 const CALC_BUTTONS: [&str; 16] = [
@@ -2499,6 +3043,7 @@ impl CalcState {
             clear_next: false,
             never_settle: false,
             flash: None,
+            history: Vec::new(),
         }
     }
 
@@ -2525,6 +3070,38 @@ impl CalcState {
                 self.clear_next = false;
                 self.never_settle = false;
             }
+            "x2" => {
+                self.never_settle = false;
+                let v = self.display.parse::<i64>().unwrap_or(0);
+                let sq = v.saturating_mul(v);
+                self.push_hist(format!("{v}^2={sq}"));
+                self.display = sq.to_string();
+                self.clear_next = true;
+            }
+            "sq" => {
+                self.never_settle = false;
+                let v = self.display.parse::<i64>().unwrap_or(0);
+                if v < 0 {
+                    self.display = String::from("ERR");
+                } else {
+                    let r = (v as f64).sqrt().round() as i64;
+                    self.push_hist(format!("sqrt({v})={r}"));
+                    self.display = r.to_string();
+                }
+                self.clear_next = true;
+            }
+            "+-" => {
+                self.never_settle = false;
+                let v = self.display.parse::<i64>().unwrap_or(0);
+                self.display = (-v).to_string();
+            }
+            "%" => {
+                self.never_settle = false;
+                self.eval_pending();
+                self.acc = Some(self.display.parse::<i64>().unwrap_or(0));
+                self.op = Some('%');
+                self.clear_next = true;
+            }
             "+" | "-" | "*" | "/" => {
                 self.never_settle = false;
                 self.eval_pending();
@@ -2536,9 +3113,16 @@ impl CalcState {
                 if self.acc == Some(1) && self.op == Some('+') && self.clear_next {
                     self.display = String::from("Never Settle");
                     self.never_settle = true;
+                    self.push_hist(String::from("1+=NeverSettle"));
                 } else {
                     self.never_settle = false;
+                    let lhs = self.acc;
+                    let op = self.op;
+                    let rhs = self.display.parse::<i64>().unwrap_or(0);
                     self.eval_pending();
+                    if let (Some(a), Some(c)) = (lhs, op) {
+                        self.push_hist(format!("{a}{c}{rhs}={}", self.display));
+                    }
                 }
                 self.op = None;
                 self.acc = None;
@@ -2556,6 +3140,13 @@ impl CalcState {
         }
     }
 
+    fn push_hist(&mut self, entry: String) {
+        self.history.push(entry);
+        if self.history.len() > 6 {
+            self.history.remove(0);
+        }
+    }
+
     fn eval_pending(&mut self) {
         let Some(lhs) = self.acc else { return };
         let Some(op) = self.op else { return };
@@ -2565,6 +3156,7 @@ impl CalcState {
             '-' => Some(lhs.saturating_sub(rhs)),
             '*' => Some(lhs.saturating_mul(rhs)),
             '/' => lhs.checked_div(rhs),
+            '%' => lhs.checked_rem(rhs),
             _ => Some(rhs),
         };
         self.display = match res {
@@ -2584,6 +3176,7 @@ impl CalcState {
             KeyEvent::Char('-') => self.press("-"),
             KeyEvent::Char('*') => self.press("*"),
             KeyEvent::Char('/') => self.press("/"),
+            KeyEvent::Char('%') => self.press("%"),
             KeyEvent::Char('=') | KeyEvent::Enter => self.press("="),
             KeyEvent::Char('c') | KeyEvent::Char('C') => self.press("C"),
             KeyEvent::Backspace => {
@@ -2602,10 +3195,23 @@ impl CalcState {
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) {
+        let x0 = 12;
+        let iw = ww - 24;
+        if iw >= 40 && (78..=98).contains(&ly) {
+            let sw = iw / 4;
+            let idx = ((lx - x0) / sw).clamp(0, 3);
+            match idx {
+                0 => self.press("x2"),
+                1 => self.press("sq"),
+                2 => self.press("%"),
+                _ => self.press("+-"),
+            }
+            return;
+        }
         let gx = 12;
-        let gy = 82;
+        let gy = 102;
         let gw = ww - 24;
-        let gh = wh - 94;
+        let gh = wh - 112;
         if gw < 4 || gh < 4 || lx < gx || ly < gy || lx >= gx + gw || ly >= gy + gh {
             return;
         }
@@ -2624,8 +3230,8 @@ impl CalcState {
         let y = wy + 34;
         let iw = ww - 24;
         if self.never_settle {
-            canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x22080E);
-            canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xEF4444, 185);
+            canvas.fill_rounded_rect(x, y, iw, 40, 10, 0x22080E);
+            canvas.draw_rounded_rect_alpha(x, y, iw, 40, 10, 0xEF4444, 185);
             canvas.blend_rect(x + 12, y + 1, (iw - 24).max(0), 1, 0xF87171, 80);
             canvas.draw_text_clipped(x + 12, y + 3, iw - 24, "OnePlus · OxygenOS", 0xFCA5A5, 1);
             let scale = if canvas.measure_text(&self.display, 2) <= iw - 24 {
@@ -2636,16 +3242,33 @@ impl CalcState {
             let ty = if scale == 2 { y + 15 } else { y + 20 };
             canvas.draw_text_clipped(x + 12, ty, iw - 24, &self.display, 0xEF4444, scale);
         } else {
-            canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x090D14);
-            canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xFFFFFF, 26);
+            canvas.fill_rounded_rect(x, y, iw, 40, 10, 0x090D14);
+            canvas.draw_rounded_rect_alpha(x, y, iw, 40, 10, 0xFFFFFF, 26);
             if let (Some(a), Some(op)) = (self.acc, self.op) {
-                canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
+                canvas.draw_text_clipped(x + 12, y + 3, iw / 2, &format!("{a} {op}"), 0x79C0FF, 1);
+            } else if let Some(last) = self.history.last() {
+                canvas.draw_text_clipped(x + 12, y + 3, iw - 24, last, 0x64748B, 1);
             }
             canvas.draw_text_clipped(x + 12, y + 15, iw - 24, &self.display, 0xFFFFFF, 2);
         }
 
-        let gy = wy + 82;
-        let gh = wh - 94;
+        let sci_y = wy + 78;
+        let sw = iw / 4;
+        for (i, lbl) in ["x^2", "sqrt", "mod", "+/-"].iter().enumerate() {
+            canvas.draw_button(
+                x + (i as i32) * sw + 2,
+                sci_y,
+                sw - 4,
+                20,
+                lbl,
+                0x161D2C,
+                0x93C5FD,
+                0x334155,
+            );
+        }
+
+        let gy = wy + 102;
+        let gh = wh - 112;
         let col_w = iw / 4;
         let row_h = gh / 4;
 
@@ -2767,6 +3390,690 @@ impl MatrixState {
             0x21262D,
             0xFFFFFF,
             base_col,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Game 2048
+// ---------------------------------------------------------------------------
+pub struct Game2048State {
+    pub grid: [[u32; 4]; 4],
+    pub score: u32,
+    pub best: u32,
+    pub game_over: bool,
+    rng: u64,
+}
+
+impl Game2048State {
+    pub fn new() -> Self {
+        let mut g = Self {
+            grid: [[0; 4]; 4],
+            score: 0,
+            best: 0,
+            game_over: false,
+            rng: 0x2048_1337_CAFE_BABE,
+        };
+        g.spawn();
+        g.spawn();
+        g
+    }
+
+    pub fn reset(&mut self) {
+        self.grid = [[0; 4]; 4];
+        self.score = 0;
+        self.game_over = false;
+        self.spawn();
+        self.spawn();
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn spawn(&mut self) {
+        let mut empty = Vec::with_capacity(16);
+        for r in 0..4 {
+            for c in 0..4 {
+                if self.grid[r][c] == 0 {
+                    empty.push((r, c));
+                }
+            }
+        }
+        if empty.is_empty() {
+            return;
+        }
+        let rnd = self.next_rand();
+        let (r, c) = empty[(rnd as usize) % empty.len()];
+        self.grid[r][c] = if (rnd >> 8).is_multiple_of(10) { 4 } else { 2 };
+    }
+
+    fn slide_line(line: [u32; 4]) -> ([u32; 4], u32) {
+        let mut vals = [0u32; 4];
+        let mut len = 0usize;
+        for &v in &line {
+            if v != 0 {
+                vals[len] = v;
+                len += 1;
+            }
+        }
+        let mut out = [0u32; 4];
+        let mut out_len = 0usize;
+        let mut gain = 0u32;
+        let mut i = 0usize;
+        while i < len {
+            if i + 1 < len && vals[i] == vals[i + 1] {
+                let merged = vals[i] * 2;
+                out[out_len] = merged;
+                gain += merged;
+                out_len += 1;
+                i += 2;
+            } else {
+                out[out_len] = vals[i];
+                out_len += 1;
+                i += 1;
+            }
+        }
+        (out, gain)
+    }
+
+    fn can_move(&self) -> bool {
+        for r in 0..4 {
+            for c in 0..4 {
+                let v = self.grid[r][c];
+                if v == 0 {
+                    return true;
+                }
+                if r + 1 < 4 && self.grid[r + 1][c] == v {
+                    return true;
+                }
+                if c + 1 < 4 && self.grid[r][c + 1] == v {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// dir: 0=Left, 1=Right, 2=Up, 3=Down. Returns true if the board changed.
+    pub fn move_dir(&mut self, dir: u8) -> bool {
+        if self.game_over {
+            return false;
+        }
+        let prev = self.grid;
+        let mut gained = 0u32;
+        for i in 0..4 {
+            let line = match dir {
+                0 => self.grid[i],
+                1 => [self.grid[i][3], self.grid[i][2], self.grid[i][1], self.grid[i][0]],
+                2 => [self.grid[0][i], self.grid[1][i], self.grid[2][i], self.grid[3][i]],
+                _ => [self.grid[3][i], self.grid[2][i], self.grid[1][i], self.grid[0][i]],
+            };
+            let (slid, g) = Self::slide_line(line);
+            gained += g;
+            match dir {
+                0 => self.grid[i] = slid,
+                1 => self.grid[i] = [slid[3], slid[2], slid[1], slid[0]],
+                2 => {
+                    for (r, &v) in slid.iter().enumerate() {
+                        self.grid[r][i] = v;
+                    }
+                }
+                _ => {
+                    for (r, &v) in slid.iter().enumerate() {
+                        self.grid[3 - r][i] = v;
+                    }
+                }
+            }
+        }
+        if self.grid != prev {
+            self.score += gained;
+            if self.score > self.best {
+                self.best = self.score;
+            }
+            self.spawn();
+            self.game_over = !self.can_move();
+            true
+        } else {
+            self.game_over = !self.can_move();
+            false
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        match key {
+            KeyEvent::Left | KeyEvent::Char('a') | KeyEvent::Char('A') => {
+                self.move_dir(0);
+            }
+            KeyEvent::Right | KeyEvent::Char('d') | KeyEvent::Char('D') => {
+                self.move_dir(1);
+            }
+            KeyEvent::Up | KeyEvent::Char('w') | KeyEvent::Char('W') => {
+                self.move_dir(2);
+            }
+            KeyEvent::Down | KeyEvent::Char('s') | KeyEvent::Char('S') => {
+                self.move_dir(3);
+            }
+            KeyEvent::Char('r') | KeyEvent::Char('R') => self.reset(),
+            _ => {}
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) {
+        if ly >= wh - 34 && ly <= wh - 8 && (12..=112).contains(&lx) {
+            self.reset();
+            return;
+        }
+        // Optional D-pad click zones inside board quadrants when mouse-playing
+        let gx = 12;
+        let gy = 58;
+        let gw = ww - 24;
+        let gh = wh - 98;
+        if lx >= gx && lx < gx + gw && ly >= gy && ly < gy + gh {
+            let dx = lx - (gx + gw / 2);
+            let dy = ly - (gy + gh / 2);
+            if dx.abs() > dy.abs() {
+                self.move_dir(if dx < 0 { 0 } else { 1 });
+            } else {
+                self.move_dir(if dy < 0 { 2 } else { 3 });
+            }
+        }
+    }
+
+    fn tile_style(v: u32) -> (u32, u32) {
+        match v {
+            0 => (0x161D2B, 0x475569),
+            2 => (0x1E293B, 0xF8FAFC),
+            4 => (0x283548, 0xF8FAFC),
+            8 => (0x9A3412, 0xFFFFFF),
+            16 => (0xC2410C, 0xFFFFFF),
+            32 => (0xB91C1C, 0xFFFFFF),
+            64 => (0xDC2626, 0xFFFFFF),
+            128 => (0xCA8A04, 0xFFFFFF),
+            256 => (0xEAB308, 0x0F172A),
+            512 => (0x2563EB, 0xFFFFFF),
+            1024 => (0x7C3AED, 0xFFFFFF),
+            _ => (0x10B981, 0xFFFFFF),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
+        let x = wx + 12;
+        let y = wy + 34;
+        let iw = (ww - 24).max(160);
+        canvas.draw_text_clipped(
+            x,
+            y,
+            iw - 90,
+            &format!("{}: {}   Best: {}", tr(lang, "Счёт", "Score"), self.score, self.best),
+            0xF8FAFC,
+            1,
+        );
+        if self.game_over {
+            canvas.draw_text_clipped(x + iw - 82, y, 80, "GAME OVER", 0xF85149, 1);
+        }
+
+        let gx = x;
+        let gy = wy + 58;
+        let gw = iw;
+        let gh = (wh - 98).max(140);
+        canvas.fill_rounded_rect(gx, gy, gw, gh, 12, 0x0B0F19);
+        canvas.draw_rounded_rect_alpha(gx, gy, gw, gh, 12, 0xFFFFFF, 26);
+
+        let gap = 6;
+        let cw = ((gw - gap * 5) / 4).max(20);
+        let ch = ((gh - gap * 5) / 4).max(20);
+        for r in 0..4 {
+            for c in 0..4 {
+                let tx = gx + gap + (c as i32) * (cw + gap);
+                let ty = gy + gap + (r as i32) * (ch + gap);
+                let val = self.grid[r][c];
+                let (bg, fg) = Self::tile_style(val);
+                canvas.fill_rounded_rect(tx, ty, cw, ch, 8, bg);
+                canvas.draw_rounded_rect_alpha(tx, ty, cw, ch, 8, 0xFFFFFF, if val == 0 { 16 } else { 42 });
+                if val > 0 {
+                    let s = val.to_string();
+                    let scale = if val < 100 && cw >= 42 { 2 } else { 1 };
+                    let tw = canvas.measure_text(&s, scale);
+                    let th = if scale == 2 { 20 } else { 12 };
+                    canvas.draw_text_clipped(
+                        tx + ((cw - tw) / 2).max(2),
+                        ty + ((ch - th) / 2).max(2),
+                        cw - 4,
+                        &s,
+                        fg,
+                        scale,
+                    );
+                }
+            }
+        }
+
+        canvas.draw_button(
+            wx + 12,
+            wy + wh - 34,
+            100,
+            24,
+            tr(lang, "Новая (R)", "New (R)"),
+            0x1E293B,
+            0xF8FAFC,
+            accent,
+        );
+        canvas.draw_text_clipped(
+            wx + 122,
+            wy + wh - 28,
+            (ww - 134).max(40),
+            tr(lang, "Стрелки / WASD", "Arrows / WASD"),
+            0x94A3B8,
+            1,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. PizView (Zero-Dependency BMP Image Viewer)
+// ---------------------------------------------------------------------------
+pub struct PizViewState {
+    pub pixels: Vec<u32>,
+    pub img_w: usize,
+    pub img_h: usize,
+    pub title: String,
+    pub rot90: u8,
+    pub zoom2x: bool,
+    pub status: String,
+}
+
+impl PizViewState {
+    pub fn new(lang: Lang) -> Self {
+        let mut s = Self {
+            pixels: Vec::new(),
+            img_w: 64,
+            img_h: 64,
+            title: String::from("Sample"),
+            rot90: 0,
+            zoom2x: false,
+            status: String::from(tr(lang, "Открой .bmp в Файлах", "Open .bmp in Files")),
+        };
+        s.load_demo();
+        s
+    }
+
+    fn load_demo(&mut self) {
+        self.img_w = 64;
+        self.img_h = 64;
+        self.pixels.resize(64 * 64, 0);
+        for y in 0..64 {
+            for x in 0..64 {
+                let r = (x * 4) as u32;
+                let g = (y * 3) as u32;
+                let b = (140 + ((x ^ y) & 63) * 2).min(255) as u32;
+                self.pixels[y * 64 + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    pub fn open_bmp(&mut self, path: &Path, lang: Lang) -> Result<String, String> {
+        let data = fs::read(path).map_err(|e| format!("Read err: {e}"))?;
+        if data.len() < 54 || &data[0..2] != b"BM" {
+            return Err(String::from("Not a valid BMP"));
+        }
+        let off = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+        let w = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        let h_raw = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+        let bpp = u16::from_le_bytes([data[28], data[29]]);
+        let comp = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+        if w <= 0 || h_raw == 0 || (bpp != 24 && bpp != 32) || (comp != 0 && comp != 3) {
+            return Err(String::from("Unsupported BMP format"));
+        }
+        let iw = w as usize;
+        let ih = h_raw.unsigned_abs() as usize;
+        if iw > 4096 || ih > 4096 || iw * ih > 16_000_000 {
+            return Err(String::from("BMP too large"));
+        }
+        let top_down = h_raw < 0;
+        let bytes_pp = (bpp / 8) as usize;
+        let row_stride = (iw * bytes_pp).div_ceil(4) * 4;
+        if off + row_stride * ih > data.len() {
+            return Err(String::from("Truncated BMP data"));
+        }
+        let mut pix = vec![0u32; iw * ih];
+        for r in 0..ih {
+            let src_r = if top_down { r } else { ih - 1 - r };
+            let base = off + src_r * row_stride;
+            for c in 0..iw {
+                let p = base + c * bytes_pp;
+                let b = data[p] as u32;
+                let g = data[p + 1] as u32;
+                let red = data[p + 2] as u32;
+                pix[r * iw + c] = (red << 16) | (g << 8) | b;
+            }
+        }
+        self.pixels = pix;
+        self.img_w = iw;
+        self.img_h = ih;
+        self.rot90 = 0;
+        self.title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("image.bmp"));
+        self.status = format!("{} ({}x{})", self.title, iw, ih);
+        Ok(format!("{}: {}", tr(lang, "Открыт BMP", "Opened BMP"), self.title))
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, wh: i32) {
+        if ly >= wh - 34 && ly <= wh - 10 {
+            if (14..=96).contains(&lx) {
+                self.rot90 = (self.rot90 + 1) % 4;
+            } else if (102..=184).contains(&lx) {
+                self.zoom2x = !self.zoom2x;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
+        let vx = wx + 12;
+        let vy = wy + 34;
+        let vw = (ww - 24).max(40);
+        let vh = (wh - 76).max(40);
+        canvas.fill_rounded_rect(vx, vy, vw, vh, 10, 0x090D16);
+        canvas.draw_rounded_rect_alpha(vx, vy, vw, vh, 10, 0xFFFFFF, 26);
+
+        let (rw, rh) = if self.rot90 % 2 == 1 {
+            (self.img_h, self.img_w)
+        } else {
+            (self.img_w, self.img_h)
+        };
+        if rw > 0 && rh > 0 && !self.pixels.is_empty() {
+            let avail_w = (vw - 12).max(8) as f32;
+            let avail_h = (vh - 12).max(8) as f32;
+            let mut scale = (avail_w / rw as f32).min(avail_h / rh as f32);
+            if self.zoom2x {
+                scale *= 1.65;
+            }
+            let dw = ((rw as f32 * scale).round() as i32).clamp(4, vw - 8);
+            let dh = ((rh as f32 * scale).round() as i32).clamp(4, vh - 8);
+            let dx0 = vx + (vw - dw) / 2;
+            let dy0 = vy + (vh - dh) / 2;
+            for py in 0..dh {
+                for px in 0..dw {
+                    let rx = (px as usize * rw) / (dw as usize);
+                    let ry = (py as usize * rh) / (dh as usize);
+                    let (sx, sy) = match self.rot90 {
+                        1 => (ry, self.img_h - 1 - rx),
+                        2 => (self.img_w - 1 - rx, self.img_h - 1 - ry),
+                        3 => (self.img_w - 1 - ry, rx),
+                        _ => (rx, ry),
+                    };
+                    if sx < self.img_w && sy < self.img_h {
+                        canvas.fill_rect(dx0 + px, dy0 + py, 1, 1, self.pixels[sy * self.img_w + sx]);
+                    }
+                }
+            }
+        }
+
+        let by = wy + wh - 34;
+        canvas.draw_button(wx + 14, by, 82, 22, tr(lang, "Повор. 90", "Rot 90"), 0x1E293B, 0xFFFFFF, accent);
+        canvas.draw_button(
+            wx + 102,
+            by,
+            82,
+            22,
+            if self.zoom2x { "Zoom 1x" } else { "Zoom 2x" },
+            if self.zoom2x { accent } else { 0x1E293B },
+            0xFFFFFF,
+            accent,
+        );
+        canvas.draw_text_clipped(wx + 192, by + 5, (ww - 204).max(40), &self.status, 0x94A3B8, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. PizSweeper (Minesweeper 9x9)
+// ---------------------------------------------------------------------------
+pub const MS_N: usize = 9;
+pub const MS_MINES: usize = 10;
+
+pub struct MinesweeperState {
+    pub mines: [bool; MS_N * MS_N],
+    pub revealed: [bool; MS_N * MS_N],
+    pub flagged: [bool; MS_N * MS_N],
+    pub adj: [u8; MS_N * MS_N],
+    pub started: bool,
+    pub won: bool,
+    pub lost: bool,
+    pub flag_mode: bool,
+    rng: u64,
+}
+
+impl MinesweeperState {
+    pub fn new() -> Self {
+        Self {
+            mines: [false; MS_N * MS_N],
+            revealed: [false; MS_N * MS_N],
+            flagged: [false; MS_N * MS_N],
+            adj: [0; MS_N * MS_N],
+            started: false,
+            won: false,
+            lost: false,
+            flag_mode: false,
+            rng: 0xBADC_0FFE_EE11_2233,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.mines = [false; MS_N * MS_N];
+        self.revealed = [false; MS_N * MS_N];
+        self.flagged = [false; MS_N * MS_N];
+        self.adj = [0; MS_N * MS_N];
+        self.started = false;
+        self.won = false;
+        self.lost = false;
+    }
+
+    fn next_rand(&mut self) -> usize {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x as usize
+    }
+
+    fn place_mines(&mut self, safe_idx: usize) {
+        let mut placed = 0;
+        while placed < MS_MINES {
+            let idx = self.next_rand() % (MS_N * MS_N);
+            if idx != safe_idx && !self.mines[idx] {
+                self.mines[idx] = true;
+                placed += 1;
+            }
+        }
+        for r in 0..MS_N {
+            for c in 0..MS_N {
+                let mut cnt = 0u8;
+                for dr in -1i32..=1 {
+                    for dc in -1i32..=1 {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        let nr = r as i32 + dr;
+                        let nc = c as i32 + dc;
+                        if (0..MS_N as i32).contains(&nr)
+                            && (0..MS_N as i32).contains(&nc)
+                            && self.mines[nr as usize * MS_N + nc as usize]
+                        {
+                            cnt += 1;
+                        }
+                    }
+                }
+                self.adj[r * MS_N + c] = cnt;
+            }
+        }
+        self.started = true;
+    }
+
+    pub fn reveal_cell(&mut self, r: usize, c: usize) {
+        if self.won || self.lost || r >= MS_N || c >= MS_N {
+            return;
+        }
+        let idx = r * MS_N + c;
+        if self.flagged[idx] || self.revealed[idx] {
+            return;
+        }
+        if !self.started {
+            self.place_mines(idx);
+        }
+        if self.mines[idx] {
+            self.revealed[idx] = true;
+            self.lost = true;
+            for i in 0..(MS_N * MS_N) {
+                if self.mines[i] {
+                    self.revealed[i] = true;
+                }
+            }
+            return;
+        }
+        let mut stack = vec![(r, c)];
+        while let Some((cr, cc)) = stack.pop() {
+            let ci = cr * MS_N + cc;
+            if self.revealed[ci] || self.flagged[ci] || self.mines[ci] {
+                continue;
+            }
+            self.revealed[ci] = true;
+            if self.adj[ci] == 0 {
+                for dr in -1i32..=1 {
+                    for dc in -1i32..=1 {
+                        let nr = cr as i32 + dr;
+                        let nc = cc as i32 + dc;
+                        if (0..MS_N as i32).contains(&nr) && (0..MS_N as i32).contains(&nc) {
+                            stack.push((nr as usize, nc as usize));
+                        }
+                    }
+                }
+            }
+        }
+        let safe_left = (0..(MS_N * MS_N)).any(|i| !self.mines[i] && !self.revealed[i]);
+        if !safe_left {
+            self.won = true;
+        }
+    }
+
+    pub fn toggle_flag(&mut self, r: usize, c: usize) {
+        if self.won || self.lost || r >= MS_N || c >= MS_N {
+            return;
+        }
+        let idx = r * MS_N + c;
+        if !self.revealed[idx] {
+            self.flagged[idx] = !self.flagged[idx];
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32, right: bool) {
+        if !right && ly >= wh - 34 && ly <= wh - 8 {
+            if (12..=94).contains(&lx) {
+                self.reset();
+            } else if (100..=188).contains(&lx) {
+                self.flag_mode = !self.flag_mode;
+            }
+            return;
+        }
+        let gx = 12;
+        let gy = 56;
+        let gw = (ww - 24).max(36);
+        let gh = (wh - 96).max(36);
+        let cw = gw / MS_N as i32;
+        let ch = gh / MS_N as i32;
+        if lx >= gx && ly >= gy && lx < gx + cw * MS_N as i32 && ly < gy + ch * MS_N as i32 {
+            let c = ((lx - gx) / cw) as usize;
+            let r = ((ly - gy) / ch) as usize;
+            if right || self.flag_mode {
+                self.toggle_flag(r, c);
+            } else {
+                self.reveal_cell(r, c);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
+        let flags = self.flagged.iter().filter(|&&f| f).count() as i32;
+        let mines_left = MS_MINES as i32 - flags;
+        let st = if self.won {
+            tr(lang, "ПОБЕДА!", "YOU WIN!")
+        } else if self.lost {
+            tr(lang, "БАБАХ!", "BOOM!")
+        } else {
+            tr(lang, "Сапёр 9x9", "Minesweeper")
+        };
+        let st_col = if self.won {
+            0x34D399
+        } else if self.lost {
+            0xFB7185
+        } else {
+            0xE2E8F0
+        };
+        canvas.draw_text_clipped(wx + 14, wy + 36, ww - 28, &format!("{st}  ·  M:{mines_left}"), st_col, 1);
+
+        let gx = wx + 12;
+        let gy = wy + 56;
+        let gw = (ww - 24).max(36);
+        let gh = (wh - 96).max(36);
+        let cw = (gw / MS_N as i32).max(10);
+        let ch = (gh / MS_N as i32).max(10);
+
+        for r in 0..MS_N {
+            for c in 0..MS_N {
+                let idx = r * MS_N + c;
+                let cx = gx + (c as i32) * cw + 1;
+                let cy = gy + (r as i32) * ch + 1;
+                let bw = (cw - 2).max(6);
+                let bh = (ch - 2).max(6);
+                if self.revealed[idx] {
+                    if self.mines[idx] {
+                        canvas.fill_rounded_rect(cx, cy, bw, bh, 4, 0x991B1B);
+                        canvas.draw_text_clipped(cx + bw / 3, cy + bh / 4, bw, "*", 0xFECACA, 1);
+                    } else {
+                        canvas.fill_rounded_rect(cx, cy, bw, bh, 4, 0x0B101B);
+                        canvas.draw_rounded_rect_alpha(cx, cy, bw, bh, 4, 0xFFFFFF, 16);
+                        let n = self.adj[idx];
+                        if n > 0 {
+                            let col = match n {
+                                1 => 0x60A5FA,
+                                2 => 0x4ADE80,
+                                3 => 0xF87171,
+                                _ => 0xFBBF24,
+                            };
+                            canvas.draw_text_clipped(cx + bw / 3, cy + bh / 4, bw, &n.to_string(), col, 1);
+                        }
+                    }
+                } else {
+                    canvas.fill_rounded_rect(cx, cy, bw, bh, 4, 0x1E293B);
+                    canvas.draw_rounded_rect_alpha(cx, cy, bw, bh, 4, 0xFFFFFF, 42);
+                    if self.flagged[idx] {
+                        canvas.fill_aa_circle((cx + bw / 2) as f32, (cy + bh / 2) as f32, 3.6, 0xF97316, 255);
+                    }
+                }
+            }
+        }
+
+        let by = wy + wh - 34;
+        canvas.draw_button(wx + 12, by, 82, 22, tr(lang, "Новая", "New"), 0x1E293B, 0xFFFFFF, accent);
+        canvas.draw_button(
+            wx + 100,
+            by,
+            88,
+            22,
+            tr(lang, "Флаг", "Flag"),
+            if self.flag_mode { accent } else { 0x1E293B },
+            0xFFFFFF,
+            0xF97316,
         );
     }
 }

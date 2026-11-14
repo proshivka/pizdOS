@@ -1,4 +1,5 @@
 mod apps;
+mod config;
 mod desktop;
 mod font;
 mod gfx;
@@ -495,8 +496,8 @@ mod tests {
         }
         desktop.render(&mut canvas);
         assert!(desktop.cc_anim > 0.3);
-        // Click UI Scale 125% inside Control Center (idx 1 -> px = 1160 - 276 - 8 = 876, sx = 876 + 10 + 65 = 951, py = 720 - 36 - 266 - 6 = 412, scale_y = 412 + 170 = 582)
-        desktop.on_mouse_down(965, 594, 1160, 720);
+        // Click UI Scale 125% inside Control Center (ph = 298 -> py = 720 - 36 - 298 - 6 = 380, scale_y = 380 + 170 = 550)
+        desktop.on_mouse_down(965, 562, 1160, 720);
         assert_eq!(desktop.settings.ui_scale_pct, 125);
     }
 
@@ -614,9 +615,42 @@ mod tests {
         desktop.on_mouse_down(580, 22, 1160, 720);
         assert!(desktop.cc_open);
 
-        // Toggle Always-On Dynamic Island back off inside Control Center (py = 412, island_y = 614..640)
-        desktop.on_mouse_down(960, 624, 1160, 720);
+        // Toggle Always-On Dynamic Island back off inside Control Center (py = 380, island_y = 582..608)
+        desktop.on_mouse_down(960, 592, 1160, 720);
         assert!(!desktop.settings.persistent_island);
+    }
+
+    #[test]
+    fn test_vista_sidebar_aero_stars_night_shift_crt_and_config() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+        assert!(desktop.settings.vista_sidebar);
+        assert!(desktop.settings.aero_stars);
+
+        // Focus sticky note in Vista Sidebar (x = 1160 - 176 = 984, y = 272), type text, save & reload config
+        desktop.on_mouse_down(1020, 300, 1160, 720);
+        assert!(desktop.sticky_focused);
+        desktop.on_key(apps::KeyEvent::Char('!'));
+        desktop.on_key(apps::KeyEvent::Escape);
+        assert!(!desktop.sticky_focused);
+
+        desktop.settings.night_shift = true;
+        desktop.settings.crt_scanlines = true;
+        for _ in 0..5 {
+            desktop.on_tick();
+        }
+        desktop.render(&mut canvas);
+        assert!(canvas.pixels.iter().any(|&p| p != 0));
+
+        // Config round-trip on temp file
+        let tmp = std::env::temp_dir().join("pizsoft_test_cfg.conf");
+        config::save_config_to(&tmp, &desktop.settings, 42, "Hi\\nthere");
+        let mut reloaded = apps::SettingsState::new();
+        let persisted = config::load_config_from(&tmp, &mut reloaded);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(reloaded.night_shift);
+        assert!(reloaded.crt_scanlines);
+        assert_eq!(persisted.best_snake, 42);
     }
 
     #[test]
@@ -657,5 +691,211 @@ mod tests {
             desktop.render(&mut canvas);
             desktop.on_mouse_up();
         }
+    }
+
+    #[test]
+    fn test_stage2_game2048_switcher_lock_and_island() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+
+        // Open 2048, play moves, verify board updates & score progresses
+        desktop.focus_or_open(desktop::AppId::Game2048);
+        assert!(desktop.windows.last().unwrap().id == desktop::AppId::Game2048);
+        desktop.on_key(apps::KeyEvent::Left);
+        desktop.on_key(apps::KeyEvent::Down);
+        desktop.on_key(apps::KeyEvent::Right);
+        desktop.on_key(apps::KeyEvent::Up);
+        assert!(desktop.game2048.grid.iter().flatten().any(|&v| v > 0));
+
+        // Window Switcher (Alt+Tab / Ctrl+Tab) opens, cycles, and Enter switches
+        desktop.focus_or_open(desktop::AppId::Terminal);
+        desktop.on_key(apps::KeyEvent::SwitchWindows);
+        assert!(desktop.switcher_open);
+        desktop.render(&mut canvas);
+        desktop.on_key(apps::KeyEvent::Enter);
+        assert!(!desktop.switcher_open);
+
+        // DND blocks normal push_toast, while Island cycles Status -> Music -> Pomodoro -> Status
+        desktop.dnd = true;
+        desktop.toast = None;
+        desktop.push_toast("Suppressed", 0xFFFFFF);
+        assert!(desktop.toast.is_none());
+        desktop.cycle_island_mode();
+        assert_eq!(desktop.island_mode, desktop::IslandMode::Music);
+        desktop.render(&mut canvas);
+        desktop.cycle_island_mode();
+        assert_eq!(desktop.island_mode, desktop::IslandMode::Pomodoro);
+        desktop.render(&mut canvas);
+        desktop.cycle_island_mode();
+        assert_eq!(desktop.island_mode, desktop::IslandMode::Status);
+
+        // Lock screen engages on Ctrl+L and unlocks on Space/click
+        desktop.on_key(apps::KeyEvent::LockScreen);
+        assert!(desktop.locked);
+        desktop.render(&mut canvas);
+        desktop.on_key(apps::KeyEvent::Char(' '));
+        assert!(!desktop.locked);
+    }
+
+    #[test]
+    fn test_stage3_files_pizview_minesweeper_workspaces_and_clipboard() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+
+        // 1. Terminal autocomplete, history, pizfetch, theme command
+        desktop.focus_or_open(desktop::AppId::Terminal);
+        for c in "pizf".chars() {
+            desktop.on_key(apps::KeyEvent::Char(c));
+        }
+        desktop.on_key(apps::KeyEvent::Tab);
+        assert_eq!(desktop.terminal.input, "pizfetch");
+        desktop.on_key(apps::KeyEvent::Enter);
+        assert!(desktop.terminal.history.iter().any(|h| h == "pizfetch"));
+        desktop.on_key(apps::KeyEvent::Up);
+        assert_eq!(desktop.terminal.input, "pizfetch");
+        desktop.terminal.input.clear();
+        for c in "theme 2".chars() {
+            desktop.on_key(apps::KeyEvent::Char(c));
+        }
+        desktop.on_key(apps::KeyEvent::Enter);
+        assert_eq!(desktop.settings.theme, apps::ThemePreset::MatrixGlow);
+
+        // 2. Paint Undo + Eyedropper + Shape cycle
+        desktop.focus_or_open(desktop::AppId::Paint);
+        let pw = desktop.windows.last().unwrap().clone();
+        let before_px = desktop.paint.buf[30 * apps::PAINT_W + 30];
+        desktop.paint.paint_at(14 + 30, 36 + 30);
+        desktop.paint.end_stroke();
+        assert_ne!(desktop.paint.buf[30 * apps::PAINT_W + 30], before_px);
+        desktop.on_key(apps::KeyEvent::Undo);
+        assert_eq!(desktop.paint.buf[30 * apps::PAINT_W + 30], before_px);
+        let _ = desktop.paint.on_click(90, pw.h - 50, pw.h);
+        assert!(desktop.paint.eyedropper);
+        let _ = desktop.paint.on_click(150, pw.h - 50, pw.h);
+        assert_eq!(desktop.paint.shape, apps::PaintShape::Line);
+
+        // 3. Notepad typing, undo, clipboard Copy/Paste, Find
+        desktop.focus_or_open(desktop::AppId::Notepad);
+        let line_count_before = desktop.notepad.lines.len();
+        desktop.on_key(apps::KeyEvent::Char('X'));
+        assert!(desktop.notepad.dirty);
+        assert!(desktop.notepad.lines.last().unwrap().ends_with('X'));
+        desktop.on_key(apps::KeyEvent::Copy);
+        let clip = platform::paste_from_clipboard().expect("clipboard text");
+        assert!(clip.contains('X'));
+        desktop.on_key(apps::KeyEvent::Undo);
+        desktop.on_key(apps::KeyEvent::Paste(String::from("Y")));
+        assert!(desktop.notepad.lines.last().unwrap().ends_with('Y'));
+        desktop.on_key(apps::KeyEvent::Find);
+        assert!(desktop.notepad.search_mode);
+        assert_eq!(desktop.notepad.lines.len(), line_count_before);
+
+        // 4. Calc Sci strip (x^2) while keeping 1+= Easter Egg
+        desktop.focus_or_open(desktop::AppId::Calc);
+        desktop.calc.press("3");
+        desktop.calc.on_click(30, 88, 250, 300); // x^2
+        assert_eq!(desktop.calc.display, "9");
+        desktop.calc.press("C");
+        desktop.calc.press("1");
+        desktop.calc.press("+");
+        desktop.calc.press("=");
+        assert!(desktop.calc.never_settle);
+
+        // 5. Files CRUD + open .bmp in PizView + open .txt in Notepad
+        let tmp_dir = std::env::temp_dir().join("pizsoft_stage3_files_test");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let shot_bmp = tmp_dir.join("sample.bmp");
+        desktop.render(&mut canvas);
+        canvas.write_bmp(&shot_bmp).unwrap();
+
+        desktop.cwd = tmp_dir.clone();
+        desktop.reload_files();
+        desktop.focus_or_open(desktop::AppId::Files);
+        let fw = desktop.windows.last().unwrap().clone();
+        // [+File] button at win.x + 130, win.y + 60
+        desktop.on_mouse_down(fw.x + 130, fw.y + 60, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(tmp_dir.join("note_1.txt").exists());
+        // [Sort] button
+        desktop.on_mouse_down(fw.x + 75, fw.y + 60, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(desktop.file_sort_desc);
+        // Click row for sample.bmp -> opens PizView
+        let bmp_row = desktop.files.iter().position(|f| f.name == "sample.bmp").unwrap();
+        desktop.on_mouse_down(fw.x + 40, fw.y + 76 + (bmp_row as i32) * 18 + 6, 1160, 720);
+        desktop.on_mouse_up();
+        assert_eq!(desktop.windows.last().unwrap().id, desktop::AppId::PizView);
+        assert_eq!(desktop.pizview.img_w, 1160);
+        let vw = desktop.windows.last().unwrap().clone();
+        desktop.pizview.on_click(40, vw.h - 20, vw.h); // Rotate
+        desktop.pizview.on_click(130, vw.h - 20, vw.h); // Zoom 2x
+        assert_eq!(desktop.pizview.rot90, 1);
+        assert!(desktop.pizview.zoom2x);
+        // Click note_1.txt -> opens Notepad
+        desktop.focus_or_open(desktop::AppId::Files);
+        let note_row = desktop.files.iter().position(|f| f.name == "note_1.txt").unwrap();
+        desktop.on_mouse_down(fw.x + 40, fw.y + 76 + (note_row as i32) * 18 + 6, 1160, 720);
+        desktop.on_mouse_up();
+        assert_eq!(desktop.windows.last().unwrap().id, desktop::AppId::Notepad);
+        assert!(desktop.notepad.file_path.as_ref().is_some_and(|p| p.ends_with("note_1.txt")));
+        // Delete note_1.txt via [Del]
+        desktop.focus_or_open(desktop::AppId::Files);
+        let del_row = desktop.files.iter().position(|f| f.name == "note_1.txt").unwrap();
+        desktop.file_sel = del_row;
+        desktop.on_mouse_down(fw.x + 245, fw.y + 60, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(!tmp_dir.join("note_1.txt").exists());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 6. Minesweeper safe first reveal + right-click flag
+        desktop.focus_or_open(desktop::AppId::Minesweeper);
+        let mw = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(mw.x + 45, mw.y + 85, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(desktop.minesweeper.started);
+        assert!(!desktop.minesweeper.lost);
+        desktop.on_right_click(mw.x + mw.w - 30, mw.y + mw.h - 50, 1160, 720);
+        desktop.ctx_menu = None;
+
+        // 7. Workspaces & Show Desktop
+        desktop.on_key(apps::KeyEvent::Workspace(2));
+        assert_eq!(desktop.active_workspace, 2);
+        desktop.focus_or_open(desktop::AppId::Calc);
+        assert_eq!(desktop.windows.last().unwrap().workspace, 2);
+        desktop.on_key(apps::KeyEvent::ShowDesktop);
+        assert!(desktop.windows.last().unwrap().minimized);
+        desktop.on_key(apps::KeyEvent::ShowDesktop);
+        assert!(!desktop.windows.last().unwrap().minimized);
+        desktop.on_key(apps::KeyEvent::Workspace(1));
+        assert_eq!(desktop.active_workspace, 1);
+
+        // 8. Calendar popup + Notification History Clear + macOS Buttons + Reset Defaults
+        desktop.on_mouse_down(941, 700, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(desktop.cal_open);
+        assert!(!desktop.toast_history.is_empty());
+        desktop.render(&mut canvas);
+        desktop.on_mouse_down(1120, 720 - 36 - 310 - 8 + 162, 1160, 720);
+        desktop.on_mouse_up();
+        assert!(desktop.toast_history.is_empty());
+        desktop.cal_open = false;
+
+        desktop.focus_or_open(desktop::AppId::Settings);
+        desktop.settings.page = apps::SettingsPage::Taskbar;
+        desktop.settings.on_click(260, 310, 520, 344); // toggle macos_buttons
+        assert!(desktop.settings.macos_buttons);
+        let sw = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(sw.x + 49, sw.y + 14, 1160, 720); // green macOS traffic light -> maximize
+        desktop.on_mouse_up();
+        assert!(desktop.windows.last().unwrap().maximized);
+
+        let maxw = desktop.windows.last().unwrap().clone();
+        desktop.settings.page = apps::SettingsPage::System;
+        desktop.on_mouse_down(maxw.x + 240, maxw.y + 295, 1160, 720); // ResetDefaults
+        desktop.on_mouse_up();
+        assert!(!desktop.settings.macos_buttons);
+        assert_eq!(desktop.settings.theme, apps::ThemePreset::AuroraPeaks);
+        desktop.render(&mut canvas);
     }
 }

@@ -1,8 +1,69 @@
 use std::io;
+use std::sync::{Mutex, OnceLock};
 
 use crate::apps::KeyEvent;
 use crate::desktop::Desktop;
 use crate::gfx::Canvas;
+
+static MEM_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn mem_clip_set(text: &str) {
+    let lock = MEM_CLIPBOARD.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut guard) = lock.lock() {
+        guard.clear();
+        guard.push_str(text);
+    }
+}
+
+fn mem_clip_get() -> Option<String> {
+    let lock = MEM_CLIPBOARD.get_or_init(|| Mutex::new(String::new()));
+    lock.lock().ok().filter(|s| !s.is_empty()).map(|s| s.clone())
+}
+
+#[cfg(windows)]
+pub fn copy_to_clipboard(text: &str) {
+    mem_clip_set(text);
+    if !cfg!(test) {
+        win32::set_clipboard_text(text);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn copy_to_clipboard(text: &str) {
+    mem_clip_set(text);
+}
+
+#[cfg(windows)]
+pub fn paste_from_clipboard() -> Option<String> {
+    if cfg!(test) {
+        return mem_clip_get();
+    }
+    win32::get_clipboard_text().or_else(mem_clip_get)
+}
+
+#[cfg(not(windows))]
+pub fn paste_from_clipboard() -> Option<String> {
+    mem_clip_get()
+}
+
+#[cfg(target_os = "linux")]
+pub fn trigger_power_action(action: &str) -> bool {
+    let candidates: &[&str] = match action {
+        "poweroff" => &["/sbin/poweroff", "/usr/sbin/poweroff", "poweroff"],
+        _ => &["/sbin/reboot", "/usr/sbin/reboot", "reboot"],
+    };
+    for bin in candidates {
+        if std::process::Command::new(bin).spawn().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn trigger_power_action(_action: &str) -> bool {
+    false
+}
 
 #[cfg(windows)]
 pub fn run_gui() -> io::Result<()> {
@@ -24,18 +85,43 @@ mod linux_fb {
     use super::*;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::mem;
     use std::os::fd::AsRawFd;
     use std::thread;
     use std::time::Duration;
 
     const FBIOGET_VSCREENINFO: usize = 0x4600;
+    const FBIOGET_FSCREENINFO: usize = 0x4602;
+    const EVIOCGABS_X: usize = 0x8018_4540;
+    const EVIOCGABS_Y: usize = 0x8018_4541;
+    const TCGETS: usize = 0x5401;
+    const TCSETS: usize = 0x5402;
     const O_NONBLOCK: i32 = 0x800;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
 
+    const EV_SYN: u16 = 0x00;
+    const EV_KEY: u16 = 0x01;
+    const EV_REL: u16 = 0x02;
+    const EV_ABS: u16 = 0x03;
+    const REL_X: u16 = 0x00;
+    const REL_Y: u16 = 0x01;
+    const ABS_X: u16 = 0x00;
+    const ABS_Y: u16 = 0x01;
+    const BTN_LEFT: u16 = 0x110;
+    const BTN_RIGHT: u16 = 0x111;
+
     unsafe extern "C" {
         fn ioctl(fd: i32, request: usize, ...) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FbBitfield {
+        offset: u32,
+        length: u32,
+        msb_right: u32,
     }
 
     #[repr(C)]
@@ -47,7 +133,12 @@ mod linux_fb {
         xoffset: u32,
         yoffset: u32,
         bits_per_pixel: u32,
-        _rest: [u32; 32],
+        grayscale: u32,
+        red: FbBitfield,
+        green: FbBitfield,
+        blue: FbBitfield,
+        transp: FbBitfield,
+        _rest: [u32; 20],
     }
 
     impl Default for FbVarScreenInfo {
@@ -60,8 +151,128 @@ mod linux_fb {
                 xoffset: 0,
                 yoffset: 0,
                 bits_per_pixel: 0,
-                _rest: [0; 32],
+                grayscale: 0,
+                red: FbBitfield::default(),
+                green: FbBitfield::default(),
+                blue: FbBitfield::default(),
+                transp: FbBitfield::default(),
+                _rest: [0; 20],
             }
+        }
+    }
+
+    #[repr(C)]
+    struct FbFixScreenInfo {
+        id: [u8; 16],
+        smem_start: usize,
+        smem_len: u32,
+        fb_type: u32,
+        type_aux: u32,
+        visual: u32,
+        xpanstep: u16,
+        ypanstep: u16,
+        ywrapstep: u16,
+        line_length: u32,
+        mmio_start: usize,
+        mmio_len: u32,
+        accel: u32,
+        capabilities: u16,
+        reserved: [u16; 2],
+    }
+
+    impl Default for FbFixScreenInfo {
+        fn default() -> Self {
+            unsafe { mem::zeroed() }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct InputAbsInfo {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InputEvent {
+        tv_sec: isize,
+        tv_usec: isize,
+        kind: u16,
+        code: u16,
+        value: i32,
+    }
+
+    struct EvdevDevice {
+        file: File,
+        abs_x: Option<(i32, i32)>,
+        abs_y: Option<(i32, i32)>,
+    }
+
+    struct Modifiers {
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        caps: bool,
+    }
+
+    impl Modifiers {
+        fn new() -> Self {
+            Self {
+                shift: false,
+                ctrl: false,
+                alt: false,
+                caps: false,
+            }
+        }
+    }
+
+    struct RawTtyGuard {
+        fd: i32,
+        orig: [u32; 16],
+        active: bool,
+        orig_flags: i32,
+    }
+
+    impl RawTtyGuard {
+        fn enter() -> Self {
+            let fd = 0;
+            let mut termios = [0u32; 16];
+            let ok = unsafe { ioctl(fd, TCGETS, termios.as_mut_ptr()) } == 0;
+            let orig_flags = unsafe { fcntl(fd, F_GETFL) };
+            if orig_flags >= 0 {
+                unsafe { fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK) };
+            }
+            if ok {
+                let mut raw = termios;
+                raw[3] &= !(0x0002 | 0x0008); // clear ICANON | ECHO
+                unsafe { ioctl(fd, TCSETS, raw.as_ptr()) };
+            }
+            let _ = io::stdout().write_all(b"\x1b[?25l");
+            let _ = io::stdout().flush();
+            Self {
+                fd,
+                orig: termios,
+                active: ok,
+                orig_flags,
+            }
+        }
+    }
+
+    impl Drop for RawTtyGuard {
+        fn drop(&mut self) {
+            if self.orig_flags >= 0 {
+                unsafe { fcntl(self.fd, F_SETFL, self.orig_flags) };
+            }
+            if self.active {
+                unsafe { ioctl(self.fd, TCSETS, self.orig.as_ptr()) };
+            }
+            let _ = io::stdout().write_all(b"\x1b[?25h\x1b[2J\x1b[H");
+            let _ = io::stdout().flush();
         }
     }
 
@@ -75,6 +286,139 @@ mod linux_fb {
         }
     }
 
+    fn open_evdev_devices() -> Vec<EvdevDevice> {
+        let mut out = Vec::new();
+        for idx in 0..16 {
+            let path = format!("/dev/input/event{idx}");
+            if let Ok(file) = File::open(&path) {
+                set_nonblocking(&file);
+                let mut ax = InputAbsInfo::default();
+                let mut ay = InputAbsInfo::default();
+                let abs_x = if unsafe { ioctl(file.as_raw_fd(), EVIOCGABS_X, &mut ax) } >= 0
+                    && ax.maximum > ax.minimum
+                {
+                    Some((ax.minimum, ax.maximum))
+                } else {
+                    None
+                };
+                let abs_y = if unsafe { ioctl(file.as_raw_fd(), EVIOCGABS_Y, &mut ay) } >= 0
+                    && ay.maximum > ay.minimum
+                {
+                    Some((ay.minimum, ay.maximum))
+                } else {
+                    None
+                };
+                out.push(EvdevDevice { file, abs_x, abs_y });
+            }
+        }
+        out
+    }
+
+    fn map_evdev_key(code: u16, m: &Modifiers) -> Option<KeyEvent> {
+        if (m.alt && code == 57) || code == 60 || (m.ctrl && code == 37) {
+            return Some(KeyEvent::ToggleLauncher);
+        }
+        if code == 59 || (m.ctrl && code == 34) {
+            return Some(KeyEvent::ToggleControlCenter);
+        }
+        if (m.alt || m.ctrl) && code == 15 {
+            return Some(KeyEvent::SwitchWindows);
+        }
+        if m.ctrl {
+            return match code {
+                38 => Some(KeyEvent::LockScreen),  // L
+                32 => Some(KeyEvent::ShowDesktop), // D
+                46 => Some(KeyEvent::Copy),        // C
+                47 => paste_from_clipboard().map(KeyEvent::Paste), // V
+                31 => Some(KeyEvent::Save),        // S
+                33 => Some(KeyEvent::Find),        // F
+                44 => Some(KeyEvent::Undo),        // Z
+                2 => Some(KeyEvent::Workspace(1)), // 1
+                3 => Some(KeyEvent::Workspace(2)), // 2
+                4 => Some(KeyEvent::Workspace(3)), // 3
+                13 | 78 => Some(KeyEvent::ScaleDelta(1)),
+                12 | 74 => Some(KeyEvent::ScaleDelta(-1)),
+                11 => Some(KeyEvent::ScaleDelta(0)),
+                _ => None,
+            };
+        }
+
+        let upper = m.shift ^ m.caps;
+        let letter = match code {
+            30 => Some(('a', 'A')),
+            48 => Some(('b', 'B')),
+            46 => Some(('c', 'C')),
+            32 => Some(('d', 'D')),
+            18 => Some(('e', 'E')),
+            33 => Some(('f', 'F')),
+            34 => Some(('g', 'G')),
+            35 => Some(('h', 'H')),
+            23 => Some(('i', 'I')),
+            36 => Some(('j', 'J')),
+            37 => Some(('k', 'K')),
+            38 => Some(('l', 'L')),
+            50 => Some(('m', 'M')),
+            49 => Some(('n', 'N')),
+            24 => Some(('o', 'O')),
+            25 => Some(('p', 'P')),
+            16 => Some(('q', 'Q')),
+            19 => Some(('r', 'R')),
+            31 => Some(('s', 'S')),
+            20 => Some(('t', 'T')),
+            22 => Some(('u', 'U')),
+            47 => Some(('v', 'V')),
+            17 => Some(('w', 'W')),
+            45 => Some(('x', 'X')),
+            21 => Some(('y', 'Y')),
+            44 => Some(('z', 'Z')),
+            _ => None,
+        };
+        if let Some((lo, hi)) = letter {
+            return Some(KeyEvent::Char(if upper { hi } else { lo }));
+        }
+
+        let sym = match code {
+            2 => Some(('1', '!')),
+            3 => Some(('2', '@')),
+            4 => Some(('3', '#')),
+            5 => Some(('4', '$')),
+            6 => Some(('5', '%')),
+            7 => Some(('6', '^')),
+            8 => Some(('7', '&')),
+            9 => Some(('8', '*')),
+            10 => Some(('9', '(')),
+            11 => Some(('0', ')')),
+            12 => Some(('-', '_')),
+            13 => Some(('=', '+')),
+            26 => Some(('[', '{')),
+            27 => Some((']', '}')),
+            39 => Some((';', ':')),
+            40 => Some(('\'', '"')),
+            41 => Some(('`', '~')),
+            43 => Some(('\\', '|')),
+            51 => Some((',', '<')),
+            52 => Some(('.', '>')),
+            53 => Some(('/', '?')),
+            57 => Some((' ', ' ')),
+            _ => None,
+        };
+        if let Some((lo, hi)) = sym {
+            return Some(KeyEvent::Char(if m.shift { hi } else { lo }));
+        }
+
+        match code {
+            1 => Some(KeyEvent::Escape),
+            14 => Some(KeyEvent::Backspace),
+            15 => Some(KeyEvent::Tab),
+            28 | 96 => Some(KeyEvent::Enter),
+            103 => Some(KeyEvent::Up),
+            108 => Some(KeyEvent::Down),
+            105 => Some(KeyEvent::Left),
+            106 => Some(KeyEvent::Right),
+            _ => None,
+        }
+    }
+
     pub fn run_linux_fb() -> io::Result<()> {
         let mut fb = OpenOptions::new().read(true).write(true).open("/dev/fb0")?;
         let mut vinfo = FbVarScreenInfo::default();
@@ -82,22 +426,39 @@ mod linux_fb {
         if rc < 0 || vinfo.xres == 0 || vinfo.yres == 0 {
             return Err(io::Error::other("FBIOGET_VSCREENINFO failed on /dev/fb0"));
         }
+        let mut finfo = FbFixScreenInfo::default();
+        let frc = unsafe { ioctl(fb.as_raw_fd(), FBIOGET_FSCREENINFO, &mut finfo) };
 
+        let _tty = RawTtyGuard::enter();
         let w = vinfo.xres as usize;
         let h = vinfo.yres as usize;
+        let bpp = vinfo.bits_per_pixel.max(32) as usize;
+        let bytes_pp = (bpp / 8).clamp(2, 4);
+        let stride = if frc == 0 && finfo.line_length >= (w * bytes_pp) as u32 {
+            finfo.line_length as usize
+        } else {
+            w * bytes_pp
+        };
+
         let mut canvas = Canvas::new(w, h);
         let mut desktop = Desktop::new(w as i32, h as i32);
         let mut prev_scale = desktop.settings.ui_scale();
         canvas.set_ui_scale(prev_scale);
+        desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
 
+        let mut evdevs = open_evdev_devices();
         let mut mice = File::open("/dev/input/mice").ok();
         if let Some(ref m) = mice {
             set_nonblocking(m);
         }
 
-        let stdin = io::stdin();
-        let mut raw_buf = Vec::with_capacity(w * h * 4);
+        let mut stdin = io::stdin();
+        let mut frame_buf = vec![0u8; stride * h];
         let mut prev_right = false;
+        let mut mods = Modifiers::new();
+        let mut abs_norm_x: i32 = desktop.mouse_x;
+        let mut abs_norm_y: i32 = desktop.mouse_y;
+        let ev_size = mem::size_of::<InputEvent>();
 
         while desktop.running {
             let cur_scale = desktop.settings.ui_scale();
@@ -109,40 +470,203 @@ mod linux_fb {
             let log_w = canvas.logical_width();
             let log_h = canvas.logical_height();
 
+            // 1. Read Linux /dev/input/event* (keyboard + PS/2/USB mouse + QEMU tablet)
+            let mut buf = [0u8; 64 * 24];
+            let max_bytes = (buf.len() / ev_size) * ev_size;
+            for dev in &mut evdevs {
+                while let Ok(n) = dev.file.read(&mut buf[..max_bytes]) {
+                    if n < ev_size {
+                        break;
+                    }
+                    let mut moved_rel = (0i32, 0i32);
+                    let mut moved_abs = false;
+                    for chunk in buf[..n].chunks_exact(ev_size) {
+                        let ev: InputEvent =
+                            unsafe { mem::transmute_copy::<u8, InputEvent>(&chunk[0]) };
+                        match ev.kind {
+                            EV_KEY => {
+                                let down = ev.value != 0;
+                                match ev.code {
+                                    42 | 54 => mods.shift = down,
+                                    29 | 97 => mods.ctrl = down,
+                                    56 | 100 => mods.alt = down,
+                                    58 if ev.value == 1 => mods.caps = !mods.caps,
+                                    BTN_LEFT => {
+                                        if down && !desktop.mouse_down {
+                                            desktop.on_mouse_down(abs_norm_x, abs_norm_y, log_w, log_h);
+                                        } else if !down && desktop.mouse_down {
+                                            desktop.on_mouse_up();
+                                        }
+                                    }
+                                    BTN_RIGHT if ev.value == 1 => {
+                                        desktop.on_right_click(abs_norm_x, abs_norm_y, log_w, log_h);
+                                    }
+                                    _ if down => {
+                                        if let Some(kev) = map_evdev_key(ev.code, &mods) {
+                                            if kev == KeyEvent::Escape && !desktop.on_escape() {
+                                                desktop.running = false;
+                                            } else {
+                                                desktop.on_key(kev);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            EV_REL => match ev.code {
+                                REL_X => moved_rel.0 += ev.value,
+                                REL_Y => moved_rel.1 += ev.value,
+                                _ => {}
+                            },
+                            EV_ABS => match ev.code {
+                                ABS_X => {
+                                    if let Some((min, max)) = dev.abs_x {
+                                        let span = (max - min).max(1) as i64;
+                                        abs_norm_x = ((((ev.value - min) as i64) * log_w as i64)
+                                            / span)
+                                            .clamp(0, log_w - 1) as i32;
+                                        moved_abs = true;
+                                    }
+                                }
+                                ABS_Y => {
+                                    if let Some((min, max)) = dev.abs_y {
+                                        let span = (max - min).max(1) as i64;
+                                        abs_norm_y = ((((ev.value - min) as i64) * log_h as i64)
+                                            / span)
+                                            .clamp(0, log_h - 1) as i32;
+                                        moved_abs = true;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            EV_SYN => {
+                                if moved_abs || moved_rel != (0, 0) {
+                                    if !moved_abs {
+                                        abs_norm_x = (desktop.mouse_x + moved_rel.0).clamp(0, log_w - 1);
+                                        abs_norm_y = (desktop.mouse_y + moved_rel.1).clamp(0, log_h - 1);
+                                    }
+                                    desktop.on_mouse_move(abs_norm_x, abs_norm_y, log_w, log_h);
+                                    moved_rel = (0, 0);
+                                    moved_abs = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if moved_abs || moved_rel != (0, 0) {
+                        if !moved_abs {
+                            abs_norm_x = (desktop.mouse_x + moved_rel.0).clamp(0, log_w - 1);
+                            abs_norm_y = (desktop.mouse_y + moved_rel.1).clamp(0, log_h - 1);
+                        }
+                        desktop.on_mouse_move(abs_norm_x, abs_norm_y, log_w, log_h);
+                    }
+                }
+            }
+
+            // 2. Legacy /dev/input/mice fallback
             if let Some(ref mut m) = mice {
                 let mut pkt = [0u8; 3];
                 while m.read_exact(&mut pkt).is_ok() {
                     let buttons = pkt[0];
                     let dx = pkt[1] as i8 as i32;
                     let dy = -(pkt[2] as i8 as i32);
-                    let nx = desktop.mouse_x + dx;
-                    let ny = desktop.mouse_y + dy;
+                    abs_norm_x = (desktop.mouse_x + dx).clamp(0, log_w - 1);
+                    abs_norm_y = (desktop.mouse_y + dy).clamp(0, log_h - 1);
                     let left = (buttons & 1) != 0;
                     let right = (buttons & 2) != 0;
                     if left && !desktop.mouse_down {
-                        desktop.on_mouse_down(nx, ny, log_w, log_h);
+                        desktop.on_mouse_down(abs_norm_x, abs_norm_y, log_w, log_h);
                     } else if !left && desktop.mouse_down {
                         desktop.on_mouse_up();
                     } else {
-                        desktop.on_mouse_move(nx, ny, log_w, log_h);
+                        desktop.on_mouse_move(abs_norm_x, abs_norm_y, log_w, log_h);
                     }
                     if right && !prev_right {
-                        desktop.on_right_click(nx, ny, log_w, log_h);
+                        desktop.on_right_click(abs_norm_x, abs_norm_y, log_w, log_h);
                     }
                     prev_right = right;
                 }
             }
 
-            let _ = &stdin;
+            // 3. Stdin non-blocking ANSI keyboard fallback (if no evdev keyboard present)
+            let mut kbuf = [0u8; 32];
+            if let Ok(kn) = stdin.read(&mut kbuf) {
+                let mut i = 0;
+                while i < kn {
+                    let b = kbuf[i];
+                    if b == 0x1B {
+                        if i + 2 < kn && kbuf[i + 1] == b'[' {
+                            let ev = match kbuf[i + 2] {
+                                b'A' => Some(KeyEvent::Up),
+                                b'B' => Some(KeyEvent::Down),
+                                b'C' => Some(KeyEvent::Right),
+                                b'D' => Some(KeyEvent::Left),
+                                _ => None,
+                            };
+                            if let Some(k) = ev {
+                                desktop.on_key(k);
+                                i += 3;
+                                continue;
+                            }
+                        }
+                        if !desktop.on_escape() {
+                            desktop.running = false;
+                        }
+                    } else if b == b'\r' || b == b'\n' {
+                        desktop.on_key(KeyEvent::Enter);
+                    } else if b == 0x7F || b == 0x08 {
+                        desktop.on_key(KeyEvent::Backspace);
+                    } else if b == b'\t' {
+                        desktop.on_key(KeyEvent::Tab);
+                    } else if (0x20..0x7F).contains(&b) {
+                        desktop.on_key(KeyEvent::Char(b as char));
+                    }
+                    i += 1;
+                }
+            }
+
             desktop.on_tick();
             desktop.render(&mut canvas);
 
-            raw_buf.clear();
-            for &px in &canvas.pixels {
-                raw_buf.extend_from_slice(&px.to_le_bytes());
+            // Pack framebuffer supporting 32bpp, 24bpp, and 16bpp RGB565 + line_length stride
+            for y in 0..h {
+                let row_off = y * stride;
+                let src_row = &canvas.pixels[y * w..(y + 1) * w];
+                match bytes_pp {
+                    4 => {
+                        let rgb_order = vinfo.red.offset == 0;
+                        for (x, &px) in src_row.iter().enumerate() {
+                            let o = row_off + x * 4;
+                            let bytes = if rgb_order {
+                                [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF]
+                            } else {
+                                px.to_le_bytes()
+                            };
+                            frame_buf[o..o + 4].copy_from_slice(&bytes);
+                        }
+                    }
+                    3 => {
+                        for (x, &px) in src_row.iter().enumerate() {
+                            let o = row_off + x * 3;
+                            frame_buf[o] = px as u8;
+                            frame_buf[o + 1] = (px >> 8) as u8;
+                            frame_buf[o + 2] = (px >> 16) as u8;
+                        }
+                    }
+                    _ => {
+                        for (x, &px) in src_row.iter().enumerate() {
+                            let o = row_off + x * 2;
+                            let r = (px >> 19) & 0x1F;
+                            let g = (px >> 10) & 0x3F;
+                            let b = (px >> 3) & 0x1F;
+                            let v = ((r << 11) | (g << 5) | b) as u16;
+                            frame_buf[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                }
             }
             fb.seek(SeekFrom::Start(0))?;
-            fb.write_all(&raw_buf)?;
+            fb.write_all(&frame_buf)?;
             fb.flush()?;
 
             thread::sleep(Duration::from_millis(16));
@@ -176,6 +700,7 @@ mod win32 {
     const WM_RBUTTONDOWN: u32 = 0x0204;
     const WM_CAPTURECHANGED: u32 = 0x0215;
     const VK_BACK: usize = 0x08;
+    const VK_TAB: usize = 0x09;
     const VK_RETURN: usize = 0x0D;
     const VK_CONTROL: i32 = 0x11;
     const VK_MENU: i32 = 0x12;
@@ -186,8 +711,20 @@ mod win32 {
     const VK_RIGHT: usize = 0x27;
     const VK_DOWN: usize = 0x28;
     const VK_0: usize = 0x30;
+    const VK_1: usize = 0x31;
+    const VK_2: usize = 0x32;
+    const VK_3: usize = 0x33;
+    const VK_C: usize = 0x43;
+    const VK_D: usize = 0x44;
+    const VK_F: usize = 0x46;
     const VK_G: usize = 0x47;
     const VK_K: usize = 0x4B;
+    const VK_L: usize = 0x4C;
+    const VK_S: usize = 0x53;
+    const VK_V: usize = 0x56;
+    const VK_Z: usize = 0x5A;
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
     const VK_ADD: usize = 0x6B;
     const VK_SUBTRACT: usize = 0x6D;
     const VK_F1: usize = 0x70;
@@ -300,6 +837,11 @@ mod win32 {
         fn SetProcessDPIAware() -> i32;
         fn GetSystemMetrics(n_index: i32) -> i32;
         fn GetKeyState(n_virt_key: i32) -> i16;
+        fn OpenClipboard(h_wnd_new_owner: Hwnd) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(u_format: u32, h_mem: isize) -> isize;
+        fn GetClipboardData(u_format: u32) -> isize;
+        fn CloseClipboard() -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -325,6 +867,60 @@ mod win32 {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetModuleHandleW(lp_module_name: *const u16) -> Hinstance;
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> isize;
+        fn GlobalLock(h_mem: isize) -> *mut u16;
+        fn GlobalUnlock(h_mem: isize) -> i32;
+        fn GlobalFree(h_mem: isize) -> isize;
+    }
+
+    pub fn set_clipboard_text(text: &str) {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = wide.len() * 2;
+        unsafe {
+            if OpenClipboard(0) == 0 {
+                return;
+            }
+            EmptyClipboard();
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if h != 0 {
+                let ptr = GlobalLock(h);
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                    GlobalUnlock(h);
+                    if SetClipboardData(CF_UNICODETEXT, h) == 0 {
+                        GlobalFree(h);
+                    }
+                } else {
+                    GlobalFree(h);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+
+    pub fn get_clipboard_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(0) == 0 {
+                return None;
+            }
+            let h = GetClipboardData(CF_UNICODETEXT);
+            let mut result = None;
+            if h != 0 {
+                let ptr = GlobalLock(h);
+                if !ptr.is_null() {
+                    let mut len = 0usize;
+                    while *ptr.add(len) != 0 && len < 8192 {
+                        len += 1;
+                    }
+                    let slice = std::slice::from_raw_parts(ptr, len);
+                    result = Some(String::from_utf16_lossy(slice));
+                    GlobalUnlock(h);
+                }
+            }
+            CloseClipboard();
+            result
+        }
     }
 
     unsafe extern "system" fn wnd_proc(
@@ -489,6 +1085,9 @@ mod win32 {
                         if alt_down && msg.w_param == VK_SPACE {
                             desktop.on_key(KeyEvent::ToggleLauncher);
                             swallow = true;
+                        } else if alt_down && msg.w_param == VK_TAB {
+                            desktop.on_key(KeyEvent::SwitchWindows);
+                            swallow = true;
                         }
                     }
                     WM_SYSCHAR => {
@@ -506,6 +1105,41 @@ mod win32 {
                             swallow = true;
                         } else if msg.w_param == VK_F1 || (ctrl_down && msg.w_param == VK_G) {
                             desktop.on_key(KeyEvent::ToggleControlCenter);
+                            swallow = true;
+                        } else if (ctrl_down || alt_down) && msg.w_param == VK_TAB {
+                            desktop.on_key(KeyEvent::SwitchWindows);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_L {
+                            desktop.on_key(KeyEvent::LockScreen);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_D {
+                            desktop.on_key(KeyEvent::ShowDesktop);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_C {
+                            desktop.on_key(KeyEvent::Copy);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_V {
+                            if let Some(txt) = paste_from_clipboard() {
+                                desktop.on_key(KeyEvent::Paste(txt));
+                            }
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_S {
+                            desktop.on_key(KeyEvent::Save);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_F {
+                            desktop.on_key(KeyEvent::Find);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_Z {
+                            desktop.on_key(KeyEvent::Undo);
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_1 {
+                            desktop.on_key(KeyEvent::Workspace(1));
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_2 {
+                            desktop.on_key(KeyEvent::Workspace(2));
+                            swallow = true;
+                        } else if ctrl_down && msg.w_param == VK_3 {
+                            desktop.on_key(KeyEvent::Workspace(3));
                             swallow = true;
                         } else if ctrl_down && (msg.w_param == VK_OEM_PLUS || msg.w_param == VK_ADD)
                         {
@@ -531,6 +1165,7 @@ mod win32 {
                                 VK_RIGHT => desktop.on_key(KeyEvent::Right),
                                 VK_DOWN => desktop.on_key(KeyEvent::Down),
                                 VK_BACK => desktop.on_key(KeyEvent::Backspace),
+                                VK_TAB => desktop.on_key(KeyEvent::Tab),
                                 VK_RETURN => desktop.on_key(KeyEvent::Enter),
                                 _ => {}
                             }

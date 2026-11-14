@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintAction, PaintState, SettingsAction,
-    SettingsState, SnakeEvent, SnakeState, TerminalState, ThemePreset, UI_SCALES, tr,
+    CalcState, Game2048State, KeyEvent, Lang, MatrixState, MinesweeperState, NotepadState,
+    PaintAction, PaintState, PizViewState, SettingsAction, SettingsState, SnakeEvent, SnakeState,
+    TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
@@ -26,6 +27,9 @@ pub enum AppId {
     Settings,
     Calc,
     Matrix,
+    Game2048,
+    PizView,
+    Minesweeper,
 }
 
 impl AppId {
@@ -51,6 +55,11 @@ impl AppId {
             (AppId::Calc, Lang::En) => "Calculator",
             (AppId::Matrix, Lang::Ru) => "Матрица",
             (AppId::Matrix, Lang::En) => "Matrix",
+            (AppId::Game2048, _) => "2048",
+            (AppId::PizView, Lang::Ru) => "Просмотр",
+            (AppId::PizView, Lang::En) => "PizView",
+            (AppId::Minesweeper, Lang::Ru) => "Сапёр",
+            (AppId::Minesweeper, Lang::En) => "Sweeper",
         }
     }
 
@@ -66,15 +75,18 @@ impl AppId {
             AppId::Settings => 0xF85149,
             AppId::Calc => 0x38BDF8,
             AppId::Matrix => 0x22C55E,
+            AppId::Game2048 => 0xF59E0B,
+            AppId::PizView => 0x06B6D4,
+            AppId::Minesweeper => 0xF43F5E,
         }
     }
 
     pub fn min_size(self) -> (i32, i32) {
         match self {
             AppId::Settings => (440, 310),
-            AppId::Paint => (368, 268),
+            AppId::Paint => (368, 286),
             AppId::Snake => (316, 274),
-            AppId::Calc => (220, 260),
+            AppId::Calc | AppId::Game2048 | AppId::Minesweeper => (220, 260),
             _ => (250, 180),
         }
     }
@@ -194,6 +206,7 @@ pub struct Window {
     pub open: bool,
     pub minimized: bool,
     pub maximized: bool,
+    pub workspace: u8,
     pub saved_rect: (i32, i32, i32, i32),
     pub open_anim: f32,
     pub min_anim: f32,
@@ -213,6 +226,7 @@ impl Window {
             open,
             minimized: false,
             maximized: false,
+            workspace: 1,
             saved_rect: (x, y, w, h),
             open_anim: 1.0,
             min_anim: if open { 1.0 } else { 0.0 },
@@ -236,12 +250,15 @@ pub struct FileItem {
     pub path: PathBuf,
 }
 
-const START_ITEMS: [Option<AppId>; 11] = [
+const START_ITEMS: [Option<AppId>; 14] = [
     Some(AppId::Terminal),
     Some(AppId::Calc),
     Some(AppId::Paint),
     Some(AppId::Snake),
+    Some(AppId::Game2048),
+    Some(AppId::Minesweeper),
     Some(AppId::Notepad),
+    Some(AppId::PizView),
     Some(AppId::Matrix),
     Some(AppId::Files),
     Some(AppId::PizGet),
@@ -250,7 +267,7 @@ const START_ITEMS: [Option<AppId>; 11] = [
     None,
 ];
 
-const DESKTOP_ICONS: [(AppId, i32, i32, u32); 8] = [
+const DESKTOP_ICONS: [(AppId, i32, i32, u32); 11] = [
     (AppId::Terminal, 18, 42, 0x3FB950),
     (AppId::PizGet, 18, 114, 0xD29922),
     (AppId::Paint, 18, 186, 0xBC8CFF),
@@ -259,11 +276,31 @@ const DESKTOP_ICONS: [(AppId, i32, i32, u32); 8] = [
     (AppId::Settings, 18, 402, 0xF85149),
     (AppId::Calc, 102, 42, 0x38BDF8),
     (AppId::Matrix, 102, 114, 0x22C55E),
+    (AppId::Game2048, 102, 186, 0xF59E0B),
+    (AppId::PizView, 102, 258, 0x06B6D4),
+    (AppId::Minesweeper, 102, 330, 0xF43F5E),
 ];
 
 struct WallpaperCache {
     key: (usize, usize, ThemePreset, bool),
     pixels: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IslandMode {
+    Status,
+    Music,
+    Pomodoro,
+}
+
+#[derive(Clone, Copy)]
+struct AeroStar {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    life: f32,
+    size: f32,
 }
 
 pub struct Desktop {
@@ -289,10 +326,25 @@ pub struct Desktop {
     pub island_anim: f32,
     pub island_vel: f32,
     pub ripples: Vec<ClickRipple>,
+    stars: Vec<AeroStar>,
+    pub sticky_note: String,
+    pub sticky_focused: bool,
+    pub screenshot_req: std::cell::Cell<bool>,
+    pub locked: bool,
+    pub switcher_open: bool,
+    pub switcher_idx: usize,
+    pub dnd: bool,
+    pub island_mode: IslandMode,
+    pub pomo_ticks: u32,
+    pub active_workspace: u8,
+    pub cal_open: bool,
+    pub toast_history: Vec<String>,
+    pub last_title_click: Option<(AppId, u64)>,
+    pub file_sort_desc: bool,
     pub dock_float_anim: f32,
     pub dock_float_vel: f32,
     pub last_canvas_size: (i32, i32),
-    pub icon_hover: [f32; 8],
+    pub icon_hover: [f32; 11],
     pub mouse_x: i32,
     pub mouse_y: i32,
     pub mouse_down: bool,
@@ -331,6 +383,9 @@ pub struct Desktop {
     pub settings: SettingsState,
     pub calc: CalcState,
     pub matrix: MatrixState,
+    pub game2048: Game2048State,
+    pub pizview: PizViewState,
+    pub minesweeper: MinesweeperState,
 
     wp_cache: RefCell<WallpaperCache>,
     anim_canvas: RefCell<Canvas>,
@@ -342,6 +397,13 @@ enum LauncherKind {
     NextTheme,
     ToggleDock,
     RefreshMetrics,
+    LockScreen,
+    ToggleDnd,
+    CycleIslandMode,
+    TakeScreenshot,
+    ShowDesktop,
+    SwitchWorkspace(u8),
+    ToggleCalendar,
     SetScale(u16),
     MathCopy(f64),
 }
@@ -449,8 +511,22 @@ impl Desktop {
         let piz_root = env::var("PIZ_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
-        let settings = SettingsState::new();
+        let mut settings = SettingsState::new();
+        let persisted = crate::config::load_config(&mut settings);
         let lang = settings.lang;
+        let mut stars = Vec::with_capacity(28);
+        for i in 0..28 {
+            let ang = (i as f32) * 2.399_963;
+            let spd = 0.35 + ((i % 5) as f32) * 0.14;
+            stars.push(AeroStar {
+                x: 0.5 + ang.cos() * 0.12 * ((i % 4) as f32 + 1.0),
+                y: 0.5 + ang.sin() * 0.12 * ((i % 4) as f32 + 1.0),
+                vx: ang.cos() * spd * 0.0045,
+                vy: ang.sin() * spd * 0.0045,
+                life: (i as f32) / 28.0,
+                size: 1.4 + ((i % 3) as f32) * 0.9,
+            });
+        }
 
         let mut d = Self {
             running: true,
@@ -472,27 +548,45 @@ impl Desktop {
             last_snap: None,
             snap_anim: 0.0,
             toast: None,
-            island_anim: 0.0,
+            island_anim: if settings.persistent_island { 1.0 } else { 0.0 },
             island_vel: 0.0,
             ripples: Vec::with_capacity(8),
+            stars,
+            sticky_note: persisted.sticky_note,
+            sticky_focused: false,
+            screenshot_req: std::cell::Cell::new(false),
+            locked: false,
+            switcher_open: false,
+            switcher_idx: 0,
+            dnd: false,
+            island_mode: IslandMode::Status,
+            pomo_ticks: 25 * 60 * 30,
+            active_workspace: 1,
+            cal_open: false,
+            toast_history: Vec::new(),
+            last_title_click: None,
+            file_sort_desc: false,
             dock_float_anim: 0.0,
             dock_float_vel: 0.0,
             last_canvas_size: (width.max(320), height.max(240)),
-            icon_hover: [0.0; 8],
+            icon_hover: [0.0; 11],
             mouse_x: width / 2,
             mouse_y: height / 2,
             mouse_down: false,
             dragging: None,
             resizing: None,
             windows: vec![
-                Window::new(AppId::Files, 150, 70, 400, 300, false),
+                Window::new(AppId::Files, 150, 70, 420, 310, false),
                 Window::new(AppId::PizGet, 190, 90, 440, 310, false),
                 Window::new(AppId::Terminal, 120, 60, 450, 290, false),
-                Window::new(AppId::Paint, 240, 110, 368, 268, false),
+                Window::new(AppId::Paint, 240, 96, 368, 294, false),
                 Window::new(AppId::Snake, 280, 100, 320, 278, false),
-                Window::new(AppId::Notepad, 210, 130, 430, 270, false),
-                Window::new(AppId::Calc, 300, 90, 260, 310, false),
+                Window::new(AppId::Notepad, 210, 118, 456, 286, false),
+                Window::new(AppId::Calc, 300, 82, 276, 342, false),
                 Window::new(AppId::Matrix, 240, 80, 380, 280, false),
+                Window::new(AppId::Game2048, 340, 80, 276, 336, false),
+                Window::new(AppId::PizView, 220, 86, 360, 300, false),
+                Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
                 Window::new(AppId::System, 190, 26, 330, 268, true),
                 Window::new(AppId::Settings, 370, 90, 520, 344, true),
             ],
@@ -524,6 +618,9 @@ impl Desktop {
             settings,
             calc: CalcState::new(),
             matrix: MatrixState::new(),
+            game2048: Game2048State::new(),
+            pizview: PizViewState::new(lang),
+            minesweeper: MinesweeperState::new(),
 
             wp_cache: RefCell::new(WallpaperCache {
                 key: (0, 0, ThemePreset::AuroraPeaks, false),
@@ -536,15 +633,27 @@ impl Desktop {
             sys.minimized = true;
             sys.min_anim = 0.0;
         }
+        d.snake.best_score = persisted.best_snake;
         d.reload_packages();
         d.reload_files();
         d
     }
 
     pub fn push_toast(&mut self, text: impl Into<String>, color: u32) {
+        if self.dnd {
+            return;
+        }
+        self.force_toast(text, color);
+    }
+
+    pub fn force_toast(&mut self, text: impl Into<String>, color: u32) {
         let mut msg = text.into();
         if msg.chars().count() > 48 {
             msg = msg.chars().take(45).collect::<String>() + "...";
+        }
+        self.toast_history.push(msg.clone());
+        if self.toast_history.len() > 8 {
+            self.toast_history.remove(0);
         }
         self.toast = Some(Toast {
             text: msg,
@@ -562,6 +671,48 @@ impl Desktop {
             self.start_menu_open = false;
             self.ctx_menu = None;
             self.launcher_open = false;
+            self.cal_open = false;
+        }
+    }
+
+    pub fn toggle_calendar(&mut self) {
+        self.cal_open = !self.cal_open;
+        if self.cal_open {
+            self.start_menu_open = false;
+            self.cc_open = false;
+            self.ctx_menu = None;
+            self.launcher_open = false;
+        }
+    }
+
+    pub fn switch_workspace(&mut self, ws: u8) {
+        let target = ws.clamp(1, 3);
+        if self.active_workspace != target {
+            self.active_workspace = target;
+            self.dragging = None;
+            self.resizing = None;
+            self.switcher_open = false;
+            let lang = self.settings.lang;
+            self.push_toast(
+                format!("{} {target}", tr(lang, "Рабочий стол", "Workspace")),
+                self.settings.active_accent(),
+            );
+        }
+    }
+
+    pub fn toggle_show_desktop(&mut self) {
+        let ws = self.active_workspace;
+        let any_vis = self
+            .windows
+            .iter()
+            .any(|w| w.open && !w.minimized && w.workspace == ws);
+        for w in &mut self.windows {
+            if w.open && w.workspace == ws {
+                w.minimized = any_vis;
+                if !self.settings.animations {
+                    w.min_anim = if any_vis { 0.0 } else { 1.0 };
+                }
+            }
         }
     }
 
@@ -625,6 +776,9 @@ impl Desktop {
             (AppId::Notepad, "notepad notes блокнот заметки pizpad"),
             (AppId::Calc, "calc math калькулятор счет"),
             (AppId::Matrix, "matrix rain матрица"),
+            (AppId::Game2048, "2048 game puzzle игра плитки"),
+            (AppId::PizView, "bmp image photo viewer картинка просмотр фото"),
+            (AppId::Minesweeper, "minesweeper сапер игра мины"),
             (AppId::Files, "files explorer файлы проводник"),
             (AppId::PizGet, "pizget packages пакеты apt"),
             (AppId::System, "system cpu ram система монитор"),
@@ -666,6 +820,55 @@ impl Desktop {
                 0x3FB950,
                 LauncherKind::RefreshMetrics,
                 "refresh обновить cpu ram metrics",
+            ),
+            (
+                tr(lang, "Экран блокировки (Ctrl+L)", "Lock Screen (Ctrl+L)"),
+                tr(lang, "СИСТЕМА", "SYSTEM"),
+                0x818CF8,
+                LauncherKind::LockScreen,
+                "lock block блок пароль экран",
+            ),
+            (
+                tr(lang, "Не беспокоить (DND)", "Do Not Disturb (DND)"),
+                tr(lang, "РЕЖИМ", "MODE"),
+                0xC084FC,
+                LauncherKind::ToggleDnd,
+                "dnd quiet не беспокоить тишина",
+            ),
+            (
+                tr(lang, "Островок: Эквалайзер / Pomodoro", "Island: Equalizer / Pomodoro"),
+                tr(lang, "ОСТРОВ", "ISLAND"),
+                0x10B981,
+                LauncherKind::CycleIslandMode,
+                "music player equalizer pomodoro timer музыка таймер",
+            ),
+            (
+                tr(lang, "Скриншот рабочего стола", "Desktop Screenshot"),
+                tr(lang, "СНИМОК", "SHOT"),
+                0x38BDF8,
+                LauncherKind::TakeScreenshot,
+                "shot screenshot скриншот снимок bmp",
+            ),
+            (
+                tr(lang, "Показать рабочий стол (Ctrl+D)", "Show Desktop (Ctrl+D)"),
+                tr(lang, "ОКНА", "WIN"),
+                0x34D399,
+                LauncherKind::ShowDesktop,
+                "desktop minimize свернуть рабочий стол",
+            ),
+            (
+                tr(lang, "Календарь и уведомления", "Calendar & Notifications"),
+                tr(lang, "ТРЕЙ", "TRAY"),
+                0xF59E0B,
+                LauncherKind::ToggleCalendar,
+                "calendar notifications toast history календарь уведомления",
+            ),
+            (
+                tr(lang, "Рабочий стол 2 (Ctrl+2)", "Workspace 2 (Ctrl+2)"),
+                "WS 2",
+                accent,
+                LauncherKind::SwitchWorkspace(2),
+                "workspace 2 стол 2",
             ),
         ];
         for (lbl, badge, col, kind, keys) in actions {
@@ -721,6 +924,44 @@ impl Desktop {
                 self.refresh_metrics();
                 self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
             }
+            LauncherKind::LockScreen => {
+                self.launcher_open = false;
+                self.locked = true;
+            }
+            LauncherKind::ToggleDnd => {
+                self.launcher_open = false;
+                self.dnd = !self.dnd;
+                self.force_toast(
+                    if self.dnd {
+                        tr(lang, "DND включён", "Do Not Disturb ON")
+                    } else {
+                        tr(lang, "DND выключен", "Do Not Disturb OFF")
+                    },
+                    0xC084FC,
+                );
+            }
+            LauncherKind::CycleIslandMode => {
+                self.launcher_open = false;
+                self.settings.persistent_island = true;
+                self.cycle_island_mode();
+            }
+            LauncherKind::TakeScreenshot => {
+                self.launcher_open = false;
+                self.screenshot_req.set(true);
+                self.force_toast(tr(lang, "Скриншот сохранён", "Screenshot saved"), 0x38BDF8);
+            }
+            LauncherKind::ShowDesktop => {
+                self.launcher_open = false;
+                self.toggle_show_desktop();
+            }
+            LauncherKind::SwitchWorkspace(ws) => {
+                self.launcher_open = false;
+                self.switch_workspace(ws);
+            }
+            LauncherKind::ToggleCalendar => {
+                self.launcher_open = false;
+                self.toggle_calendar();
+            }
             LauncherKind::SetScale(pct) => {
                 self.launcher_open = false;
                 self.settings.ui_scale_pct = pct;
@@ -773,8 +1014,8 @@ impl Desktop {
                 }
             }
         }
-        dirs.sort_by(|a, b| a.name.cmp(&b.name));
-        reg.sort_by(|a, b| a.name.cmp(&b.name));
+        dirs.sort_by(|a, b| if self.file_sort_desc { b.name.cmp(&a.name) } else { a.name.cmp(&b.name) });
+        reg.sort_by(|a, b| if self.file_sort_desc { b.name.cmp(&a.name) } else { a.name.cmp(&b.name) });
         self.files.extend(dirs);
         self.files.extend(reg);
         self.file_sel = 0;
@@ -823,7 +1064,16 @@ impl Desktop {
     }
 
     pub fn on_escape(&mut self) -> bool {
+        if self.switcher_open {
+            self.switcher_open = false;
+            return true;
+        }
         if self.ctx_menu.take().is_some() {
+            return true;
+        }
+        if self.sticky_focused {
+            self.sticky_focused = false;
+            crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
             return true;
         }
         if self.launcher_open {
@@ -832,6 +1082,10 @@ impl Desktop {
         }
         if self.cc_open {
             self.cc_open = false;
+            return true;
+        }
+        if self.cal_open {
+            self.cal_open = false;
             return true;
         }
         if self.start_menu_open {
@@ -867,18 +1121,19 @@ impl Desktop {
         if open_count == 0 {
             return 100;
         }
-        let avail = (canvas_w - 310).max(120);
-        ((avail / open_count as i32) - 4).clamp(64, 130)
+        let avail = (canvas_w - 372).max(100);
+        ((avail / open_count as i32) - 4).clamp(56, 130)
     }
 
     fn taskbar_pill_rect(&self, canvas_w: i32, canvas_h: i32, id: AppId) -> (i32, i32, i32) {
         let (dock_x, task_y, dock_w, _, _) = self.taskbar_rect(canvas_w, canvas_h);
-        let open_count = self.windows.iter().filter(|w| w.open).count();
+        let ws = self.active_workspace;
+        let open_count = self.windows.iter().filter(|w| w.open && w.workspace == ws).count();
         let pill_w = self.taskbar_pill_width(dock_w, open_count);
         let pos = self
             .windows
             .iter()
-            .filter(|w| w.open)
+            .filter(|w| w.open && w.workspace == ws)
             .position(|w| w.id == id)
             .unwrap_or(0) as i32;
         (dock_x + 102 + pos * (pill_w + 4), task_y + 6, pill_w)
@@ -1013,6 +1268,24 @@ impl Desktop {
             }
             self.ripples.retain(|r| r.t < 1.0);
 
+            if self.settings.aero_stars {
+                for (i, s) in self.stars.iter_mut().enumerate() {
+                    s.x += s.vx * (0.7 + s.life);
+                    s.y += s.vy * (0.7 + s.life);
+                    s.life += 0.0085;
+                    if s.life >= 1.0 || s.x < -0.05 || s.x > 1.05 || s.y < -0.05 || s.y > 1.05 {
+                        let ang = ((self.tick as f32) * 0.37 + (i as f32) * 2.399_963)
+                            % core::f32::consts::TAU;
+                        let spd = 0.35 + ((i % 5) as f32) * 0.14;
+                        s.x = 0.5 + ang.cos() * 0.04;
+                        s.y = 0.5 + ang.sin() * 0.04;
+                        s.vx = ang.cos() * spd * 0.0045;
+                        s.vy = ang.sin() * spd * 0.0045;
+                        s.life = 0.0;
+                    }
+                }
+            }
+
             for (i, &(_, ix, iy, _)) in DESKTOP_ICONS.iter().enumerate() {
                 let hov = self.ctx_menu.is_none()
                     && !self.start_menu_open
@@ -1063,6 +1336,16 @@ impl Desktop {
         if self.tick.is_multiple_of(30) {
             self.refresh_metrics();
         }
+        if self.island_mode == IslandMode::Pomodoro {
+            if self.pomo_ticks > 0 {
+                self.pomo_ticks -= 1;
+            }
+            if self.pomo_ticks == 0 {
+                self.island_mode = IslandMode::Status;
+                self.pomo_ticks = 25 * 60 * 30;
+                self.force_toast(tr(self.settings.lang, "Pomodoro завершён!", "Pomodoro Done!"), 0x10B981);
+            }
+        }
         let div = self.settings.snake_tick_div.max(1);
         if self
             .windows
@@ -1072,6 +1355,7 @@ impl Desktop {
             if self.tick.is_multiple_of(div) {
                 match self.snake.step() {
                     SnakeEvent::NewBest(score) => {
+                        crate::config::save_config(&self.settings, score, &self.sticky_note);
                         let msg = format!(
                             "{}: {score}",
                             tr(self.settings.lang, "Новый рекорд", "New Best")
@@ -1107,6 +1391,7 @@ impl Desktop {
             let was_min = win.minimized;
             win.open = true;
             win.minimized = false;
+            win.workspace = self.active_workspace;
             win.close_anim = 1.0;
             if !was_open {
                 win.min_anim = 1.0;
@@ -1124,11 +1409,12 @@ impl Desktop {
     }
 
     fn toggle_taskbar_window(&mut self, id: AppId) {
+        let ws = self.active_workspace;
         let is_top_visible = self
             .windows
             .iter()
             .rev()
-            .find(|w| w.open && !w.minimized)
+            .find(|w| w.open && !w.minimized && w.workspace == ws)
             .is_some_and(|w| w.id == id);
 
         if is_top_visible {
@@ -1185,7 +1471,7 @@ impl Desktop {
     fn cc_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32) {
         let (dock_x, task_y, dock_w, dock_h, _) = self.taskbar_rect(canvas_w, canvas_h);
         let pw = 276;
-        let ph = 266;
+        let ph = 298;
         let px = (dock_x + dock_w - pw - 8).max(8);
         let py = if self.settings.taskbar_top {
             task_y + dock_h + 6
@@ -1196,28 +1482,105 @@ impl Desktop {
     }
 
     fn idle_island_text(&self) -> String {
-        let clock_or_up = if self.settings.show_clock {
-            &self.clock_str
-        } else {
-            &self.uptime
-        };
-        format!("pizdOS  ·  CPU {}%  ·  {}", self.cpu_pct, clock_or_up)
+        match self.island_mode {
+            IslandMode::Status => {
+                let clock_or_up = if self.settings.show_clock {
+                    &self.clock_str
+                } else {
+                    &self.uptime
+                };
+                if self.dnd {
+                    format!("DND  ·  pizdOS  ·  CPU {}%  ·  {}", self.cpu_pct, clock_or_up)
+                } else {
+                    format!("pizdOS  ·  CPU {}%  ·  {}", self.cpu_pct, clock_or_up)
+                }
+            }
+            IslandMode::Music => {
+                if self.dnd {
+                    String::from("DND  ·  pizdOS Lo-Fi  ·  Synth")
+                } else {
+                    String::from("pizdOS Lo-Fi  ·  Synthwave")
+                }
+            }
+            IslandMode::Pomodoro => {
+                let secs = self.pomo_ticks / 30;
+                format!("Pomodoro  ·  {:02}:{:02}", secs / 60, secs % 60)
+            }
+        }
     }
 
     fn idle_island_rect(&self, canvas_w: i32, canvas_h: i32, txt: &str) -> (i32, i32, i32, i32) {
         let text_w = crate::font::measure_text_scaled(txt, 1, 1.0);
-        let tw = (text_w + 48).clamp(164, (canvas_w - 32).max(164));
+        let tw = (text_w + 76).clamp(184, (canvas_w - 32).max(184));
         let th = 26;
         let tx = (canvas_w - tw) / 2;
         let ty = if self.settings.taskbar_top { canvas_h - 40 } else { 10 };
         (tx, ty, tw, th)
     }
 
+    fn switcher_rect(&self, canvas_w: i32, canvas_h: i32, count: usize) -> (i32, i32, i32, i32, i32, i32) {
+        let n = count.clamp(1, 7) as i32;
+        let gap = 8;
+        let bw = (n * 92 + (n - 1) * gap + 28).clamp(240, (canvas_w - 28).max(240));
+        let bh = 114;
+        let cw = ((bw - 28 - (n - 1) * gap) / n).max(36);
+        let bx = (canvas_w - bw) / 2;
+        let by = (canvas_h - bh) / 2;
+        (bx, by, bw, bh, cw, gap)
+    }
+
+    pub fn cycle_island_mode(&mut self) {
+        self.island_mode = match self.island_mode {
+            IslandMode::Status => IslandMode::Music,
+            IslandMode::Music => {
+                self.pomo_ticks = 25 * 60 * 30;
+                IslandMode::Pomodoro
+            }
+            IslandMode::Pomodoro => IslandMode::Status,
+        };
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
+        if self.locked {
+            if matches!(key, KeyEvent::Enter | KeyEvent::Char(' ') | KeyEvent::Escape) {
+                self.locked = false;
+            }
+            return;
+        }
         if key == KeyEvent::Escape && self.on_escape() {
             return;
         }
         match key {
+            KeyEvent::LockScreen => {
+                self.locked = true;
+                self.switcher_open = false;
+                self.start_menu_open = false;
+                self.cc_open = false;
+                self.launcher_open = false;
+                self.cal_open = false;
+                return;
+            }
+            KeyEvent::ShowDesktop => {
+                self.toggle_show_desktop();
+                return;
+            }
+            KeyEvent::Workspace(ws) => {
+                self.switch_workspace(ws);
+                return;
+            }
+            KeyEvent::SwitchWindows => {
+                let ws = self.active_workspace;
+                let count = self.windows.iter().filter(|w| w.open && w.workspace == ws).count();
+                if count > 0 {
+                    if !self.switcher_open {
+                        self.switcher_open = true;
+                        self.switcher_idx = if count > 1 { 1 } else { 0 };
+                    } else {
+                        self.switcher_idx = (self.switcher_idx + 1) % count;
+                    }
+                }
+                return;
+            }
             KeyEvent::ToggleLauncher => {
                 self.toggle_launcher();
                 return;
@@ -1246,6 +1609,68 @@ impl Desktop {
             _ => {}
         }
 
+        if self.switcher_open {
+            let ws = self.active_workspace;
+            let ids: Vec<AppId> = self.windows.iter().rev().filter(|w| w.open && w.workspace == ws).map(|w| w.id).collect();
+            match key {
+                KeyEvent::Right | KeyEvent::Down | KeyEvent::Tab => {
+                    if !ids.is_empty() {
+                        self.switcher_idx = (self.switcher_idx + 1) % ids.len();
+                    }
+                }
+                KeyEvent::Left | KeyEvent::Up => {
+                    if !ids.is_empty() {
+                        self.switcher_idx = (self.switcher_idx + ids.len() - 1) % ids.len();
+                    }
+                }
+                KeyEvent::Enter => {
+                    if let Some(&id) = ids.get(self.switcher_idx) {
+                        self.focus_or_open(id);
+                    }
+                    self.switcher_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.sticky_focused {
+            match key {
+                KeyEvent::Escape => {
+                    self.sticky_focused = false;
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                }
+                KeyEvent::Backspace => {
+                    self.sticky_note.pop();
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                }
+                KeyEvent::Enter => {
+                    if self.sticky_note.len() < 160 {
+                        self.sticky_note.push('\n');
+                        crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                    }
+                }
+                KeyEvent::Paste(txt) => {
+                    for c in txt.chars() {
+                        if !c.is_control() && self.sticky_note.len() < 160 {
+                            self.sticky_note.push(c);
+                        }
+                    }
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                }
+                KeyEvent::Copy => {
+                    crate::platform::copy_to_clipboard(&self.sticky_note);
+                    self.push_toast(tr(self.settings.lang, "Скопировано", "Copied"), 0xFCD34D);
+                }
+                KeyEvent::Char(c) if self.sticky_note.len() < 160 => {
+                    self.sticky_note.push(c);
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.launcher_open {
             let entries = self.launcher_entries();
             match key {
@@ -1266,6 +1691,14 @@ impl Desktop {
                     self.launcher_query.pop();
                     self.launcher_sel = 0;
                 }
+                KeyEvent::Paste(txt) => {
+                    for ch in txt.chars() {
+                        if !ch.is_control() && self.launcher_query.chars().count() < 36 {
+                            self.launcher_query.push(ch);
+                        }
+                    }
+                    self.launcher_sel = 0;
+                }
                 KeyEvent::Char(ch) if !ch.is_control() && self.launcher_query.chars().count() < 36 => {
                     self.launcher_query.push(ch);
                     self.launcher_sel = 0;
@@ -1275,14 +1708,68 @@ impl Desktop {
             return;
         }
 
-        let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized) else {
+        let ws = self.active_workspace;
+        let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized && w.workspace == ws) else {
             return;
         };
+        if key == KeyEvent::Copy {
+            let clip = match top.id {
+                AppId::Notepad => self.notepad.lines.join("\n"),
+                AppId::Terminal => {
+                    if !self.terminal.input.is_empty() {
+                        self.terminal.input.clone()
+                    } else {
+                        self.terminal.lines.last().cloned().unwrap_or_default()
+                    }
+                }
+                AppId::Calc => self.calc.display.clone(),
+                _ => String::new(),
+            };
+            if !clip.is_empty() {
+                crate::platform::copy_to_clipboard(&clip);
+                self.push_toast(tr(self.settings.lang, "Скопировано", "Copied"), self.settings.active_accent());
+            }
+            return;
+        }
         match top.id {
-            AppId::Terminal => self.terminal.on_key(key, &self.kernel, &self.mem),
+            AppId::Terminal => match self.terminal.on_key(key, &self.kernel, &self.mem) {
+                TermAction::None => {}
+                TermAction::SetTheme(idx) => {
+                    self.settings.theme = match idx {
+                        1 => ThemePreset::CrimsonSunset,
+                        2 => ThemePreset::MatrixGlow,
+                        3 => ThemePreset::OceanGlass,
+                        _ => ThemePreset::AuroraPeaks,
+                    };
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                    self.push_toast(
+                        self.settings.theme.name(self.settings.lang),
+                        self.settings.active_accent(),
+                    );
+                }
+                TermAction::SetScale(pct) => {
+                    let old_scale = self.settings.ui_scale();
+                    self.settings.ui_scale_pct = pct;
+                    let (cw, ch) = self.last_canvas_size;
+                    self.rescale_viewport(old_scale, cw, ch);
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                }
+            },
             AppId::Snake => self.snake.on_key(key),
-            AppId::Notepad => self.notepad.on_key(key),
+            AppId::Game2048 => self.game2048.on_key(key),
+            AppId::Notepad => {
+                let lang = self.settings.lang;
+                if let Some(msg) = self.notepad.on_key(key, lang) {
+                    self.status = msg.clone();
+                    self.push_toast(msg, 0x58A6FF);
+                }
+            }
             AppId::Calc => self.calc.on_key(key),
+            AppId::Paint => {
+                if key == KeyEvent::Undo && self.paint.undo() {
+                    self.push_toast(tr(self.settings.lang, "Отменено в Paint", "Paint Undo"), 0xBC8CFF);
+                }
+            }
             AppId::Settings => self.settings.on_key(key),
             _ => {}
         }
@@ -1361,7 +1848,12 @@ impl Desktop {
             && !self.launcher_open
             && !self.cc_open
             && !self.start_menu_open
-            && let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized)
+            && !self.cal_open
+            && let Some(top) = self
+                .windows
+                .iter()
+                .rev()
+                .find(|w| w.open && !w.minimized && w.workspace == self.active_workspace)
             && top.id == AppId::Paint
         {
             self.paint
@@ -1373,9 +1865,22 @@ impl Desktop {
         self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+        let ws = self.active_workspace;
+        if let Some(win) = self
+            .windows
+            .iter()
+            .rev()
+            .find(|w| w.open && !w.minimized && w.workspace == ws && x >= w.x && x < w.x + w.w && y >= w.y && y < w.y + w.h)
+            .cloned()
+            && win.id == AppId::Minesweeper
+        {
+            self.minesweeper.on_click(x - win.x, y - win.y, win.w, win.h, true);
+            return;
+        }
         self.start_menu_open = false;
         self.cc_open = false;
         self.launcher_open = false;
+        self.cal_open = false;
         let mx = x.min((canvas_w - 190).max(0));
         let my = y.min((canvas_h - 170).max(0));
         self.ctx_menu = Some((mx, my));
@@ -1394,6 +1899,32 @@ impl Desktop {
                 t: 0.0,
                 color: self.settings.active_accent(),
             });
+        }
+
+        if self.locked {
+            self.locked = false;
+            return;
+        }
+
+        if self.switcher_open {
+            let ws = self.active_workspace;
+            let ids: Vec<AppId> = self.windows.iter().rev().filter(|w| w.open && w.workspace == ws).map(|w| w.id).collect();
+            let shown = ids.len().min(7);
+            if shown > 0 {
+                let (bx, by, bw, bh, cw, gap) = self.switcher_rect(canvas_w, canvas_h, shown);
+                if x >= bx && x <= bx + bw && y >= by + 32 && y <= by + bh - 12 {
+                    for (i, &id) in ids.iter().take(7).enumerate() {
+                        let cx = bx + 14 + (i as i32) * (cw + gap);
+                        if x >= cx && x <= cx + cw {
+                            self.focus_or_open(id);
+                            self.switcher_open = false;
+                            return;
+                        }
+                    }
+                }
+            }
+            self.switcher_open = false;
+            return;
         }
 
         // 0. Right-click context menu hit test
@@ -1430,6 +1961,18 @@ impl Desktop {
 
         let (dock_x, task_y, dock_w, dock_h, _floating) = self.taskbar_rect(canvas_w, canvas_h);
         let lang_x = (dock_x + dock_w - 144).max(dock_x + 108);
+        let ws_hit = x >= dock_x
+            && x < dock_x + dock_w
+            && y >= task_y
+            && y < task_y + dock_h
+            && x >= lang_x - 122
+            && x <= lang_x - 94;
+        let cal_hit = x >= dock_x
+            && x < dock_x + dock_w
+            && y >= task_y
+            && y < task_y + dock_h
+            && x >= lang_x - 90
+            && x <= lang_x - 64;
         let search_hit = x >= dock_x
             && x < dock_x + dock_w
             && y >= task_y
@@ -1517,17 +2060,94 @@ impl Desktop {
                 let island_y = py + 202;
                 if y >= island_y && y <= island_y + 26 && x >= px + 10 && x <= px + pw - 10 {
                     self.settings.persistent_island = !self.settings.persistent_island;
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
                     return;
                 }
-                let foot_y = py + 234;
+                let fx_y = py + 234;
+                if y >= fx_y && y <= fx_y + 26 {
+                    for idx in 0..4 {
+                        let fx = px + 10 + idx * 65;
+                        if x >= fx && x <= fx + 61 {
+                            match idx {
+                                0 => self.settings.vista_sidebar = !self.settings.vista_sidebar,
+                                1 => self.settings.aero_stars = !self.settings.aero_stars,
+                                2 => self.settings.night_shift = !self.settings.night_shift,
+                                _ => self.settings.crt_scanlines = !self.settings.crt_scanlines,
+                            }
+                            crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                            return;
+                        }
+                    }
+                }
+                let foot_y = py + 266;
                 if y >= foot_y && y <= foot_y + 24 {
-                    self.refresh_metrics();
-                    self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
+                    if x >= px + pw - 72 {
+                        self.screenshot_req.set(true);
+                        self.cc_open = false;
+                        self.push_toast(
+                            tr(lang, "Скриншот сохранён", "Screenshot saved"),
+                            0x38BDF8,
+                        );
+                    } else {
+                        self.refresh_metrics();
+                        self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
+                    }
                 }
                 return;
             }
             if !cc_hit {
                 self.cc_open = false;
+            }
+        }
+
+        // 0d. Calendar + Notifications + Linux DE Power Popup
+        if self.cal_open {
+            let pw = 290;
+            let ph = 310;
+            let px = (dock_x + dock_w - pw - 8).max(8);
+            let py = if self.settings.taskbar_top {
+                task_y + dock_h + 6
+            } else {
+                (task_y - ph - 8).max(8)
+            };
+            if x >= px && x <= px + pw && y >= py && y <= py + ph {
+                let lang = self.settings.lang;
+                if y >= py + 154 && y <= py + 174 && x >= px + pw - 70 && x <= px + pw - 10 {
+                    self.toast_history.clear();
+                    return;
+                }
+                if y >= py + 274 && y <= py + 300 {
+                    if x >= px + 10 && x <= px + 96 {
+                        self.running = false;
+                    } else if x >= px + 102 && x <= px + 188 {
+                        if !crate::platform::trigger_power_action("reboot") {
+                            self.force_toast(
+                                tr(
+                                    lang,
+                                    "Доступно только в pizdOS Linux DE",
+                                    "Only available in real pizdOS Linux DE",
+                                ),
+                                0xF59E0B,
+                            );
+                        }
+                    } else if x >= px + 194
+                        && x <= px + 280
+                        && !crate::platform::trigger_power_action("poweroff")
+                    {
+                        self.force_toast(
+                            tr(
+                                lang,
+                                "Доступно только в pizdOS Linux DE",
+                                "Only available in real pizdOS Linux DE",
+                            ),
+                            0xF85149,
+                        );
+                    }
+                }
+                return;
+            }
+            if !cal_hit {
+                self.cal_open = false;
             }
         }
 
@@ -1566,7 +2186,16 @@ impl Desktop {
                 if self.start_menu_open {
                     self.cc_open = false;
                     self.launcher_open = false;
+                    self.cal_open = false;
                 }
+                return;
+            }
+            if ws_hit {
+                self.switch_workspace((self.active_workspace % 3) + 1);
+                return;
+            }
+            if cal_hit {
+                self.toggle_calendar();
                 return;
             }
             if search_hit {
@@ -1584,6 +2213,10 @@ impl Desktop {
                 };
                 return;
             }
+            if x >= dock_x + dock_w - 10 {
+                self.toggle_show_desktop();
+                return;
+            }
             if x > lang_x + 38 {
                 self.settings.show_clock = !self.settings.show_clock;
                 return;
@@ -1591,10 +2224,12 @@ impl Desktop {
 
             self.cc_open = false;
             self.launcher_open = false;
+            self.cal_open = false;
+            let ws = self.active_workspace;
             let open_ids: Vec<AppId> = self
                 .windows
                 .iter()
-                .filter(|w| w.open)
+                .filter(|w| w.open && w.workspace == ws)
                 .map(|w| w.id)
                 .collect();
             let pill_w = self.taskbar_pill_width(dock_w, open_ids.len());
@@ -1609,22 +2244,28 @@ impl Desktop {
             return;
         }
 
-        // 2b. Always-On Dynamic Island pill click (toggles Control Center)
+        // 2b. Always-On Dynamic Island pill click (left -> Control Center, right -> cycle mode)
         if self.settings.persistent_island && self.toast.is_none() {
             let txt = self.idle_island_text();
             let (ix, iy, iw, ih) = self.idle_island_rect(canvas_w, canvas_h, &txt);
             if x >= ix && x <= ix + iw && y >= iy && y <= iy + ih {
-                self.toggle_control_center();
+                if x >= ix + iw - 38 {
+                    self.cycle_island_mode();
+                } else {
+                    self.toggle_control_center();
+                }
                 return;
             }
         }
 
         // 3. Topmost visible window hit test (expanded 4px border zone for effortless edge-resize grabs)
+        let ws = self.active_workspace;
         let mut hit_idx = None;
         for (idx, win) in self.windows.iter().enumerate().rev() {
             let pad = if win.maximized { 0 } else { 4 };
             if win.open
                 && !win.minimized
+                && win.workspace == ws
                 && x >= win.x - pad
                 && x < win.x + win.w + pad
                 && y >= win.y - pad
@@ -1641,26 +2282,47 @@ impl Desktop {
             let top_idx = self.windows.len() - 1;
 
             if y >= win.y + 5 && y <= win.y + 23 {
-                // Close button [×]
-                if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 {
-                    self.windows[top_idx].open = false;
-                    self.dragging = None;
-                    self.resizing = None;
-                    return;
-                }
-                // Maximize/Restore button [□]
-                if x >= win.x + win.w - 49 && x <= win.x + win.w - 29 {
-                    self.toggle_maximize(top_idx, canvas_w, canvas_h);
-                    self.dragging = None;
-                    self.resizing = None;
-                    return;
-                }
-                // Minimize button [_]
-                if x >= win.x + win.w - 72 && x <= win.x + win.w - 52 {
-                    self.windows[top_idx].minimized = true;
-                    self.dragging = None;
-                    self.resizing = None;
-                    return;
+                if self.settings.macos_buttons {
+                    if x >= win.x + 6 && x <= win.x + 20 {
+                        self.windows[top_idx].open = false;
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
+                    if x >= win.x + 24 && x <= win.x + 38 {
+                        self.windows[top_idx].minimized = true;
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
+                    if x >= win.x + 42 && x <= win.x + 56 {
+                        self.toggle_maximize(top_idx, canvas_w, canvas_h);
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
+                } else {
+                    // Close [×]
+                    if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 {
+                        self.windows[top_idx].open = false;
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
+                    // Maximize/Restore button [□]
+                    if x >= win.x + win.w - 49 && x <= win.x + win.w - 29 {
+                        self.toggle_maximize(top_idx, canvas_w, canvas_h);
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
+                    // Minimize button [_]
+                    if x >= win.x + win.w - 72 && x <= win.x + win.w - 52 {
+                        self.windows[top_idx].minimized = true;
+                        self.dragging = None;
+                        self.resizing = None;
+                        return;
+                    }
                 }
             }
 
@@ -1677,6 +2339,17 @@ impl Desktop {
             }
 
             if y < win.y + 28 {
+                if let Some((prev_id, prev_t)) = self.last_title_click
+                    && prev_id == win.id
+                    && self.tick.saturating_sub(prev_t) <= 18
+                {
+                    self.last_title_click = None;
+                    self.toggle_maximize(top_idx, canvas_w, canvas_h);
+                    self.dragging = None;
+                    self.resizing = None;
+                    return;
+                }
+                self.last_title_click = Some((win.id, self.tick));
                 self.dragging = Some((win.id, x - win.x, y - win.y));
                 return;
             }
@@ -1686,7 +2359,20 @@ impl Desktop {
             return;
         }
 
-        // 4. Desktop icons
+        // 4. Desktop icons & Vista Sidebar Sticky Note
+        if self.sticky_focused {
+            self.sticky_focused = false;
+            crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+        }
+        if self.settings.vista_sidebar && canvas_w >= 540 {
+            let top_bar = if self.settings.taskbar_top { self.dock_reserve() } else { 0 };
+            let sx = canvas_w - 176;
+            let sy = top_bar + 272;
+            if x >= sx && x <= sx + 164 && y >= sy && y <= sy + 104 {
+                self.sticky_focused = true;
+                return;
+            }
+        }
         if self.settings.show_icons {
             for &(id, ix, iy, _) in &DESKTOP_ICONS {
                 if x >= ix - 4 && x <= ix + 74 && y >= iy - 2 && y <= iy + 58 {
@@ -1764,19 +2450,113 @@ impl Desktop {
                 }
             }
             AppId::Files => {
-                if ly >= 54 && ly < win.h - 16 {
-                    let row = ((ly - 54) / 18) as usize;
+                if (50..=70).contains(&ly) {
+                    if (14..=48).contains(&lx) {
+                        if let Some(p) = self.cwd.parent().map(|p| p.to_path_buf()) {
+                            self.cwd = p;
+                            self.reload_files();
+                        }
+                    } else if (52..=102).contains(&lx) {
+                        self.file_sort_desc = !self.file_sort_desc;
+                        self.reload_files();
+                    } else if (106..=164).contains(&lx) {
+                        let mut n = 1;
+                        let target = loop {
+                            let cand = self.cwd.join(format!("note_{n}.txt"));
+                            if !cand.exists() {
+                                break cand;
+                            }
+                            n += 1;
+                        };
+                        match fs::write(&target, "pizdOS 2.1(00) note\n") {
+                            Ok(()) => {
+                                let name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                self.reload_files();
+                                self.push_toast(format!("{}: {name}", tr(lang, "Создан", "Created")), 0x3FB950);
+                            }
+                            Err(e) => self.push_toast(format!("Err: {e}"), 0xF85149),
+                        }
+                    } else if (168..=224).contains(&lx) {
+                        let mut n = 1;
+                        let target = loop {
+                            let cand = self.cwd.join(format!("dir_{n}"));
+                            if !cand.exists() {
+                                break cand;
+                            }
+                            n += 1;
+                        };
+                        match fs::create_dir(&target) {
+                            Ok(()) => {
+                                let name = target.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                self.reload_files();
+                                self.push_toast(format!("{}: {name}", tr(lang, "Папка", "Folder")), 0x3FB950);
+                            }
+                            Err(e) => self.push_toast(format!("Err: {e}"), 0xF85149),
+                        }
+                    } else if (228..=278).contains(&lx)
+                        && let Some(entry) = self.files.get(self.file_sel).cloned()
+                        && entry.name != ".."
+                    {
+                        let res = if entry.is_dir {
+                            fs::remove_dir(&entry.path)
+                        } else {
+                            fs::remove_file(&entry.path)
+                        };
+                        match res {
+                            Ok(()) => {
+                                self.reload_files();
+                                self.push_toast(
+                                    format!("{}: {}", tr(lang, "Удалён", "Deleted"), entry.name),
+                                    0xF59E0B,
+                                );
+                            }
+                            Err(e) => self.push_toast(format!("Err: {e}"), 0xF85149),
+                        }
+                    }
+                    return;
+                }
+                if ly >= 76 && ly < win.h - 16 {
+                    let row = ((ly - 76) / 18) as usize;
                     if let Some(entry) = self.files.get(row).cloned() {
                         self.file_sel = row;
                         if entry.is_dir {
                             self.cwd = entry.path;
                             self.reload_files();
+                        } else if entry
+                            .path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("bmp"))
+                        {
+                            match self.pizview.open_bmp(&entry.path, lang) {
+                                Ok(msg) => {
+                                    self.status = msg.clone();
+                                    self.push_toast(msg, 0x38BDF8);
+                                    self.focus_or_open(AppId::PizView);
+                                }
+                                Err(err) => {
+                                    self.status = err.clone();
+                                    self.push_toast(err, 0xF85149);
+                                }
+                            }
                         } else {
-                            self.status = format!("Fayl: {}", entry.name);
+                            match self.notepad.open_file(&entry.path, lang) {
+                                Ok(msg) => {
+                                    self.status = msg.clone();
+                                    self.push_toast(msg, 0x58A6FF);
+                                    self.focus_or_open(AppId::Notepad);
+                                }
+                                Err(err) => {
+                                    self.status = err.clone();
+                                    self.push_toast(err, 0xF85149);
+                                }
+                            }
                         }
                     }
                 }
             }
+            AppId::PizView => self.pizview.on_click(lx, ly, win.h),
+            AppId::Minesweeper => self.minesweeper.on_click(lx, ly, win.w, win.h, false),
             AppId::Paint => match self.paint.on_click(lx, ly, win.h) {
                 PaintAction::None => {}
                 PaintAction::Saved(path) => {
@@ -1799,6 +2579,7 @@ impl Desktop {
                 }
             }
             AppId::Calc => self.calc.on_click(lx, ly, win.w, win.h),
+            AppId::Game2048 => self.game2048.on_click(lx, ly, win.w, win.h),
             AppId::Matrix => {
                 if ly >= win.h - 32 && ly <= win.h - 8 && (12..=142).contains(&lx) {
                     self.matrix.cycle_color();
@@ -1807,7 +2588,14 @@ impl Desktop {
             AppId::Settings => {
                 let old_scale = self.settings.ui_scale();
                 let prev_dock = self.settings.floating_dock;
+                let prev_taps = self.settings.update_taps;
                 let action = self.settings.on_click(lx, ly, win.w, win.h);
+                if self.settings.update_taps >= 5 && prev_taps < 5 {
+                    self.force_toast(
+                        tr(lang, "Режим разработчика 2.1(00) активирован!", "Developer Mode 2.1(00) unlocked!"),
+                        0xA855F7,
+                    );
+                }
                 if self.settings.floating_dock != prev_dock {
                     self.on_viewport_resize(canvas_w, canvas_h);
                 }
@@ -1822,6 +2610,7 @@ impl Desktop {
                         self.settings.active_accent(),
                     );
                 }
+                crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
                 match action {
                     SettingsAction::None => {}
                     SettingsAction::RefreshMetrics => {
@@ -1833,6 +2622,22 @@ impl Desktop {
                     }
                     SettingsAction::OpenTerminal => self.focus_or_open(AppId::Terminal),
                     SettingsAction::OpenPizGet => self.focus_or_open(AppId::PizGet),
+                    SettingsAction::ResetDefaults => {
+                        let old_scale = self.settings.ui_scale();
+                        self.settings = SettingsState::new();
+                        self.sticky_note = crate::config::PersistedState::default().sticky_note;
+                        self.rescale_viewport(old_scale, canvas_w, canvas_h);
+                        self.on_viewport_resize(canvas_w, canvas_h);
+                        crate::config::save_config(
+                            &self.settings,
+                            self.snake.best_score,
+                            &self.sticky_note,
+                        );
+                        self.force_toast(
+                            tr(lang, "Настройки сброшены", "Settings reset to defaults"),
+                            0xF59E0B,
+                        );
+                    }
                 }
             }
             AppId::Terminal => {}
@@ -1870,11 +2675,21 @@ impl Desktop {
             canvas.pixels.copy_from_slice(&wp.pixels);
         }
 
+        // 1b. Longhorn 4074 Aero Stars
+        if self.settings.aero_stars {
+            self.draw_aero_stars(canvas, w, h, accent);
+        }
+
         // 2. Desktop Icons (with smooth spring hover lift)
         if self.settings.show_icons {
             for (idx, &(id, ix, iy, col)) in DESKTOP_ICONS.iter().enumerate() {
                 self.draw_desktop_icon(canvas, idx, ix, iy, id, id.title(lang), col);
             }
+        }
+
+        // 2a. Windows Vista Sidebar Gadgets (Analog Clock, CPU/RAM Gauges, Sticky Note)
+        if self.settings.vista_sidebar && w >= 540 {
+            self.draw_vista_sidebar(canvas, w, h, accent);
         }
 
         // 2b. Window Snap Zone Preview (below active windows)
@@ -1892,15 +2707,19 @@ impl Desktop {
         }
 
         // 3. Visible & Animating Windows (non-linear Genie / Spring Morph / Back Pop-In)
+        let ws = self.active_workspace;
         let top_vis = self
             .windows
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, win)| win.open && !win.minimized)
+            .find(|(_, win)| win.open && !win.minimized && win.workspace == ws)
             .map(|(i, _)| i);
 
         for (idx, win) in self.windows.iter().enumerate() {
+            if win.workspace != ws {
+                continue;
+            }
             let focused = Some(idx) == top_vis;
             if !win.open {
                 if anim && win.close_anim > 0.01 {
@@ -2068,7 +2887,7 @@ impl Desktop {
             .windows
             .iter()
             .enumerate()
-            .filter(|(_, win)| win.open)
+            .filter(|(_, win)| win.open && win.workspace == ws)
             .collect();
         let pill_w = self.taskbar_pill_width(dock_w, open_wins.len());
         let mut bx = dock_x + 102;
@@ -2120,12 +2939,47 @@ impl Desktop {
         }
 
         let lang_x = (dock_x + dock_w - 144).max(bx + 8);
+        // Workspace pill [W1..W3]
+        let ws_x = lang_x - 122;
+        let ws_hov = self.mouse_x >= ws_x
+            && self.mouse_x <= ws_x + 28
+            && self.mouse_y >= task_y + 6
+            && self.mouse_y <= task_y + 30;
+        if ws > 1 {
+            canvas.blend_rounded_rect(ws_x, task_y + 6, 28, 24, 7, accent, 55);
+            canvas.draw_rounded_rect_alpha(ws_x, task_y + 6, 28, 24, 7, accent, 140);
+        } else {
+            canvas.blend_rounded_rect(ws_x, task_y + 6, 28, 24, 7, 0xFFFFFF, if ws_hov { 26 } else { 13 });
+            canvas.draw_rounded_rect_alpha(ws_x, task_y + 6, 28, 24, 7, 0xFFFFFF, 24);
+        }
+        canvas.draw_text_clipped(ws_x + 7, task_y + 11, 20, &format!("W{ws}"), 0xE2E8F0, 1);
+
+        // Calendar / Notifications popup pill
+        let cal_x = lang_x - 90;
+        let cal_hov = self.mouse_x >= cal_x
+            && self.mouse_x <= cal_x + 26
+            && self.mouse_y >= task_y + 6
+            && self.mouse_y <= task_y + 30;
+        if self.cal_open {
+            canvas.blend_rounded_rect(cal_x, task_y + 6, 26, 24, 7, accent, 70);
+            canvas.draw_rounded_rect_alpha(cal_x, task_y + 6, 26, 24, 7, accent, 150);
+        } else {
+            canvas.blend_rounded_rect(cal_x, task_y + 6, 26, 24, 7, 0xFFFFFF, if cal_hov { 26 } else { 13 });
+            canvas.draw_rounded_rect_alpha(cal_x, task_y + 6, 26, 24, 7, 0xFFFFFF, 24);
+        }
+        canvas.draw_rounded_rect_alpha(cal_x + 7, task_y + 11, 12, 13, 2, 0xCBD5E1, 220);
+        canvas.blend_rect(cal_x + 8, task_y + 13, 10, 2, accent, 200);
+        if !self.toast_history.is_empty() {
+            canvas.fill_aa_circle((cal_x + 21) as f32, (task_y + 11) as f32, 2.2, accent, 245);
+        }
+
         // Spotlight Search quick pill
         let search_x = lang_x - 60;
         let search_hov = self.mouse_x >= search_x
             && self.mouse_x <= search_x + 26
             && self.mouse_y >= task_y + 6
             && self.mouse_y <= task_y + 30;
+
         if self.launcher_open {
             canvas.blend_rounded_rect(search_x, task_y + 6, 26, 24, 7, accent, 70);
             canvas.draw_rounded_rect_alpha(search_x, task_y + 6, 26, 24, 7, accent, 150);
@@ -2166,9 +3020,10 @@ impl Desktop {
         canvas.draw_text_clipped(lang_x + 10, task_y + 11, 26, lang_lbl, 0xE2E8F0, 1);
 
         let tray_x = lang_x + 40;
-        let tray_w = (dock_x + dock_w - 6 - tray_x).max(40);
+        let tray_w = (dock_x + dock_w - 12 - tray_x).max(40);
         canvas.blend_rounded_rect(tray_x, task_y + 6, tray_w, 24, 7, 0xFFFFFF, 11);
         canvas.draw_rounded_rect_alpha(tray_x, task_y + 6, tray_w, 24, 7, 0xFFFFFF, 20);
+        canvas.blend_rect(dock_x + dock_w - 9, task_y + 8, 2, 20, 0xFFFFFF, 46);
         let pulse_a = if anim {
             (205.0 + 50.0 * ((self.tick as f32) * 0.08).sin()).clamp(150.0, 255.0) as u8
         } else {
@@ -2189,7 +3044,7 @@ impl Desktop {
             1,
         );
 
-        // 5. Overlays: Start Menu, Control Center, Spotlight Launcher, Context Menu, Dynamic Island Toast
+        // 5. Overlays: Start Menu, Control Center, Spotlight Launcher, Calendar, Context Menu, Toast
         if self.start_menu_open || (anim && self.start_anim > 0.03) {
             self.draw_start_menu(canvas, dock_x, task_y, dock_h, accent);
         }
@@ -2198,6 +3053,9 @@ impl Desktop {
         }
         if self.launcher_open || (anim && self.launcher_anim > 0.03) {
             self.draw_launcher(canvas, w, h, accent);
+        }
+        if self.cal_open {
+            self.draw_calendar_popup(canvas, dock_x, task_y, dock_w, dock_h, accent);
         }
         let anim_ctx = if anim && self.ctx_anim > 0.04 {
             self.last_ctx_menu
@@ -2212,6 +3070,12 @@ impl Desktop {
         }
         if let Some(toast) = self.toast.as_ref() {
             self.draw_toast(canvas, w, h, toast);
+        }
+        if self.switcher_open {
+            self.draw_window_switcher(canvas, w, h, accent);
+        }
+        if self.locked {
+            self.draw_lock_screen(canvas, w, h, accent);
         }
 
         // 6. Expanding AA click ripples
@@ -2245,10 +3109,11 @@ impl Desktop {
                 && !self.start_menu_open
                 && !self.cc_open
                 && !self.launcher_open
+                && !self.cal_open
                 && !over_dock
             {
                 for win in self.windows.iter().rev() {
-                    if !win.open || win.minimized {
+                    if !win.open || win.minimized || win.workspace != ws {
                         continue;
                     }
                     let pad = if win.maximized { 0 } else { 4 };
@@ -2267,6 +3132,166 @@ impl Desktop {
                 canvas.draw_resize_cursor(self.mouse_x, self.mouse_y, ux, uy);
             } else {
                 canvas.draw_cursor(self.mouse_x, self.mouse_y);
+            }
+        }
+
+        if self.settings.night_shift {
+            canvas.apply_night_shift();
+        }
+        if self.settings.crt_scanlines {
+            canvas.apply_crt_scanlines();
+        }
+        if self.screenshot_req.replace(false) {
+            let p = std::env::temp_dir().join(format!("pizsoft_shot_{}.bmp", self.tick));
+            let _ = canvas.write_bmp(&p);
+        }
+    }
+
+    fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let wf = w as f32;
+        let hf = h as f32;
+        for (i, s) in self.stars.iter().enumerate() {
+            let fade = if s.life < 0.25 {
+                s.life / 0.25
+            } else {
+                (1.0 - s.life) / 0.75
+            }
+            .clamp(0.0, 1.0);
+            let a = (fade * 175.0) as u8;
+            if a < 4 {
+                continue;
+            }
+            let sx = s.x * wf;
+            let sy = s.y * hf;
+            let col = if i % 3 == 0 {
+                accent
+            } else if i % 2 == 0 {
+                0xBAE6FD
+            } else {
+                0xFFFFFF
+            };
+            let r = s.size * (0.65 + s.life * 0.75);
+            canvas.fill_aa_circle(sx, sy, r * 2.4, col, a / 4);
+            canvas.fill_aa_circle(sx, sy, r, col, a);
+            if r > 1.7 {
+                let arm = r * 2.1;
+                canvas.draw_aa_line(sx - arm, sy, sx + arm, sy, 0.9, 0xFFFFFF, a / 2);
+                canvas.draw_aa_line(sx, sy - arm, sx, sy + arm, 0.9, 0xFFFFFF, a / 2);
+            }
+        }
+    }
+
+    fn draw_vista_sidebar(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let (glass_a, border_a) = self.settings.glass_alphas();
+        let top_bar = if self.settings.taskbar_top {
+            self.dock_reserve()
+        } else {
+            0
+        };
+        let gx = w - 176;
+        let gy = top_bar + 14;
+        let gw = 164;
+
+        // Subtle Vista translucent sidebar strip
+        let strip_h = (h - top_bar - 44).max(120);
+        canvas.blend_rounded_rect(gx - 6, top_bar + 6, gw + 12, strip_h, 14, 0x090D16, (glass_a / 4).max(32));
+        canvas.draw_rounded_rect_alpha(gx - 6, top_bar + 6, gw + 12, strip_h, 14, 0xFFFFFF, 16);
+
+        // 1. Gadget 1: Vista Analog Clock (164 x 146)
+        canvas.draw_soft_shadow(gx, gy, gw, 146, 14);
+        canvas.blend_rounded_rect(gx, gy, gw, 146, 14, 0x0C111C, glass_a.saturating_sub(18));
+        canvas.draw_rounded_rect_alpha(gx, gy, gw, 146, 14, 0xFFFFFF, border_a);
+        let cx = (gx + gw / 2) as f32;
+        let cy = (gy + 66) as f32;
+        let rad = 48.0;
+        canvas.fill_aa_circle(cx, cy, rad + 2.0, accent, 50);
+        canvas.fill_aa_circle(cx, cy, rad, 0x080C15, 225);
+        canvas.fill_aa_circle(cx, cy, rad - 2.0, 0x161E31, 95);
+        for m in 0..12 {
+            let a = (m as f32) * (core::f32::consts::TAU / 12.0) - core::f32::consts::FRAC_PI_2;
+            let r0 = if m % 3 == 0 { rad - 9.0 } else { rad - 5.5 };
+            let r1 = rad - 2.5;
+            canvas.draw_aa_line(
+                cx + a.cos() * r0,
+                cy + a.sin() * r0,
+                cx + a.cos() * r1,
+                cy + a.sin() * r1,
+                if m % 3 == 0 { 1.8 } else { 1.1 },
+                0xCBD5E1,
+                215,
+            );
+        }
+        // Parse HH:MM:SS or HH:MM from clock_str
+        let parts: Vec<f32> = self
+            .clock_str
+            .split(':')
+            .filter_map(|p| p.trim().parse::<f32>().ok())
+            .collect();
+        let hr = parts.first().copied().unwrap_or(12.0) % 12.0;
+        let mn = parts.get(1).copied().unwrap_or(0.0);
+        let sc = parts.get(2).copied().unwrap_or((self.tick % 60) as f32);
+        let hr_a = ((hr + mn / 60.0) / 12.0) * core::f32::consts::TAU - core::f32::consts::FRAC_PI_2;
+        let mn_a = ((mn + sc / 60.0) / 60.0) * core::f32::consts::TAU - core::f32::consts::FRAC_PI_2;
+        let sc_a = (sc / 60.0) * core::f32::consts::TAU - core::f32::consts::FRAC_PI_2;
+        canvas.draw_aa_line(cx, cy, cx + hr_a.cos() * 24.0, cy + hr_a.sin() * 24.0, 2.6, 0xF8FAFC, 245);
+        canvas.draw_aa_line(cx, cy, cx + mn_a.cos() * 35.0, cy + mn_a.sin() * 35.0, 1.8, 0xBAE6FD, 245);
+        canvas.draw_aa_line(cx, cy, cx + sc_a.cos() * 40.0, cy + sc_a.sin() * 40.0, 1.1, accent, 245);
+        canvas.fill_aa_circle(cx, cy, 3.2, accent, 255);
+        let cw_txt = canvas.measure_text(&self.clock_str, 1);
+        canvas.draw_text_clipped(gx + (gw - cw_txt) / 2, gy + 123, gw - 12, &self.clock_str, 0xE2E8F0, 1);
+
+        // 2. Gadget 2: Vista CPU / RAM Dual Meters (164 x 96)
+        let my = gy + 154;
+        canvas.draw_soft_shadow(gx, my, gw, 96, 14);
+        canvas.blend_rounded_rect(gx, my, gw, 96, 14, 0x0C111C, glass_a.saturating_sub(18));
+        canvas.draw_rounded_rect_alpha(gx, my, gw, 96, 14, 0xFFFFFF, border_a);
+        canvas.draw_text_clipped(gx + 12, my + 8, gw - 24, tr(lang, "Монитор Vista", "Vista Meters"), 0x94A3B8, 1);
+        for (idx, (lbl, pct, col)) in [
+            ("CPU", self.cpu_pct as f32, accent),
+            ("RAM", self.mem.percent as f32, 0xF59E0B),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mcx = (gx + 43 + (idx as i32) * 78) as f32;
+            let mcy = (my + 58) as f32;
+            canvas.fill_aa_circle(mcx, mcy, 24.0, 0x1E293B, 220);
+            canvas.fill_aa_circle(mcx, mcy, 20.0, 0x0B101B, 245);
+            let frac = (pct / 100.0).clamp(0.0, 1.0);
+            let steps = ((frac * 18.0).round() as usize).max(1);
+            for s in 0..steps {
+                let ang = -core::f32::consts::PI * 1.15 + (s as f32 / 18.0) * core::f32::consts::PI * 1.3;
+                canvas.fill_aa_circle(mcx + ang.cos() * 21.8, mcy + ang.sin() * 21.8, 2.2, *col, 240);
+            }
+            let ptxt = format!("{}%", *pct as u8);
+            let pw_t = canvas.measure_text(&ptxt, 1);
+            canvas.draw_text_clipped(mcx as i32 - pw_t / 2, (mcy as i32) - 5, 42, &ptxt, 0xF8FAFC, 1);
+            let lw_t = canvas.measure_text(lbl, 1);
+            canvas.draw_text_clipped(mcx as i32 - lw_t / 2, (mcy as i32) + 23, 40, lbl, 0x94A3B8, 1);
+        }
+
+        // 3. Gadget 3: Sticky Note (164 x 104)
+        let sy = gy + 258;
+        if sy + 104 < h - 36 {
+            canvas.draw_soft_shadow(gx, sy, gw, 104, 14);
+            canvas.blend_rounded_rect(gx, sy, gw, 104, 14, 0x261F0B, glass_a.saturating_sub(12));
+            let s_border = if self.sticky_focused { 0xFBBF24 } else { 0xD97706 };
+            canvas.draw_rounded_rect_alpha(gx, sy, gw, 104, 14, s_border, if self.sticky_focused { 185 } else { 95 });
+            canvas.draw_text_clipped(
+                gx + 10,
+                sy + 7,
+                gw - 20,
+                if self.sticky_focused {
+                    tr(lang, "Заметка (ввод...)", "Note (typing...)")
+                } else {
+                    tr(lang, "Стикер (клик)", "Sticky Note")
+                },
+                0xFCD34D,
+                1,
+            );
+            for (row, line) in self.sticky_note.split('\n').take(4).enumerate() {
+                canvas.draw_text_clipped(gx + 10, sy + 26 + (row as i32) * 18, gw - 20, line, 0xFEF3C7, 1);
             }
         }
     }
@@ -2461,18 +3486,40 @@ impl Desktop {
             1,
         );
 
-        let foot_y = py + 234;
-        canvas.blend_rounded_rect(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 11);
-        canvas.draw_rounded_rect_alpha(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 22);
+        let fx_y = py + 234;
+        let fx_items = [
+            ("Vista", self.settings.vista_sidebar, 0x38BDF8),
+            ("Stars", self.settings.aero_stars, 0xA855F7),
+            ("Night", self.settings.night_shift, 0xF59E0B),
+            ("CRT", self.settings.crt_scanlines, 0x22C55E),
+        ];
+        for (idx, (lbl, on, col)) in fx_items.iter().enumerate() {
+            let fx = px + 10 + (idx as i32) * 65;
+            if *on {
+                canvas.blend_rounded_rect(fx, fx_y, 61, 26, 8, *col, 68);
+                canvas.draw_rounded_rect_alpha(fx, fx_y, 61, 26, 8, *col, 165);
+            } else {
+                canvas.blend_rounded_rect(fx, fx_y, 61, 26, 8, 0xFFFFFF, 12);
+                canvas.draw_rounded_rect_alpha(fx, fx_y, 61, 26, 8, 0xFFFFFF, 22);
+            }
+            canvas.draw_text_clipped(fx + 8, fx_y + 7, 46, lbl, if *on { 0xFFFFFF } else { 0xCBD5E1 }, 1);
+        }
+
+        let foot_y = py + 266;
+        canvas.blend_rounded_rect(px + 10, foot_y, pw - 86, 24, 8, 0xFFFFFF, 11);
+        canvas.draw_rounded_rect_alpha(px + 10, foot_y, pw - 86, 24, 8, 0xFFFFFF, 22);
         canvas.fill_aa_circle((px + 22) as f32, (foot_y + 12) as f32, 3.0, 0x3FB950, 255);
         canvas.draw_text_clipped(
             px + 30,
             foot_y + 5,
-            pw - 48,
-            &format!("CPU {}%   RAM {}%", self.cpu_pct, self.mem.percent),
+            pw - 110,
+            &format!("CPU {}%  RAM {}%", self.cpu_pct, self.mem.percent),
             0xE2E8F0,
             1,
         );
+        canvas.blend_rounded_rect(px + pw - 70, foot_y, 60, 24, 8, accent, 58);
+        canvas.draw_rounded_rect_alpha(px + pw - 70, foot_y, 60, 24, 8, accent, 150);
+        canvas.draw_text_clipped(px + pw - 58, foot_y + 5, 44, "Shot", 0xFFFFFF, 1);
     }
 
     fn draw_launcher(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
@@ -2624,12 +3671,129 @@ impl Desktop {
         } else {
             255.0
         };
-        canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, 0x3FB950, (55.0 * t) as u8);
-        canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, 0x3FB950, (pulse * t) as u8);
-        if t > 0.35 {
-            canvas.draw_text_clipped(tx + 25, ty + 6, tw - 48, &txt, 0xE2E8F0, 1);
-            canvas.fill_aa_circle((tx + tw - 12) as f32, (ty + 13) as f32, 2.4, accent, (220.0 * t) as u8);
+        match self.island_mode {
+            IslandMode::Music => {
+                let cols = [0x22C55E, 0x38BDF8, 0xA855F7, 0xEC4899, 0xF59E0B];
+                for (b, &col) in cols.iter().enumerate() {
+                    let phase = ((self.tick as f32) * 0.24 + (b as f32) * 1.15).sin();
+                    let bh = if self.settings.animations {
+                        ((5.0 + 6.0 * (0.5 + 0.5 * phase)) * t).round() as i32
+                    } else {
+                        7
+                    }
+                    .max(2);
+                    canvas.fill_rect(tx + 11 + (b as i32) * 3, ty + 18 - bh, 2, bh, col);
+                }
+            }
+            IslandMode::Pomodoro => {
+                let col = 0xF97316;
+                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, col, (55.0 * t) as u8);
+                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, col, (pulse * t) as u8);
+                let total = (25 * 60 * 30) as f32;
+                let frac = 1.0 - (self.pomo_ticks as f32 / total).clamp(0.0, 1.0);
+                let pw = (((tw - 30) as f32) * frac.max(0.04)).round() as i32;
+                canvas.blend_rect(tx + 15, ty + th - 3, pw, 1, col, (190.0 * t) as u8);
+            }
+            IslandMode::Status => {
+                let dot_col = if self.dnd { 0xA855F7 } else { 0x3FB950 };
+                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, dot_col, (55.0 * t) as u8);
+                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, dot_col, (pulse * t) as u8);
+            }
         }
+        if t > 0.35 {
+            let text_x = if self.island_mode == IslandMode::Music { tx + 31 } else { tx + 24 };
+            canvas.draw_text_clipped(text_x, ty + 6, tw - 66, &txt, 0xE2E8F0, 1);
+            let mode_idx = match self.island_mode {
+                IslandMode::Status => 0,
+                IslandMode::Music => 1,
+                IslandMode::Pomodoro => 2,
+            };
+            canvas.blend_rounded_rect(tx + tw - 34, ty + 5, 26, 16, 8, 0xFFFFFF, (22.0 * t) as u8);
+            for d in 0..3 {
+                let col = if d == mode_idx { accent } else { 0x64748B };
+                let rad = if d == mode_idx { 2.3 } else { 1.5 };
+                canvas.fill_aa_circle((tx + tw - 28 + d * 7) as f32, (ty + 13) as f32, rad, col, (220.0 * t) as u8);
+            }
+        }
+    }
+
+    fn draw_window_switcher(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let ids: Vec<AppId> = self.windows.iter().rev().filter(|win| win.open).map(|win| win.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let shown = ids.len().min(7);
+        let active = self.switcher_idx % ids.len();
+        let (bx, by, bw, bh, cw, gap) = self.switcher_rect(w, h, shown);
+
+        canvas.blend_rect(0, 0, w, h, 0x050811, 115);
+        canvas.draw_soft_shadow(bx, by, bw, bh, 16);
+        canvas.blend_rounded_rect(bx, by, bw, bh, 16, 0x101624, 236);
+        canvas.draw_rounded_rect_alpha(bx, by, bw, bh, 16, 0xFFFFFF, 52);
+        canvas.draw_text_clipped(
+            bx + 14,
+            by + 10,
+            bw - 28,
+            tr(lang, "Переключение окон  (Alt/Ctrl+Tab)", "Window Switcher  (Alt/Ctrl+Tab)"),
+            0x94A3B8,
+            1,
+        );
+
+        for (i, &id) in ids.iter().take(7).enumerate() {
+            let cx = bx + 14 + (i as i32) * (cw + gap);
+            let cy = by + 32;
+            let sel = i == active;
+            if sel {
+                canvas.blend_rounded_rect(cx, cy, cw, 68, 11, accent, 58);
+                canvas.draw_rounded_rect_alpha(cx, cy, cw, 68, 11, accent, 215);
+            } else {
+                canvas.blend_rounded_rect(cx, cy, cw, 68, 11, 0xFFFFFF, 12);
+                canvas.draw_rounded_rect_alpha(cx, cy, cw, 68, 11, 0xFFFFFF, 26);
+            }
+            canvas.fill_aa_circle((cx + cw / 2) as f32, (cy + 24) as f32, 11.0, id.color(), 215);
+            canvas.draw_text_clipped(
+                cx + 6,
+                cy + 46,
+                cw - 12,
+                id.title(lang),
+                if sel { 0xFFFFFF } else { 0xCBD5E1 },
+                1,
+            );
+        }
+    }
+
+    fn draw_lock_screen(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let lang = self.settings.lang;
+        canvas.blend_rect(0, 0, w, h, 0x050912, 216);
+        canvas.fill_aa_circle((w / 2) as f32, (h / 2 - 20) as f32, 160.0, accent, 26);
+        canvas.fill_aa_circle((w / 2) as f32, (h / 2 - 20) as f32, 85.0, accent, 22);
+
+        let top_txt = if self.dnd {
+            format!("pizdOS 2.1(00)  ·  DND  ·  CPU {}%", self.cpu_pct)
+        } else {
+            format!("pizdOS 2.1(00)  ·  CPU {}%  ·  RAM {}%", self.cpu_pct, self.mem.percent)
+        };
+        let top_w = (canvas.measure_text(&top_txt, 1) + 28).min(w - 24);
+        canvas.blend_rounded_rect((w - top_w) / 2, 16, top_w, 24, 12, 0x0F172A, 210);
+        canvas.draw_rounded_rect_alpha((w - top_w) / 2, 16, top_w, 24, 12, 0xFFFFFF, 44);
+        canvas.draw_text_clipped((w - top_w) / 2 + 14, 21, top_w - 28, &top_txt, 0xCBD5E1, 1);
+
+        let clk_w = canvas.measure_text(&self.clock_str, 3);
+        canvas.draw_text_clipped((w - clk_w) / 2, h / 2 - 64, w - 32, &self.clock_str, 0xF8FAFC, 3);
+
+        let sub = format!("{}  ·  pizdOS 2.1(00)", self.settings.device_name);
+        let sub_w = canvas.measure_text(&sub, 1);
+        canvas.draw_text_clipped((w - sub_w) / 2, h / 2 - 4, w - 32, &sub, 0x94A3B8, 1);
+
+        let hint = tr(lang, "Клик или Enter / Пробел для входа", "Click or press Enter / Space to unlock");
+        let hw = (canvas.measure_text(hint, 1) + 34).clamp(180, w - 24);
+        let hx = (w - hw) / 2;
+        let hy = (h / 2 + 34).min(h - 46);
+        canvas.blend_rounded_rect(hx, hy, hw, 28, 14, accent, 52);
+        canvas.draw_rounded_rect_alpha(hx, hy, hw, 28, 14, accent, 165);
+        canvas.fill_aa_circle((hx + 14) as f32, (hy + 14) as f32, 3.0, 0x3FB950, 255);
+        canvas.draw_text_clipped(hx + 24, hy + 7, hw - 32, hint, 0xF8FAFC, 1);
     }
 
     fn draw_toast(&self, canvas: &mut Canvas, w: i32, h: i32, toast: &Toast) {
@@ -2743,7 +3907,7 @@ impl Desktop {
             menu_x + 24,
             menu_y + 8,
             menu_w - 86,
-            tr(lang, "pizdOS 2.0", "pizdOS 2.0"),
+            tr(lang, "pizdOS 2.1(00)", "pizdOS 2.1(00)"),
             0xF8FAFC,
             1,
         );
@@ -2881,6 +4045,34 @@ impl Desktop {
                 canvas.fill_aa_circle(cx, cy + 8.0, 1.8, 0xF8FAFC, 255);
                 canvas.fill_aa_circle(cx + 6.0, cy + 2.0, 1.6, 0xE2E8F0, 235);
             }
+            AppId::Game2048 => {
+                let qx = cx as i32 - 8;
+                let qy = cy as i32 - 8;
+                canvas.fill_rounded_rect(qx, qy, 7, 7, 2, 0xFDE68A);
+                canvas.fill_rounded_rect(qx + 9, qy, 7, 7, 2, 0xF59E0B);
+                canvas.fill_rounded_rect(qx, qy + 9, 7, 7, 2, 0xFB923C);
+                canvas.fill_rounded_rect(qx + 9, qy + 9, 7, 7, 2, 0xEF4444);
+            }
+            AppId::Files => {
+                canvas.fill_rounded_rect(bx + 10, by + 11, 9, 4, 1, 0x60A5FA);
+                canvas.fill_rounded_rect(bx + 10, by + 14, 20, 14, 3, 0x3B82F6);
+                canvas.blend_rect(bx + 12, by + 16, 16, 2, 0xBFDBFE, 120);
+            }
+            AppId::PizView => {
+                canvas.draw_rounded_rect_alpha(bx + 10, by + 11, 20, 18, 3, 0x7DD3FC, 230);
+                canvas.fill_aa_circle(cx + 4.5, cy - 4.0, 2.2, 0xFBBF24, 255);
+                canvas.draw_aa_line(cx - 7.0, cy + 5.0, cx - 1.5, cy - 1.5, 1.8, 0x38BDF8, 255);
+                canvas.draw_aa_line(cx - 1.5, cy - 1.5, cx + 3.0, cy + 3.0, 1.8, 0x38BDF8, 255);
+                canvas.draw_aa_line(cx + 1.5, cy + 2.0, cx + 6.5, cy + 5.0, 1.8, 0x7DD3FC, 240);
+            }
+            AppId::Minesweeper => {
+                canvas.draw_aa_line(cx - 8.5, cy, cx + 8.5, cy, 1.6, 0x94A3B8, 220);
+                canvas.draw_aa_line(cx, cy - 8.5, cx, cy + 8.5, 1.6, 0x94A3B8, 220);
+                canvas.draw_aa_line(cx - 6.0, cy - 6.0, cx + 6.0, cy + 6.0, 1.4, 0x94A3B8, 200);
+                canvas.draw_aa_line(cx + 6.0, cy - 6.0, cx - 6.0, cy + 6.0, 1.4, 0x94A3B8, 200);
+                canvas.fill_aa_circle(cx, cy, 5.2, 0x1E293B, 255);
+                canvas.fill_aa_circle(cx - 1.5, cy - 1.5, 1.6, 0xF87171, 240);
+            }
             _ => {}
         }
 
@@ -2919,52 +4111,66 @@ impl Desktop {
             canvas.blend_rect(win.x + 24, win.y, (win.w - 48).max(0), 1, accent, 82);
         }
         canvas.blend_rect(win.x + 1, win.y + 27, win.w - 2, 1, 0xFFFFFF, 16);
-        canvas.fill_aa_circle(
-            (win.x + 14) as f32,
-            (win.y + 14) as f32,
-            3.2,
-            win.id.color(),
-            if focused { 245 } else { 125 },
-        );
-        canvas.draw_text_clipped(
-            win.x + 24,
-            win.y + 7,
-            win.w - 106,
-            win.id.title(lang),
-            if focused { 0xF1F5F9 } else { 0x7D8590 },
-            1,
-        );
-
         let btn_y = win.y + 5;
         let cy = btn_y + 9;
         let hover_y = is_onscreen && self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
-        let min_x = win.x + win.w - 72;
-        let max_x = win.x + win.w - 49;
-        let cls_x = win.x + win.w - 26;
-        let min_hov = hover_y && (min_x..=min_x + 20).contains(&self.mouse_x);
-        let max_hov = hover_y && (max_x..=max_x + 20).contains(&self.mouse_x);
-        let cls_hov = hover_y && (cls_x..=cls_x + 20).contains(&self.mouse_x);
+        if self.settings.macos_buttons {
+            canvas.fill_aa_circle((win.x + 13) as f32, cy as f32, 5.2, 0xFF5F57, 255);
+            canvas.fill_aa_circle((win.x + 31) as f32, cy as f32, 5.2, 0xFEBC2E, 255);
+            canvas.fill_aa_circle((win.x + 49) as f32, cy as f32, 5.2, 0x28C840, 255);
+            canvas.draw_text_clipped(
+                win.x + 66,
+                win.y + 7,
+                (win.w - 80).max(40),
+                win.id.title(lang),
+                if focused { 0xF1F5F9 } else { 0x7D8590 },
+                1,
+            );
+        } else {
+            canvas.fill_aa_circle(
+                (win.x + 14) as f32,
+                (win.y + 14) as f32,
+                3.2,
+                win.id.color(),
+                if focused { 245 } else { 125 },
+            );
+            canvas.draw_text_clipped(
+                win.x + 24,
+                win.y + 7,
+                win.w - 106,
+                win.id.title(lang),
+                if focused { 0xF1F5F9 } else { 0x7D8590 },
+                1,
+            );
 
-        if min_hov {
-            canvas.fill_aa_circle((min_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
+            let min_x = win.x + win.w - 72;
+            let max_x = win.x + win.w - 49;
+            let cls_x = win.x + win.w - 26;
+            let min_hov = hover_y && (min_x..=min_x + 20).contains(&self.mouse_x);
+            let max_hov = hover_y && (max_x..=max_x + 20).contains(&self.mouse_x);
+            let cls_hov = hover_y && (cls_x..=cls_x + 20).contains(&self.mouse_x);
+
+            if min_hov {
+                canvas.fill_aa_circle((min_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
+            }
+            if max_hov {
+                canvas.fill_aa_circle((max_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
+            }
+            if cls_hov {
+                canvas.fill_aa_circle((cls_x + 10) as f32, cy as f32, 9.0, 0xEF4444, 195);
+            }
+
+            let min_a = if min_hov { 245 } else { 155 };
+            canvas.draw_aa_line((min_x + 6) as f32, (cy + 1) as f32, (min_x + 14) as f32, (cy + 1) as f32, 1.3, 0xE2E8F0, min_a);
+
+            let max_a = if max_hov { 245 } else { 155 };
+            canvas.draw_rounded_rect_alpha(max_x + 6, cy - 4, 8, 8, 1, 0xE2E8F0, max_a);
+
+            let cls_col = if cls_hov { 0xFFFFFF } else { 0xE2E8F0 };
+            let cls_a = if cls_hov { 255 } else { 170 };
+            canvas.draw_aa_line((cls_x + 6) as f32, (cy - 4) as f32, (cls_x + 14) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
+            canvas.draw_aa_line((cls_x + 14) as f32, (cy - 4) as f32, (cls_x + 6) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
         }
-        if max_hov {
-            canvas.fill_aa_circle((max_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
-        }
-        if cls_hov {
-            canvas.fill_aa_circle((cls_x + 10) as f32, cy as f32, 9.0, 0xEF4444, 195);
-        }
-
-        let min_a = if min_hov { 245 } else { 155 };
-        canvas.draw_aa_line((min_x + 6) as f32, (cy + 1) as f32, (min_x + 14) as f32, (cy + 1) as f32, 1.3, 0xE2E8F0, min_a);
-
-        let max_a = if max_hov { 245 } else { 155 };
-        canvas.draw_rounded_rect_alpha(max_x + 6, cy - 4, 8, 8, 1, 0xE2E8F0, max_a);
-
-        let cls_col = if cls_hov { 0xFFFFFF } else { 0xE2E8F0 };
-        let cls_a = if cls_hov { 255 } else { 170 };
-        canvas.draw_aa_line((cls_x + 6) as f32, (cy - 4) as f32, (cls_x + 14) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
-        canvas.draw_aa_line((cls_x + 14) as f32, (cy - 4) as f32, (cls_x + 6) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
 
         let (hlx, hly) = if is_onscreen && focused {
             (self.mouse_x - win.x, self.mouse_y - win.y)
@@ -2980,6 +4186,9 @@ impl Desktop {
             AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.h, lang, self.tick),
             AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h, lang),
             AppId::Calc => self.calc.draw(canvas, win.x, win.y, win.w, win.h, accent),
+            AppId::Game2048 => self.game2048.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
+            AppId::PizView => self.pizview.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
+            AppId::Minesweeper => self.minesweeper.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
             AppId::Settings => self.settings.draw(
                 canvas,
@@ -3182,17 +4391,54 @@ impl Desktop {
     }
 
     fn draw_files_contents(&self, canvas: &mut Canvas, win: &Window) {
+        let lang = self.settings.lang;
         let x = win.x + 14;
         let y = win.y + 34;
         let iw = win.w - 28;
 
         canvas.draw_text_clipped(x, y, iw, &format!("CWD: {}", self.cwd.display()), 0x79C0FF, 1);
-        canvas.fill_rounded_rect(x - 2, win.y + 52, iw + 4, (win.h - 68).max(40), 8, 0x0C111C);
-        canvas.draw_rounded_rect_alpha(x - 2, win.y + 52, iw + 4, (win.h - 68).max(40), 8, 0xFFFFFF, 20);
 
-        let max_rows = ((win.h - 70) / 18).max(1) as usize;
+        let tb_y = win.y + 50;
+        let sort_lbl = if self.file_sort_desc { "Z-A" } else { "A-Z" };
+        canvas.draw_button(win.x + 14, tb_y, 34, 20, "..", 0x1E293B, 0xE2E8F0, 0x475569);
+        canvas.draw_button(win.x + 52, tb_y, 50, 20, sort_lbl, 0x1E293B, 0xE2E8F0, 0x475569);
+        canvas.draw_button(
+            win.x + 106,
+            tb_y,
+            58,
+            20,
+            tr(lang, "+Файл", "+File"),
+            0x14532D,
+            0x86EFAC,
+            0x22C55E,
+        );
+        canvas.draw_button(
+            win.x + 168,
+            tb_y,
+            56,
+            20,
+            tr(lang, "+Папк", "+Dir"),
+            0x1E3A8A,
+            0x93C5FD,
+            0x3B82F6,
+        );
+        canvas.draw_button(
+            win.x + 228,
+            tb_y,
+            50,
+            20,
+            tr(lang, "Удал.", "Del"),
+            0x7F1D1D,
+            0xFCA5A5,
+            0xEF4444,
+        );
+
+        canvas.fill_rounded_rect(x - 2, win.y + 74, iw + 4, (win.h - 90).max(40), 8, 0x0C111C);
+        canvas.draw_rounded_rect_alpha(x - 2, win.y + 74, iw + 4, (win.h - 90).max(40), 8, 0xFFFFFF, 20);
+
+        let max_rows = ((win.h - 92) / 18).max(1) as usize;
         for (i, item) in self.files.iter().take(max_rows).enumerate() {
-            let ry = win.y + 54 + (i as i32) * 18;
+            let ry = win.y + 76 + (i as i32) * 18;
             let selected = i == self.file_sel;
             if selected {
                 canvas.fill_rounded_rect(x + 1, ry, iw - 2, 16, 6, 0x21262D);
@@ -3208,5 +4454,156 @@ impl Desktop {
                 1,
             );
         }
+    }
+
+    fn draw_calendar_popup(
+        &self,
+        canvas: &mut Canvas,
+        dock_x: i32,
+        task_y: i32,
+        dock_w: i32,
+        dock_h: i32,
+        accent: u32,
+    ) {
+        let lang = self.settings.lang;
+        let (glass_a, border_a) = self.settings.glass_alphas();
+        let pw = 290;
+        let ph = 310;
+        let px = (dock_x + dock_w - pw - 8).max(8);
+        let py = if self.settings.taskbar_top {
+            task_y + dock_h + 6
+        } else {
+            (task_y - ph - 8).max(8)
+        };
+
+        canvas.draw_soft_shadow(px, py, pw, ph, 14);
+        canvas.blend_rounded_rect(px, py, pw, ph, 14, 0x0B0F1A, glass_a);
+        canvas.draw_rounded_rect_alpha(px, py, pw, ph, 14, 0xFFFFFF, border_a);
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let days = secs / 86_400;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u32;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
+        let first_wd = ((days - (d as i64 - 1) + 3).rem_euclid(7)) as u32;
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let dim: u32 = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 30,
+        };
+
+        canvas.draw_text_clipped(
+            px + 12,
+            py + 10,
+            180,
+            &format!("{year}-{m:02}-{d:02} UTC  |  W{}", self.active_workspace),
+            0xF8FAFC,
+            1,
+        );
+        canvas.draw_text_clipped(px + pw - 68, py + 10, 56, &self.clock_str, accent, 1);
+
+        let wdays = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+        for (c, lbl) in wdays.iter().enumerate() {
+            canvas.draw_text_clipped(px + 16 + (c as i32) * 38, py + 28, 30, lbl, 0x94A3B8, 1);
+        }
+        for day in 1..=dim {
+            let slot = first_wd + day - 1;
+            let row = (slot / 7) as i32;
+            let col = (slot % 7) as i32;
+            let cx = px + 12 + col * 38;
+            let cy = py + 44 + row * 18;
+            if day == d {
+                canvas.fill_rounded_rect(cx, cy - 1, 26, 16, 6, accent);
+            }
+            canvas.draw_text_clipped(
+                cx + 4,
+                cy + 2,
+                22,
+                &format!("{day:2}"),
+                if day == d { 0x0B0F1A } else { 0xCBD5E1 },
+                1,
+            );
+        }
+
+        canvas.blend_rect(px + 10, py + 150, pw - 20, 1, 0xFFFFFF, 22);
+        canvas.draw_text_clipped(
+            px + 12,
+            py + 157,
+            180,
+            tr(lang, "Уведомления", "Notifications"),
+            0xE2E8F0,
+            1,
+        );
+        canvas.draw_button(
+            px + pw - 70,
+            py + 154,
+            60,
+            18,
+            tr(lang, "Очист.", "Clear"),
+            0x1E293B,
+            0xCBD5E1,
+            0x475569,
+        );
+        if self.toast_history.is_empty() {
+            canvas.draw_text_clipped(
+                px + 14,
+                py + 186,
+                pw - 28,
+                tr(lang, "История пуста", "No recent notifications"),
+                0x64748B,
+                1,
+            );
+        } else {
+            for (i, msg) in self.toast_history.iter().rev().take(4).enumerate() {
+                let ny = py + 178 + (i as i32) * 21;
+                canvas.blend_rounded_rect(px + 10, ny, pw - 20, 18, 6, 0xFFFFFF, 10);
+                canvas.draw_text_clipped(px + 16, ny + 3, pw - 32, msg, 0xCBD5E1, 1);
+            }
+        }
+
+        canvas.blend_rect(px + 10, py + 266, pw - 20, 1, 0xFFFFFF, 20);
+        canvas.draw_button(
+            px + 10,
+            py + 274,
+            86,
+            26,
+            tr(lang, "Выход", "Exit"),
+            0x1E293B,
+            0xE2E8F0,
+            0x475569,
+        );
+        canvas.draw_button(
+            px + 102,
+            py + 274,
+            86,
+            26,
+            tr(lang, "Ребут", "Reboot"),
+            0x78350F,
+            0xFDE68A,
+            0xF59E0B,
+        );
+        canvas.draw_button(
+            px + 194,
+            py + 274,
+            86,
+            26,
+            tr(lang, "Выкл", "Power"),
+            0x7F1D1D,
+            0xFCA5A5,
+            0xEF4444,
+        );
     }
 }
