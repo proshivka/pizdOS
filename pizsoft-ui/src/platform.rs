@@ -1,5 +1,6 @@
 use std::io;
 
+use crate::apps::KeyEvent;
 use crate::desktop::Desktop;
 use crate::gfx::Canvas;
 
@@ -149,10 +150,17 @@ mod win32 {
     const WM_DESTROY: u32 = 0x0002;
     const WM_PAINT: u32 = 0x000F;
     const WM_KEYDOWN: u32 = 0x0100;
+    const WM_CHAR: u32 = 0x0102;
     const WM_MOUSEMOVE: u32 = 0x0200;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
+    const VK_BACK: usize = 0x08;
+    const VK_RETURN: usize = 0x0D;
     const VK_ESCAPE: usize = 0x1B;
+    const VK_LEFT: usize = 0x25;
+    const VK_UP: usize = 0x26;
+    const VK_RIGHT: usize = 0x27;
+    const VK_DOWN: usize = 0x28;
     const PM_REMOVE: u32 = 0x0001;
     const SRCCOPY: u32 = 0x00CC_0020;
 
@@ -354,10 +362,30 @@ mod win32 {
                 let x = (msg.l_param & 0xFFFF) as i16 as i32;
                 let y = ((msg.l_param >> 16) & 0xFFFF) as i16 as i32;
                 match msg.message {
-                    WM_MOUSEMOVE => desktop.on_mouse_move(x, y, canvas.width as i32, canvas.height as i32),
-                    WM_LBUTTONDOWN => desktop.on_mouse_down(x, y, canvas.width as i32, canvas.height as i32),
+                    WM_MOUSEMOVE => {
+                        desktop.on_mouse_move(x, y, canvas.width as i32, canvas.height as i32)
+                    }
+                    WM_LBUTTONDOWN => {
+                        desktop.on_mouse_down(x, y, canvas.width as i32, canvas.height as i32)
+                    }
                     WM_LBUTTONUP => desktop.on_mouse_up(),
-                    WM_KEYDOWN if msg.w_param == VK_ESCAPE => desktop.running = false,
+                    WM_KEYDOWN => match msg.w_param {
+                        VK_ESCAPE => desktop.running = false,
+                        VK_LEFT => desktop.on_key(KeyEvent::Left),
+                        VK_UP => desktop.on_key(KeyEvent::Up),
+                        VK_RIGHT => desktop.on_key(KeyEvent::Right),
+                        VK_DOWN => desktop.on_key(KeyEvent::Down),
+                        VK_BACK => desktop.on_key(KeyEvent::Backspace),
+                        VK_RETURN => desktop.on_key(KeyEvent::Enter),
+                        _ => {}
+                    },
+                    WM_CHAR => {
+                        if let Some(ch) = char::from_u32(msg.w_param as u32)
+                            && !ch.is_control()
+                        {
+                            desktop.on_key(KeyEvent::Char(ch));
+                        }
+                    }
                     _ => {}
                 }
                 unsafe {

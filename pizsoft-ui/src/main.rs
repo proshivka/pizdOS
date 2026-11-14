@@ -1,3 +1,4 @@
+mod apps;
 mod desktop;
 mod font;
 mod gfx;
@@ -101,12 +102,20 @@ mod tests {
         let mut canvas = Canvas::new(960, 600);
         let mut desktop = Desktop::new(960, 600);
 
-        // Drag topmost window ("Sistema" at 110,45)
+        // Drag topmost window ("Nastroyki - About OS" at 420,120)
         let orig_x = desktop.windows.last().unwrap().x;
-        desktop.on_mouse_down(130, 55, 960, 600);
-        desktop.on_mouse_move(200, 100, 960, 600);
+        desktop.on_mouse_down(440, 130, 960, 600);
+        desktop.on_mouse_move(490, 150, 960, 600);
         desktop.on_mouse_up();
         assert_ne!(desktop.windows.last().unwrap().x, orig_x);
+
+        // Open Start Menu & all new apps
+        desktop.on_mouse_down(20, 580, 960, 600);
+        assert!(desktop.start_menu_open);
+        desktop.focus_or_open(desktop::AppId::Terminal);
+        desktop.focus_or_open(desktop::AppId::Paint);
+        desktop.focus_or_open(desktop::AppId::Snake);
+        desktop.focus_or_open(desktop::AppId::Notepad);
 
         desktop.render(&mut canvas);
         assert!(canvas.pixels.iter().any(|&p| p != 0x101822));

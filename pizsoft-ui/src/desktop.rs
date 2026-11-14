@@ -3,6 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::apps::{
+    KeyEvent, NotepadState, PaintState, SnakeState, TerminalState, draw_settings_about_os,
+};
 use crate::gfx::Canvas;
 use crate::sys::{
     CpuSample, MemInfo, PkgSummary, ProcInfo, list_processes, load_packages, read_cpu_sample,
@@ -14,7 +17,11 @@ pub enum AppId {
     System,
     PizGet,
     Files,
-    About,
+    Terminal,
+    Paint,
+    Snake,
+    Notepad,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +42,21 @@ pub struct FileItem {
     pub path: PathBuf,
 }
 
+const START_ITEMS: [(Option<AppId>, &str); 9] = [
+    (Some(AppId::Terminal), "Terminal"),
+    (Some(AppId::Paint), "PizPaint"),
+    (Some(AppId::Snake), "Zmeyka"),
+    (Some(AppId::Notepad), "PizPad (Bloknot)"),
+    (Some(AppId::Files), "Fayly"),
+    (Some(AppId::PizGet), "piz-get Store"),
+    (Some(AppId::System), "Sistema"),
+    (Some(AppId::Settings), "Nastroyki / About OS"),
+    (None, "Vyhod (Exit)"),
+];
+
 pub struct Desktop {
     pub running: bool,
+    pub start_menu_open: bool,
     pub mouse_x: i32,
     pub mouse_y: i32,
     pub mouse_down: bool,
@@ -63,6 +83,12 @@ pub struct Desktop {
     pub cwd: PathBuf,
     pub files: Vec<FileItem>,
     pub file_sel: usize,
+
+    // apps
+    pub terminal: TerminalState,
+    pub paint: PaintState,
+    pub snake: SnakeState,
+    pub notepad: NotepadState,
 }
 
 impl Desktop {
@@ -74,50 +100,87 @@ impl Desktop {
 
         let mut d = Self {
             running: true,
+            start_menu_open: false,
             mouse_x: width / 2,
             mouse_y: height / 2,
             mouse_down: false,
             dragging: None,
             windows: vec![
                 Window {
-                    id: AppId::About,
-                    title: "Pizsoft UI",
-                    x: 420,
-                    y: 260,
-                    w: 360,
-                    h: 190,
-                    open: false,
-                },
-                Window {
                     id: AppId::Files,
                     title: "Fayly",
-                    x: 340,
-                    y: 90,
-                    w: 410,
-                    h: 320,
-                    open: true,
+                    x: 150,
+                    y: 70,
+                    w: 400,
+                    h: 300,
+                    open: false,
                 },
                 Window {
                     id: AppId::PizGet,
                     title: "piz-get Store",
                     x: 190,
-                    y: 160,
+                    y: 90,
                     w: 440,
                     h: 310,
-                    open: true,
+                    open: false,
+                },
+                Window {
+                    id: AppId::Terminal,
+                    title: "Terminal",
+                    x: 120,
+                    y: 60,
+                    w: 440,
+                    h: 280,
+                    open: false,
+                },
+                Window {
+                    id: AppId::Paint,
+                    title: "PizPaint",
+                    x: 240,
+                    y: 110,
+                    w: 364,
+                    h: 266,
+                    open: false,
+                },
+                Window {
+                    id: AppId::Snake,
+                    title: "Zmeyka",
+                    x: 280,
+                    y: 100,
+                    w: 320,
+                    h: 278,
+                    open: false,
+                },
+                Window {
+                    id: AppId::Notepad,
+                    title: "PizPad",
+                    x: 210,
+                    y: 130,
+                    w: 420,
+                    h: 270,
+                    open: false,
                 },
                 Window {
                     id: AppId::System,
                     title: "Sistema",
                     x: 110,
                     y: 45,
-                    w: 390,
+                    w: 380,
                     h: 270,
+                    open: true,
+                },
+                Window {
+                    id: AppId::Settings,
+                    title: "Nastroyki - About OS",
+                    x: 420,
+                    y: 120,
+                    w: 430,
+                    h: 300,
                     open: true,
                 },
             ],
             tick: 0,
-            status: String::from("Gotovo | 0% GNU | 0 Deps"),
+            status: String::from("0% GNU | 0 Deps"),
 
             cpu_pct: 12,
             last_cpu: read_cpu_sample(),
@@ -134,6 +197,11 @@ impl Desktop {
             cwd,
             files: Vec::new(),
             file_sel: 0,
+
+            terminal: TerminalState::new(),
+            paint: PaintState::new(),
+            snake: SnakeState::new(),
+            notepad: NotepadState::new(),
         };
 
         d.reload_packages();
@@ -197,9 +265,14 @@ impl Desktop {
         if self.tick.is_multiple_of(30) {
             self.refresh_metrics();
         }
+        if self.tick.is_multiple_of(10)
+            && self.windows.iter().any(|w| w.id == AppId::Snake && w.open)
+        {
+            self.snake.step();
+        }
     }
 
-    fn focus_or_open(&mut self, id: AppId) {
+    pub fn focus_or_open(&mut self, id: AppId) {
         if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
             let mut win = self.windows.remove(pos);
             win.open = true;
@@ -220,6 +293,18 @@ impl Desktop {
         self.reload_packages();
     }
 
+    pub fn on_key(&mut self, key: KeyEvent) {
+        let Some(top) = self.windows.iter().rev().find(|w| w.open) else {
+            return;
+        };
+        match top.id {
+            AppId::Terminal => self.terminal.on_key(key, &self.kernel, &self.mem),
+            AppId::Snake => self.snake.on_key(key),
+            AppId::Notepad => self.notepad.on_key(key),
+            _ => {}
+        }
+    }
+
     pub fn on_mouse_move(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
@@ -229,7 +314,25 @@ impl Desktop {
         {
             win.x = (self.mouse_x - off_x).clamp(0, (canvas_w - 60).max(0));
             win.y = (self.mouse_y - off_y).clamp(0, (canvas_h - 60).max(0));
+            return;
         }
+
+        if self.mouse_down
+            && let Some(top) = self.windows.last()
+            && top.open
+            && top.id == AppId::Paint
+        {
+            self.paint
+                .paint_at(self.mouse_x - top.x, self.mouse_y - top.y);
+        }
+    }
+
+    fn taskbar_pill_width(&self, canvas_w: i32, open_count: usize) -> i32 {
+        if open_count == 0 {
+            return 100;
+        }
+        let avail = (canvas_w - 250).max(120);
+        ((avail / open_count as i32) - 4).clamp(64, 120)
     }
 
     pub fn on_mouse_down(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
@@ -237,26 +340,55 @@ impl Desktop {
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.mouse_down = true;
 
-        // Taskbar hit test
         let task_y = canvas_h - 34;
-        if y >= task_y {
-            if (6..=106).contains(&x) {
-                self.focus_or_open(AppId::About);
+
+        // 1. Start Menu popup hit test
+        if self.start_menu_open {
+            let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
+            let menu_y = task_y - menu_h;
+            if (6..=216).contains(&x) && y >= menu_y && y < task_y {
+                let rel_y = y - (menu_y + 28);
+                if rel_y >= 0 {
+                    let idx = (rel_y / 24) as usize;
+                    if let Some((app_opt, _)) = START_ITEMS.get(idx) {
+                        self.start_menu_open = false;
+                        match app_opt {
+                            Some(id) => self.focus_or_open(*id),
+                            None => self.running = false,
+                        }
+                        return;
+                    }
+                }
                 return;
             }
-            let mut bx = 114;
-            let ids: Vec<AppId> = self.windows.iter().map(|w| w.id).collect();
-            for id in ids {
-                if x >= bx && x <= bx + 110 {
+            self.start_menu_open = false;
+        }
+
+        // 2. Taskbar hit test (only currently open windows)
+        if y >= task_y {
+            if (6..=96).contains(&x) {
+                self.start_menu_open = !self.start_menu_open;
+                return;
+            }
+            let open_ids: Vec<AppId> = self
+                .windows
+                .iter()
+                .filter(|w| w.open)
+                .map(|w| w.id)
+                .collect();
+            let pill_w = self.taskbar_pill_width(canvas_w, open_ids.len());
+            let mut bx = 104;
+            for id in open_ids {
+                if x >= bx && x <= bx + pill_w {
                     self.focus_or_open(id);
                     return;
                 }
-                bx += 116;
+                bx += pill_w + 4;
             }
             return;
         }
 
-        // Topmost open window hit test (iterate in reverse z-order)
+        // 3. Topmost open window hit test
         let mut hit_idx = None;
         for (idx, win) in self.windows.iter().enumerate().rev() {
             if win.open && x >= win.x && x < win.x + win.w && y >= win.y && y < win.y + win.h {
@@ -266,11 +398,10 @@ impl Desktop {
         }
 
         if let Some(idx) = hit_idx {
-            let mut win = self.windows.remove(idx);
+            let win = self.windows.remove(idx);
             self.windows.push(win.clone());
             let top_idx = self.windows.len() - 1;
 
-            // Close button [X]
             if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 && y >= win.y + 4 && y <= win.y + 22
             {
                 self.windows[top_idx].open = false;
@@ -278,27 +409,29 @@ impl Desktop {
                 return;
             }
 
-            // Titlebar drag
             if y < win.y + 26 {
                 self.dragging = Some((win.id, x - win.x, y - win.y));
                 return;
             }
 
-            win = self.windows[top_idx].clone();
             self.handle_window_click(&win, x - win.x, y - win.y);
             return;
         }
 
-        // Desktop icons on the left
+        // 4. Desktop icons on the left
         if (14..=92).contains(&x) {
             if (20..=76).contains(&y) {
-                self.focus_or_open(AppId::System);
+                self.focus_or_open(AppId::Terminal);
             } else if (92..=148).contains(&y) {
                 self.focus_or_open(AppId::PizGet);
             } else if (164..=220).contains(&y) {
-                self.focus_or_open(AppId::Files);
+                self.focus_or_open(AppId::Paint);
             } else if (236..=292).contains(&y) {
-                self.focus_or_open(AppId::About);
+                self.focus_or_open(AppId::Snake);
+            } else if (308..=364).contains(&y) {
+                self.focus_or_open(AppId::Notepad);
+            } else if (380..=436).contains(&y) {
+                self.focus_or_open(AppId::Settings);
             }
         }
     }
@@ -350,11 +483,10 @@ impl Desktop {
                     }
                 }
             }
-            AppId::About => {
-                if ly >= win.h - 38 && ly <= win.h - 12 && (14..=124).contains(&lx) {
-                    self.running = false;
-                }
-            }
+            AppId::Paint => self.paint.on_click(lx, ly, win.h),
+            AppId::Snake => self.snake.on_click(lx, ly, win.h),
+            AppId::Notepad => self.notepad.on_click(lx, ly, win.h),
+            AppId::Terminal | AppId::Settings => {}
         }
     }
 
@@ -371,22 +503,15 @@ impl Desktop {
             canvas.fill_rect(0, gy, w, 1, 0x15202E);
         }
 
-        // Watermark
-        canvas.draw_text(
-            (w - 220).max(110),
-            (h - 62).max(20),
-            "pizdOS 2.0 | Pizsoft UI",
-            0x27384D,
-            1,
-        );
-
         // 2. Desktop Icons
-        self.draw_desktop_icon(canvas, 18, 22, "Sistema", 0x2EA043);
+        self.draw_desktop_icon(canvas, 18, 22, "Terminal", 0x3FB950);
         self.draw_desktop_icon(canvas, 18, 94, "piz-get", 0xD29922);
-        self.draw_desktop_icon(canvas, 18, 166, "Fayly", 0x58A6FF);
-        self.draw_desktop_icon(canvas, 18, 238, "O sisteme", 0xF85149);
+        self.draw_desktop_icon(canvas, 18, 166, "PizPaint", 0xBC8CFF);
+        self.draw_desktop_icon(canvas, 18, 238, "Zmeyka", 0x2EA043);
+        self.draw_desktop_icon(canvas, 18, 310, "PizPad", 0x58A6FF);
+        self.draw_desktop_icon(canvas, 18, 382, "Nastroyki", 0xF85149);
 
-        // 3. Windows (back to front)
+        // 3. Open Windows
         for (idx, win) in self.windows.iter().enumerate() {
             if !win.open {
                 continue;
@@ -395,40 +520,73 @@ impl Desktop {
             self.draw_window(canvas, win, focused);
         }
 
-        // 4. Taskbar
+        // 4. Taskbar (shows ONLY currently open windows)
         let task_y = h - 34;
         canvas.fill_rect(0, task_y, w, 34, 0x161B22);
         canvas.fill_rect(0, task_y, w, 1, 0x30363D);
-        canvas.draw_button(
-            6,
-            task_y + 5,
-            100,
-            24,
-            "pizdOS",
-            0xB62324,
-            0xFFFFFF,
-            0xFF7B72,
-        );
+        let start_bg = if self.start_menu_open { 0xDA3633 } else { 0xB62324 };
+        canvas.draw_button(6, task_y + 5, 90, 24, "Pusk", start_bg, 0xFFFFFF, 0xFF7B72);
 
-        let mut bx = 114;
-        for win in &self.windows {
-            let bg = if win.open { 0x21262D } else { 0x161B22 };
-            let border = if win.open { 0x58A6FF } else { 0x30363D };
-            canvas.draw_button(bx, task_y + 5, 110, 24, win.title, bg, 0xE6EDF3, border);
-            bx += 116;
+        let open_wins: Vec<&Window> = self.windows.iter().filter(|win| win.open).collect();
+        let pill_w = self.taskbar_pill_width(w, open_wins.len());
+        let mut bx = 104;
+        for (i, win) in open_wins.iter().enumerate() {
+            let is_top = i + 1 == open_wins.len();
+            let bg = if is_top { 0x1F6FEB } else { 0x21262D };
+            let border = if is_top { 0x79C0FF } else { 0x30363D };
+            canvas.draw_button(bx, task_y + 5, pill_w, 24, win.title, bg, 0xFFFFFF, border);
+            bx += pill_w + 4;
         }
 
         canvas.draw_text_clipped(
-            (w - 220).max(bx + 8),
+            (w - 132).max(bx + 8),
             task_y + 13,
-            212,
-            &self.status,
+            126,
+            &self.uptime,
             0x8B949E,
             1,
         );
 
-        // 5. Mouse cursor
+        // 5. Start Menu popup
+        if self.start_menu_open {
+            self.draw_start_menu(canvas, task_y);
+        }
+
+        // 6. Mouse cursor
         canvas.draw_cursor(self.mouse_x, self.mouse_y);
+    }
+
+    fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32) {
+        let menu_w = 210;
+        let menu_h = (START_ITEMS.len() as i32) * 24 + 34;
+        let menu_x = 6;
+        let menu_y = task_y - menu_h;
+
+        canvas.fill_rect(menu_x + 4, menu_y + 4, menu_w, menu_h, 0x090C10);
+        canvas.fill_rect(menu_x, menu_y, menu_w, menu_h, 0x161B22);
+        canvas.draw_rect(menu_x, menu_y, menu_w, menu_h, 0x58A6FF);
+        canvas.fill_rect(menu_x + 1, menu_y + 1, menu_w - 2, 24, 0x1F6FEB);
+        canvas.draw_text_clipped(
+            menu_x + 10,
+            menu_y + 9,
+            menu_w - 20,
+            "pizdOS 2.0 | Pusk",
+            0xFFFFFF,
+            1,
+        );
+
+        for (i, (app_opt, label)) in START_ITEMS.iter().enumerate() {
+            let iy = menu_y + 28 + (i as i32) * 24;
+            let hovered = self.mouse_x >= menu_x
+                && self.mouse_x <= menu_x + menu_w
+                && self.mouse_y >= iy
+                && self.mouse_y < iy + 22;
+            if hovered {
+                canvas.fill_rect(menu_x + 4, iy, menu_w - 8, 22, 0x21262D);
+            }
+            let col = if app_opt.is_none() { 0xFF7B72 } else { 0xE6EDF3 };
+            canvas.draw_text_clipped(menu_x + 12, iy + 7, menu_w - 24, label, col, 1);
+        }
     }
 
     fn draw_desktop_icon(&self, canvas: &mut Canvas, x: i32, y: i32, label: &str, accent: u32) {
@@ -439,25 +597,14 @@ impl Desktop {
     }
 
     fn draw_window(&self, canvas: &mut Canvas, win: &Window, focused: bool) {
-        // Drop shadow
         canvas.fill_rect(win.x + 4, win.y + 4, win.w, win.h, 0x090C10);
-
-        // Window body
         canvas.fill_rect(win.x, win.y, win.w, win.h, 0x161B22);
         let border = if focused { 0x58A6FF } else { 0x30363D };
         canvas.draw_rect(win.x, win.y, win.w, win.h, border);
 
-        // Titlebar
         let title_bg = if focused { 0x1F6FEB } else { 0x21262D };
         canvas.fill_rect(win.x + 1, win.y + 1, win.w - 2, 24, title_bg);
-        canvas.draw_text_clipped(
-            win.x + 10,
-            win.y + 9,
-            win.w - 44,
-            win.title,
-            0xFFFFFF,
-            1,
-        );
+        canvas.draw_text_clipped(win.x + 10, win.y + 9, win.w - 44, win.title, 0xFFFFFF, 1);
         canvas.draw_button(
             win.x + win.w - 26,
             win.y + 4,
@@ -473,7 +620,13 @@ impl Desktop {
             AppId::System => self.draw_system_contents(canvas, win),
             AppId::PizGet => self.draw_pizget_contents(canvas, win),
             AppId::Files => self.draw_files_contents(canvas, win),
-            AppId::About => self.draw_about_contents(canvas, win),
+            AppId::Terminal => self.terminal.draw(canvas, win.x, win.y, win.w, win.h),
+            AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h),
+            AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h),
+            AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h),
+            AppId::Settings => {
+                draw_settings_about_os(canvas, win.x, win.y, win.w, win.h, &self.kernel, &self.mem)
+            }
         }
     }
 
@@ -486,14 +639,7 @@ impl Desktop {
         canvas.draw_text_clipped(x, y + 16, iw, &format!("Uptime: {}", self.uptime), 0xE6EDF3, 1);
         canvas.draw_text_clipped(x, y + 32, iw, &format!("Load  : {}", self.loadavg), 0xE6EDF3, 1);
 
-        canvas.draw_text_clipped(
-            x,
-            y + 54,
-            iw,
-            &format!("CPU: {}%", self.cpu_pct),
-            0x79C0FF,
-            1,
-        );
+        canvas.draw_text_clipped(x, y + 54, iw, &format!("CPU: {}%", self.cpu_pct), 0x79C0FF, 1);
         canvas.draw_progress_bar(x, y + 66, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
 
         canvas.draw_text_clipped(
@@ -555,14 +701,7 @@ impl Desktop {
         let iw = win.w - 28;
 
         if self.packages.is_empty() {
-            canvas.draw_text_clipped(
-                x,
-                y + 8,
-                iw,
-                "Net paketov (nazhmi Obnovi)",
-                0x8B949E,
-                1,
-            );
+            canvas.draw_text_clipped(x, y + 8, iw, "Net paketov (nazhmi Obnovi)", 0x8B949E, 1);
         } else {
             let max_rows = ((win.h - 86) / 18).max(1) as usize;
             for (i, p) in self.packages.iter().take(max_rows).enumerate() {
@@ -621,26 +760,5 @@ impl Desktop {
                 1,
             );
         }
-    }
-
-    fn draw_about_contents(&self, canvas: &mut Canvas, win: &Window) {
-        let x = win.x + 14;
-        let y = win.y + 38;
-        let iw = win.w - 28;
-        canvas.draw_text_clipped(x, y, iw, "Pizsoft UI v0.1.0", 0x58A6FF, 2);
-        canvas.draw_text_clipped(x, y + 28, iw, "pizdOS 2.0 (Alpine GNU-Free)", 0xE6EDF3, 1);
-        canvas.draw_text_clipped(x, y + 46, iw, "0 external crates | 0% GNU", 0x3FB950, 1);
-        canvas.draw_text_clipped(x, y + 64, iw, "Pizsoft Corporation (c) 2026", 0x8B949E, 1);
-
-        canvas.draw_button(
-            x,
-            win.y + win.h - 38,
-            110,
-            26,
-            "Vyhod",
-            0xB62324,
-            0xFFFFFF,
-            0xFF7B72,
-        );
     }
 }
