@@ -31,8 +31,22 @@ pub struct RasterGlyph {
     pub alpha: Vec<u8>,
 }
 
+struct FontCaches {
+    ascii_1x: [Option<&'static RasterGlyph>; 95],
+    other: HashMap<(char, i32), &'static RasterGlyph>,
+}
+
+impl FontCaches {
+    fn new() -> Self {
+        Self {
+            ascii_1x: [None; 95],
+            other: HashMap::with_capacity(128),
+        }
+    }
+}
+
 thread_local! {
-    static GLYPH_CACHE: RefCell<HashMap<(char, i32), &'static RasterGlyph>> = RefCell::new(HashMap::new());
+    static GLYPH_CACHE: RefCell<FontCaches> = RefCell::new(FontCaches::new());
 }
 
 #[inline]
@@ -56,13 +70,24 @@ pub fn measure_text(s: &str, scale: i32) -> i32 {
 pub fn rasterize_cached(ch: char, scale: i32) -> &'static RasterGlyph {
     let s = scale.max(1);
     GLYPH_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if let Some(&g) = map.get(&(ch, s)) {
+        let mut fc = cache.borrow_mut();
+        if s == 1 {
+            let u = ch as u32;
+            if (0x20..=0x7E).contains(&u) {
+                let idx = (u - 0x20) as usize;
+                if let Some(g) = fc.ascii_1x[idx] {
+                    return g;
+                }
+                let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s)));
+                fc.ascii_1x[idx] = Some(leaked);
+                return leaked;
+            }
+        }
+        if let Some(&g) = fc.other.get(&(ch, s)) {
             return g;
         }
-        let built = build_raster_glyph(ch, s);
-        let leaked: &'static RasterGlyph = Box::leak(Box::new(built));
-        map.insert((ch, s), leaked);
+        let leaked: &'static RasterGlyph = Box::leak(Box::new(build_raster_glyph(ch, s)));
+        fc.other.insert((ch, s), leaked);
         leaked
     })
 }

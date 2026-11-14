@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::font::{GLYPH_H, measure_text, rasterize_cached};
+use crate::font::{GLYPH_H, RasterGlyph, measure_text, rasterize_cached};
 
 /// 32-bit XRGB pixel canvas (0x00RRGGBB).
 pub struct Canvas {
@@ -25,13 +25,25 @@ pub fn lerp_rgb(c1: u32, c2: u32, t: u32, max_t: u32) -> u32 {
 }
 
 #[inline]
-fn blend_rgb(dst: u32, src: u32, alpha: u8) -> u32 {
+pub fn blend_rgb(dst: u32, src: u32, alpha: u8) -> u32 {
+    if alpha == 0 {
+        return dst;
+    }
+    if alpha == 255 {
+        return src;
+    }
     let a = alpha as u32;
     let inv = 255 - a;
-    let r = (((dst >> 16) & 0xFF) * inv + ((src >> 16) & 0xFF) * a) / 255;
-    let g = (((dst >> 8) & 0xFF) * inv + ((src >> 8) & 0xFF) * a) / 255;
-    let b = ((dst & 0xFF) * inv + (src & 0xFF) * a) / 255;
-    (r << 16) | (g << 8) | b
+    let d_rb = dst & 0x00FF_00FF;
+    let s_rb = src & 0x00FF_00FF;
+    let rb = d_rb * inv + s_rb * a + 0x0080_0080;
+    let rb = ((rb + ((rb >> 8) & 0x00FF_00FF)) >> 8) & 0x00FF_00FF;
+
+    let d_g = (dst >> 8) & 0xFF;
+    let s_g = (src >> 8) & 0xFF;
+    let g = d_g * inv + s_g * a + 128;
+    let g = (g + (g >> 8)) >> 8;
+    rb | (g << 8)
 }
 
 impl Canvas {
@@ -81,18 +93,54 @@ impl Canvas {
         }
     }
 
+    /// Copy an opaque packed RGB pixel buffer (`w x h`) onto the canvas with clipping.
+    pub fn blit_rgb_rect(&mut self, dx: i32, dy: i32, w: i32, h: i32, src: &[u32]) {
+        if w <= 0 || h <= 0 || src.len() < (w as usize) * (h as usize) {
+            return;
+        }
+        let x0 = dx.max(0);
+        let y0 = dy.max(0);
+        let x1 = (dx + w).min(self.width as i32);
+        let y1 = (dy + h).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let copy_w = (x1 - x0) as usize;
+        let sx0 = (x0 - dx) as usize;
+        for py in y0..y1 {
+            let sy = (py - dy) as usize;
+            let dst_off = (py as usize) * self.width + (x0 as usize);
+            let src_off = sy * (w as usize) + sx0;
+            self.pixels[dst_off..dst_off + copy_w]
+                .copy_from_slice(&src[src_off..src_off + copy_w]);
+        }
+    }
+
     pub fn blend_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u8) {
-        if w <= 0 || h <= 0 {
+        if w <= 0 || h <= 0 || alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(x, y, w, h, color);
             return;
         }
         let x0 = x.max(0) as usize;
         let y0 = y.max(0) as usize;
         let x1 = (x + w).min(self.width as i32).max(0) as usize;
         let y1 = (y + h).min(self.height as i32).max(0) as usize;
+        let a = alpha as u32;
+        let inv = 255 - a;
+        let s_rb_a = (color & 0x00FF_00FF) * a + 0x0080_0080;
+        let s_g_a = ((color >> 8) & 0xFF) * a + 128;
         for py in y0..y1 {
             let row = py * self.width;
-            for px in x0..x1 {
-                self.pixels[row + px] = blend_rgb(self.pixels[row + px], color, alpha);
+            for px in &mut self.pixels[row + x0..row + x1] {
+                let dst = *px;
+                let rb = (dst & 0x00FF_00FF) * inv + s_rb_a;
+                let rb = ((rb + ((rb >> 8) & 0x00FF_00FF)) >> 8) & 0x00FF_00FF;
+                let g = ((dst >> 8) & 0xFF) * inv + s_g_a;
+                let g = (g + (g >> 8)) >> 8;
+                *px = rb | (g << 8);
             }
         }
     }
@@ -428,21 +476,39 @@ impl Canvas {
         if r <= 0.0 || alpha == 0 {
             return;
         }
-        let x0 = (cx - r - 1.0).floor() as i32;
-        let x1 = (cx + r + 1.0).ceil() as i32;
-        let y0 = (cy - r - 1.0).floor() as i32;
-        let y1 = (cy + r + 1.0).ceil() as i32;
+        let x0 = ((cx - r - 1.0).floor() as i32).max(0);
+        let x1 = ((cx + r + 1.0).ceil() as i32).min(self.width as i32 - 1);
+        let y0 = ((cy - r - 1.0).floor() as i32).max(0);
+        let y1 = ((cy + r + 1.0).ceil() as i32).min(self.height as i32 - 1);
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let r_in = (r - 0.7).max(0.0);
+        let r_in2 = r_in * r_in;
+        let r_out = r + 0.7;
+        let r_out2 = r_out * r_out;
+
         for py in y0..=y1 {
             let dy = py as f32 + 0.5 - cy;
+            let dy2 = dy * dy;
+            let row = (py as usize) * self.width;
             for px in x0..=x1 {
                 let dx = px as f32 + 0.5 - cx;
-                let dist = (dx * dx + dy * dy).sqrt() - r;
+                let d2 = dx * dx + dy2;
+                if d2 >= r_out2 {
+                    continue;
+                }
+                if d2 <= r_in2 {
+                    let idx = row + px as usize;
+                    self.pixels[idx] = blend_rgb(self.pixels[idx], color, alpha);
+                    continue;
+                }
+                let dist = d2.sqrt() - r;
                 let cov = (0.5 - dist).clamp(0.0, 1.0);
-                if cov > 0.01 {
-                    let a = (alpha as f32 * cov) as u8;
-                    if a > 0 {
-                        self.blend_pixel(px, py, color, a);
-                    }
+                let a = (alpha as f32 * cov) as u8;
+                if a > 0 {
+                    let idx = row + px as usize;
+                    self.pixels[idx] = blend_rgb(self.pixels[idx], color, a);
                 }
             }
         }
@@ -534,26 +600,110 @@ impl Canvas {
         }
     }
 
-    pub fn draw_soft_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32) {
-        self.blend_rounded_rect(x - 6, y + 2, w + 12, h + 14, r + 7, 0x000000, 14);
-        self.blend_rounded_rect(x - 3, y + 4, w + 6, h + 8, r + 4, 0x000000, 24);
-        self.blend_rounded_rect(x, y + 5, w + 2, h + 5, r + 2, 0x000000, 36);
-        self.blend_rounded_rect(x + 1, y + 6, w, h + 2, r + 1, 0x000000, 48);
+    fn blend_rounded_outer_ring(
+        &mut self,
+        outer: (i32, i32, i32, i32, i32),
+        inner: (i32, i32, i32, i32),
+        alpha: u8,
+    ) {
+        let (sx, sy, sw, sh, sr) = outer;
+        let (inner_x, inner_y, inner_w, inner_h) = inner;
+        if sw <= 0 || sh <= 0 || alpha == 0 {
+            return;
+        }
+        let sr = sr.min(sw / 2).min(sh / 2).max(0);
+        let top_h = (inner_y - sy).clamp(0, sh);
+        let bot_y = (inner_y + inner_h).clamp(sy, sy + sh);
+        let bot_h = (sy + sh - bot_y).max(0);
+        let mid_y = sy + top_h;
+        let mid_h = (bot_y - mid_y).max(0);
+        let left_w = (inner_x - sx).clamp(0, sw);
+        let right_x = (inner_x + inner_w).clamp(sx, sx + sw);
+        let right_w = (sx + sw - right_x).max(0);
+
+        // Straight outer bands outside the inner window rect (zero wasted fills behind opaque UI!)
+        if top_h > sr {
+            self.blend_rect(sx, sy + sr, sw, top_h - sr, 0x000000, alpha);
+        }
+        let top_bar_h = top_h.min(sr);
+        if top_bar_h > 0 {
+            self.blend_rect(sx + sr, sy, (sw - 2 * sr).max(0), top_bar_h, 0x000000, alpha);
+        }
+        if bot_h > sr {
+            self.blend_rect(sx, bot_y, sw, bot_h - sr, 0x000000, alpha);
+        }
+        let bot_bar_h = bot_h.min(sr);
+        if bot_bar_h > 0 {
+            self.blend_rect(
+                sx + sr,
+                sy + sh - bot_bar_h,
+                (sw - 2 * sr).max(0),
+                bot_bar_h,
+                0x000000,
+                alpha,
+            );
+        }
+        if mid_h > 0 {
+            if left_w > 0 {
+                self.blend_rect(sx, mid_y, left_w, mid_h, 0x000000, alpha);
+            }
+            if right_w > 0 {
+                self.blend_rect(right_x, mid_y, right_w, mid_h, 0x000000, alpha);
+            }
+        }
+        for dy in 0..sr {
+            for dx in 0..sr {
+                let cov = Self::corner_cov(sr - 1 - dx, sr - 1 - dy, sr);
+                if cov > 0 {
+                    let a = ((alpha as u32 * cov as u32) / 255) as u8;
+                    if a > 0 {
+                        for &(px, py) in &[
+                            (sx + dx, sy + dy),
+                            (sx + sw - 1 - dx, sy + dy),
+                            (sx + dx, sy + sh - 1 - dy),
+                            (sx + sw - 1 - dx, sy + sh - 1 - dy),
+                        ] {
+                            if px < inner_x || px >= inner_x + inner_w || py < inner_y || py >= inner_y + inner_h {
+                                self.blend_pixel(px, py, 0x000000, a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: u32, scale: i32) -> i32 {
-        let g = rasterize_cached(ch, scale);
-        for row in 0..g.height {
-            let py = y + row as i32;
-            let row_off = row * g.width;
-            for col in 0..g.width {
-                let a = g.alpha[row_off + col];
+    pub fn draw_soft_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32) {
+        let ir = r.min(w / 2).min(h / 2).max(0);
+        let inner = (x + ir, y + ir, (w - 2 * ir).max(0), (h - 2 * ir).max(0));
+        self.blend_rounded_outer_ring((x - 6, y + 2, w + 12, h + 14, r + 7), inner, 14);
+        self.blend_rounded_outer_ring((x - 3, y + 4, w + 6, h + 8, r + 4), inner, 24);
+        self.blend_rounded_outer_ring((x, y + 5, w + 2, h + 5, r + 2), inner, 36);
+        self.blend_rounded_outer_ring((x + 1, y + 6, w, h + 2, r + 1), inner, 48);
+    }
+
+    fn draw_glyph(&mut self, x: i32, y: i32, g: &RasterGlyph, color: u32) -> i32 {
+        let x0 = (-x).max(0) as usize;
+        let y0 = (-y).max(0) as usize;
+        let x1 = ((self.width as i32 - x).min(g.width as i32)).max(0) as usize;
+        let y1 = ((self.height as i32 - y).min(g.height as i32)).max(0) as usize;
+        for row in y0..y1 {
+            let dst_row = (y + row as i32) as usize * self.width;
+            let src_row = row * g.width;
+            for col in x0..x1 {
+                let a = g.alpha[src_row + col];
                 if a > 0 {
-                    self.blend_pixel(x + col as i32, py, color, a);
+                    let dst_idx = dst_row + (x + col as i32) as usize;
+                    self.pixels[dst_idx] = blend_rgb(self.pixels[dst_idx], color, a);
                 }
             }
         }
         g.advance
+    }
+
+    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: u32, scale: i32) -> i32 {
+        let g = rasterize_cached(ch, scale);
+        self.draw_glyph(x, y, g, color)
     }
 
     pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, scale: i32) {
@@ -582,11 +732,11 @@ impl Canvas {
         let limit = x + max_w;
         let mut cx = x;
         for ch in text.chars() {
-            let adv = rasterize_cached(ch, s).advance;
-            if cx + adv > limit {
+            let g = rasterize_cached(ch, s);
+            if cx + g.advance > limit {
                 break;
             }
-            cx += self.draw_char(cx, y, ch, color, s);
+            cx += self.draw_glyph(cx, y, g, color);
         }
     }
 
@@ -638,13 +788,15 @@ impl Canvas {
         self.draw_text_clipped(tx, ty, w - 8, label, fg_color, 1);
     }
 
-    pub fn draw_toggle(&mut self, x: i32, y: i32, on: bool, accent: u32) {
-        let track = if on { accent } else { 0x262B36 };
+    pub fn draw_toggle_anim(&mut self, x: i32, y: i32, t: f32, accent: u32) {
+        let t = t.clamp(0.0, 1.0);
+        let ti = (t * 255.0) as u32;
+        let track = lerp_rgb(0x262B36, accent, ti, 255);
         self.fill_rounded_rect(x, y, 36, 18, 9, track);
-        self.draw_rounded_rect_alpha(x, y, 36, 18, 9, 0xFFFFFF, if on { 55 } else { 28 });
-        let knob_cx = if on { x + 26 } else { x + 9 };
-        self.fill_aa_circle(knob_cx as f32 + 0.5, y as f32 + 10.2, 6.2, 0x000000, 65);
-        self.fill_aa_circle(knob_cx as f32 + 0.5, y as f32 + 9.0, 6.0, 0xF8FAFC, 255);
+        self.draw_rounded_rect_alpha(x, y, 36, 18, 9, 0xFFFFFF, 28 + (ti * 27 / 255) as u8);
+        let knob_cx = x as f32 + 9.0 + t * 17.0;
+        self.fill_aa_circle(knob_cx + 0.5, y as f32 + 10.2, 6.2, 0x000000, 65);
+        self.fill_aa_circle(knob_cx + 0.5, y as f32 + 9.0, 6.0, 0xF8FAFC, 255);
     }
 
     pub fn draw_cursor(&mut self, mx: i32, my: i32) {

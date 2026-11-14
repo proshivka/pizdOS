@@ -195,4 +195,79 @@ mod tests {
         desktop.on_mouse_down(1100, 700, 1160, 720);
         assert_ne!(desktop.settings.show_clock, orig_clock);
     }
+
+    #[test]
+    fn test_swar_blend_customization_and_animations() {
+        // 1. SWAR blend_rgb accuracy across alpha 0..=255
+        let samples = [(0x102030, 0xF43F5E), (0x000000, 0xFFFFFF), (0xAABBCC, 0x112233)];
+        for (dst, src) in samples {
+            assert_eq!(gfx::blend_rgb(dst, src, 0), dst & 0x00FF_FFFF);
+            assert_eq!(gfx::blend_rgb(dst, src, 255), src & 0x00FF_FFFF);
+            for a in 0..=255u8 {
+                let got = gfx::blend_rgb(dst, src, a);
+                let inv = 255 - a as u32;
+                let au = a as u32;
+                for shift in [16, 8, 0] {
+                    let dc = (dst >> shift) & 0xFF;
+                    let sc = (src >> shift) & 0xFF;
+                    let exact = (dc * inv + sc * au) / 255;
+                    let gc = (got >> shift) & 0xFF;
+                    assert!(
+                        gc.abs_diff(exact) <= 1,
+                        "channel diff too large: alpha={a} got={gc} exact={exact}"
+                    );
+                }
+            }
+        }
+
+        // 2. Settings customization: Accent palette, Floating Dock, Animations, Glass Intensity
+        let mut desktop = Desktop::new(1160, 720);
+        let sw = desktop.windows.last().unwrap().clone(); // Settings at (370, 90, 520, 344)
+        assert_eq!(desktop.settings.accent_idx, 0);
+        assert!(!desktop.settings.floating_dock);
+        assert!(desktop.settings.animations);
+        assert_eq!(desktop.settings.glass_level, 0);
+
+        // Click Display tab (sidebar idx 0: x+20, y+45)
+        desktop.on_mouse_down(sw.x + 40, sw.y + 45, 1160, 720);
+        assert_eq!(desktop.settings.page, apps::SettingsPage::Display);
+        // Step animations -> pill smoothly approaches Display tab (y=0.0)
+        for _ in 0..40 {
+            desktop.on_tick();
+        }
+        assert!(desktop.settings.tab_pill_y < 0.5);
+
+        // Select Cobalt custom accent dot (index 1 -> ACCENT_PALETTE[0])
+        desktop.on_mouse_down(sw.x + sw.w - 136 + 22, sw.y + 230, 1160, 720);
+        assert_eq!(desktop.settings.accent_idx, 1);
+        assert_eq!(desktop.settings.active_accent(), apps::ACCENT_PALETTE[0]);
+
+        // Click Taskbar tab (sidebar idx 1: y+75) & toggle Floating Minimal Dock
+        desktop.on_mouse_down(sw.x + 40, sw.y + 75, 1160, 720);
+        assert_eq!(desktop.settings.page, apps::SettingsPage::Taskbar);
+        desktop.on_mouse_down(sw.x + 250, sw.y + 110, 1160, 720);
+        assert!(desktop.settings.floating_dock);
+        for _ in 0..40 {
+            desktop.on_tick();
+        }
+        assert!((desktop.settings.toggle_anim[3] - 1.0).abs() < 0.02);
+
+        // Click System tab (sidebar idx 2: y+105) & cycle Glass Intensity -> Airy (1)
+        desktop.on_mouse_down(sw.x + 40, sw.y + 105, 1160, 720);
+        assert_eq!(desktop.settings.page, apps::SettingsPage::System);
+        desktop.on_mouse_down(sw.x + 250, sw.y + 188, 1160, 720);
+        assert_eq!(desktop.settings.glass_level, 1);
+        assert_eq!(desktop.settings.glass_alphas().0, 182);
+
+        // Open Start menu on Floating Dock and render full desktop
+        desktop.on_mouse_down(30, 700, 1160, 720);
+        assert!(desktop.start_menu_open);
+        for _ in 0..20 {
+            desktop.on_tick();
+        }
+        assert!(desktop.start_anim > 0.9);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+        desktop.render(&mut canvas);
+        assert!(canvas.pixels.iter().any(|&p| p != 0));
+    }
 }

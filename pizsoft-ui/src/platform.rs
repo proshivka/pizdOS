@@ -308,6 +308,7 @@ mod win32 {
                 unsafe { ValidateRect(hwnd, null()) };
                 0
             }
+            0x0014 /* WM_ERASEBKGND */ => 1,
             _ => unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) },
         }
     }
@@ -362,6 +363,22 @@ mod win32 {
         let mut canvas = Canvas::new(1160, 720);
         let mut desktop = Desktop::new(1160, 720);
         let mut msg = Msg::default();
+        let mut bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: 1160,
+                bi_height: -720, // top-down
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
 
         while desktop.running {
             while unsafe { PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) } != 0 {
@@ -419,27 +436,12 @@ mod win32 {
             if cw != canvas.width || ch != canvas.height {
                 canvas.resize(cw, ch);
                 desktop.on_viewport_resize(cw as i32, ch as i32);
+                bmi.bmi_header.bi_width = cw as i32;
+                bmi.bmi_header.bi_height = -(ch as i32);
             }
 
             desktop.on_tick();
             desktop.render(&mut canvas);
-
-            let bmi = BitmapInfo {
-                bmi_header: BitmapInfoHeader {
-                    bi_size: mem::size_of::<BitmapInfoHeader>() as u32,
-                    bi_width: cw as i32,
-                    bi_height: -(ch as i32), // top-down
-                    bi_planes: 1,
-                    bi_bit_count: 32,
-                    bi_compression: 0,
-                    bi_size_image: 0,
-                    bi_x_pels_per_meter: 0,
-                    bi_y_pels_per_meter: 0,
-                    bi_clr_used: 0,
-                    bi_clr_important: 0,
-                },
-                bmi_colors: [0],
-            };
 
             let hdc = unsafe { GetDC(hwnd) };
             if hdc != 0 {

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs;
 use std::process::Command;
 
@@ -706,13 +707,33 @@ pub enum SettingsAction {
     OpenPizGet,
 }
 
+pub const ACCENT_PALETTE: [u32; 5] = [
+    0x388BFD, // Cobalt
+    0x2DD4BF, // Mint
+    0xA855F7, // Orchid
+    0xF43F5E, // Coral
+    0xF59E0B, // Amber
+];
+
+struct HeroCache {
+    iw: i32,
+    theme: ThemePreset,
+    accent: u32,
+    hero: Vec<u32>,
+    mini: Vec<u32>,
+}
+
 pub struct SettingsState {
     pub page: SettingsPage,
     pub lang: Lang,
     pub theme: ThemePreset,
+    pub accent_idx: usize,
     pub show_grid: bool,
     pub show_icons: bool,
     pub taskbar_top: bool,
+    pub floating_dock: bool,
+    pub animations: bool,
+    pub glass_level: u8,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub snake_tick_div: u64,
@@ -720,6 +741,9 @@ pub struct SettingsState {
     pub editing_device: bool,
     pub update_taps: u8,
     pub license_alt: bool,
+    pub tab_pill_y: f32,
+    pub toggle_anim: [f32; 7],
+    hero_cache: RefCell<Option<HeroCache>>,
 }
 
 impl SettingsState {
@@ -728,9 +752,13 @@ impl SettingsState {
             page: SettingsPage::About,
             lang: Lang::Ru,
             theme: ThemePreset::AuroraPeaks,
+            accent_idx: 0,
             show_grid: false,
             show_icons: true,
             taskbar_top: false,
+            floating_dock: false,
+            animations: true,
+            glass_level: 0,
             crosshair_cursor: false,
             show_clock: true,
             snake_tick_div: 10,
@@ -738,6 +766,123 @@ impl SettingsState {
             editing_device: false,
             update_taps: 0,
             license_alt: false,
+            tab_pill_y: 90.0,
+            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            hero_cache: RefCell::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn active_accent(&self) -> u32 {
+        if self.accent_idx == 0 {
+            self.theme.accent()
+        } else {
+            ACCENT_PALETTE
+                .get(self.accent_idx - 1)
+                .copied()
+                .unwrap_or_else(|| self.theme.accent())
+        }
+    }
+
+    /// Returns `(panel_alpha, border_alpha_boost)` for the selected glass density.
+    #[inline]
+    pub fn glass_alphas(&self) -> (u8, u8) {
+        match self.glass_level {
+            1 => (182, 42), // Frosted / Airy Glass
+            2 => (246, 18), // Dense / Solid Dark
+            _ => (228, 28), // Standard Liquid Glass
+        }
+    }
+
+    #[inline]
+    fn page_index(&self) -> usize {
+        match self.page {
+            SettingsPage::Display => 0,
+            SettingsPage::Taskbar => 1,
+            SettingsPage::System => 2,
+            SettingsPage::About => 3,
+        }
+    }
+
+    pub fn step_anim(&mut self) {
+        let target_pill = (self.page_index() as f32) * 30.0;
+        let targets = [
+            self.show_grid,
+            self.show_icons,
+            self.taskbar_top,
+            self.floating_dock,
+            self.animations,
+            self.crosshair_cursor,
+            self.show_clock,
+        ];
+        if !self.animations {
+            self.tab_pill_y = target_pill;
+            for (slot, &on) in self.toggle_anim.iter_mut().zip(targets.iter()) {
+                *slot = if on { 1.0 } else { 0.0 };
+            }
+            return;
+        }
+        let diff = target_pill - self.tab_pill_y;
+        if diff.abs() < 0.25 {
+            self.tab_pill_y = target_pill;
+        } else {
+            self.tab_pill_y += diff * 0.28;
+        }
+        for (slot, &on) in self.toggle_anim.iter_mut().zip(targets.iter()) {
+            let tgt = if on { 1.0 } else { 0.0 };
+            let d = tgt - *slot;
+            if d.abs() < 0.015 {
+                *slot = tgt;
+            } else {
+                *slot += d * 0.30;
+            }
+        }
+    }
+
+    fn blit_cached_hero(
+        &self,
+        canvas: &mut Canvas,
+        hero_rect: (i32, i32, i32),
+        scr_pos: (i32, i32),
+        accent: u32,
+    ) {
+        let (x, y, iw) = hero_rect;
+        let (scr_x, scr_y) = scr_pos;
+        let cw = iw.clamp(16, 1200);
+        let mut cache_ref = self.hero_cache.borrow_mut();
+        let valid = cache_ref
+            .as_ref()
+            .is_some_and(|c| c.iw == cw && c.theme == self.theme && c.accent == accent);
+        if !valid {
+            let (wp_tl, wp_br, wp_a, wp_b, _, wp_rib) = self.theme.mesh_palette();
+            let cw_u = cw as usize;
+            let mut hc = Canvas::new(cw_u, 90);
+            hc.pixels.fill(0x131720);
+            hc.fill_luminous_card(
+                0,
+                0,
+                cw,
+                90,
+                14,
+                0x101521,
+                lerp_rgb(0x161E30, accent, 52, 255),
+                accent,
+                wp_rib,
+            );
+            let mut mc = Canvas::new(32, 52);
+            mc.pixels.fill(0x161B26);
+            mc.fill_luminous_card(0, 0, 32, 52, 6, wp_tl, wp_br, wp_a, wp_b);
+            *cache_ref = Some(HeroCache {
+                iw: cw,
+                theme: self.theme,
+                accent,
+                hero: hc.pixels,
+                mini: mc.pixels,
+            });
+        }
+        if let Some(c) = cache_ref.as_ref() {
+            canvas.blit_rgb_rect(x, y, cw, 90, &c.hero);
+            canvas.blit_rgb_rect(scr_x, scr_y, 32, 52, &c.mini);
         }
     }
 
@@ -803,7 +948,17 @@ impl SettingsState {
                     self.show_grid = !self.show_grid;
                 } else if (172..206).contains(&ly) {
                     self.show_icons = !self.show_icons;
-                } else if (218..=270).contains(&ly) && iw >= 160 {
+                } else if (214..248).contains(&ly) {
+                    let dot_x0 = ww - 136;
+                    if lx >= dot_x0 - 11 {
+                        let idx = ((lx - (dot_x0 - 11)) / 22) as usize;
+                        if idx < 6 {
+                            self.accent_idx = idx;
+                        }
+                    } else {
+                        self.accent_idx = (self.accent_idx + 1) % 6;
+                    }
+                } else if (256..=302).contains(&ly) && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let rel_x = lx - 146;
                     let idx = (rel_x / (sw_w + 6)) as usize;
@@ -823,8 +978,12 @@ impl SettingsState {
                 if (60..94).contains(&ly) {
                     self.taskbar_top = !self.taskbar_top;
                 } else if (94..128).contains(&ly) {
-                    self.crosshair_cursor = !self.crosshair_cursor;
+                    self.floating_dock = !self.floating_dock;
                 } else if (128..162).contains(&ly) {
+                    self.animations = !self.animations;
+                } else if (162..196).contains(&ly) {
+                    self.crosshair_cursor = !self.crosshair_cursor;
+                } else if (196..230).contains(&ly) {
                     self.show_clock = !self.show_clock;
                 }
             }
@@ -836,7 +995,9 @@ impl SettingsState {
                         10 => 5,
                         _ => 14,
                     };
-                } else if (206..240).contains(&ly) {
+                } else if (172..206).contains(&ly) {
+                    self.glass_level = (self.glass_level + 1) % 3;
+                } else if (240..274).contains(&ly) {
                     return SettingsAction::RefreshMetrics;
                 }
             }
@@ -935,7 +1096,7 @@ impl SettingsState {
         row_h: i32,
         dot_col: u32,
         label: &str,
-        on: bool,
+        anim_t: f32,
         accent: u32,
         hovered: bool,
         divider_top: bool,
@@ -950,7 +1111,7 @@ impl SettingsState {
         canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, dot_col, 32);
         canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, dot_col, 240);
         canvas.draw_text_clipped(x + 32, mid_y - 7, w - 82, label, 0xE2E8F0, 1);
-        canvas.draw_toggle(x + w - 48, mid_y - 9, on, accent);
+        canvas.draw_toggle_anim(x + w - 48, mid_y - 9, anim_t, accent);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -965,19 +1126,24 @@ impl SettingsState {
         mem: &MemInfo,
         cpu_pct: u8,
         uptime: &str,
+        tick: u64,
         hover_lx: i32,
         hover_ly: i32,
     ) {
         let lang = self.lang;
-        let accent = self.theme.accent();
+        let accent = self.active_accent();
 
-        // Minimalist flat sidebar
+        // Minimalist flat sidebar with smooth sliding active indicator pill
         let sb_x = wx + 10;
         let sb_y = wy + 34;
         let sb_w = 126;
         let sb_h = wh - 44;
         canvas.fill_rounded_rect(sb_x, sb_y, sb_w, sb_h, 8, 0x11151E);
         canvas.draw_rounded_rect_alpha(sb_x, sb_y, sb_w, sb_h, 8, 0xFFFFFF, 18);
+
+        let pill_y = sb_y + 6 + self.tab_pill_y.round() as i32;
+        canvas.blend_rounded_rect(sb_x + 5, pill_y, sb_w - 10, 25, 6, accent, 42);
+        canvas.fill_rounded_rect(sb_x + 7, pill_y + 6, 3, 13, 1, accent);
 
         let tabs = [
             (SettingsPage::Display, tr(lang, "Экран и язык", "Display & Lang")),
@@ -991,10 +1157,7 @@ impl SettingsState {
             let local_ty = 40 + (i as i32) * 30;
             let hovered = (10..=136).contains(&hover_lx)
                 && (local_ty..local_ty + 25).contains(&hover_ly);
-            if active {
-                canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 25, 6, accent, 42);
-                canvas.fill_rounded_rect(sb_x + 7, ty + 6, 3, 13, 1, accent);
-            } else if hovered {
+            if !active && hovered {
                 canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 25, 6, 0xFFFFFF, 12);
             }
             let fg = if active { 0xF8FAFC } else { 0x94A3B8 };
@@ -1012,7 +1175,7 @@ impl SettingsState {
                     x + 2,
                     y + 2,
                     iw,
-                    tr(lang, "Экран, обои и язык", "Display, Wallpaper & Lang"),
+                    tr(lang, "Экран, обои и акцент", "Display, Wallpaper & Accent"),
                     0x94A3B8,
                     1,
                 );
@@ -1056,7 +1219,7 @@ impl SettingsState {
                     34,
                     0xA855F7,
                     tr(lang, "Сетка поверх обоев", "Wallpaper Grid"),
-                    self.show_grid,
+                    self.toggle_anim[0],
                     accent,
                     in_content && (138..172).contains(&hover_ly),
                     false,
@@ -1069,15 +1232,53 @@ impl SettingsState {
                     34,
                     0x3FB950,
                     tr(lang, "Иконки на рабочем столе", "Desktop Icons"),
-                    self.show_icons,
+                    self.toggle_anim[1],
                     accent,
                     in_content && (172..206).contains(&hover_ly),
                     true,
                 );
 
+                // Card 3: System Accent Color Palette
+                let c3_y = wy + 214;
+                Self::draw_card_frame(canvas, x, c3_y, iw, 34, 12);
+                if in_content && (214..248).contains(&hover_ly) {
+                    canvas.blend_rounded_rect(x + 4, c3_y + 2, iw - 8, 30, 8, 0xFFFFFF, 10);
+                }
+                let mid_y = c3_y + 17;
+                canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, accent, 32);
+                canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, accent, 240);
+                canvas.draw_text_clipped(
+                    x + 32,
+                    mid_y - 7,
+                    (iw - 165).max(40),
+                    tr(lang, "Цвет акцента", "Accent Color"),
+                    0xE2E8F0,
+                    1,
+                );
+                let dot_x0 = x + iw - 124;
+                for i in 0..6 {
+                    let cx = (dot_x0 + (i as i32) * 22) as f32;
+                    let cy = mid_y as f32;
+                    let col = if i == 0 {
+                        self.theme.accent()
+                    } else {
+                        ACCENT_PALETTE[i - 1]
+                    };
+                    if self.accent_idx == i {
+                        canvas.fill_aa_circle(cx, cy, 9.2, 0xFFFFFF, 215);
+                        canvas.fill_aa_circle(cx, cy, 7.6, 0x161B26, 255);
+                    }
+                    canvas.fill_aa_circle(cx, cy, 6.2, col, 255);
+                    if i == 0 {
+                        // Subtle inner auto-ring
+                        canvas.fill_aa_circle(cx, cy, 2.1, 0xFFFFFF, 225);
+                    }
+                }
+
                 // Interactive ColorOS Luminous Theme Swatches
-                let sw_y = wy + 218;
-                if sw_y + 52 <= wy + wh - 10 && iw >= 160 {
+                let sw_y = wy + 256;
+                let sw_h = (wy + wh - 10 - sw_y).clamp(32, 46);
+                if sw_y + 32 <= wy + wh - 8 && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let presets = [
                         ThemePreset::AuroraPeaks,
@@ -1088,19 +1289,25 @@ impl SettingsState {
                     for (i, preset) in presets.iter().enumerate() {
                         let sx = x + (i as i32) * (sw_w + 6);
                         let (tl, br, ba, _, _, rib) = preset.mesh_palette();
-                        canvas.fill_luminous_card(sx, sw_y, sw_w, 52, 10, tl, br, ba, rib);
+                        canvas.fill_luminous_card(sx, sw_y, sw_w, sw_h, 10, tl, br, ba, rib);
                         let selected = *preset == self.theme;
                         canvas.draw_rounded_rect_alpha(
                             sx,
                             sw_y,
                             sw_w,
-                            52,
+                            sw_h,
                             10,
                             0xFFFFFF,
                             if selected { 175 } else { 28 },
                         );
                         if selected {
-                            canvas.fill_aa_circle((sx + sw_w - 11) as f32, (sw_y + 11) as f32, 3.2, 0xFFFFFF, 240);
+                            canvas.fill_aa_circle(
+                                (sx + sw_w - 11) as f32,
+                                (sw_y + 11) as f32,
+                                3.2,
+                                0xFFFFFF,
+                                240,
+                            );
                         }
                     }
                 }
@@ -1110,13 +1317,13 @@ impl SettingsState {
                     x + 2,
                     y + 2,
                     iw,
-                    tr(lang, "Панель задач и поведение", "Taskbar & Behaviour"),
+                    tr(lang, "Панель задач и эффекты", "Taskbar & Effects"),
                     0x94A3B8,
                     1,
                 );
 
                 let c_y = wy + 60;
-                Self::draw_card_frame(canvas, x, c_y, iw, 102, 12);
+                Self::draw_card_frame(canvas, x, c_y, iw, 170, 12);
                 Self::draw_toggle_row(
                     canvas,
                     x,
@@ -1125,7 +1332,7 @@ impl SettingsState {
                     34,
                     accent,
                     tr(lang, "Панель задач сверху", "Taskbar on Top"),
-                    self.taskbar_top,
+                    self.toggle_anim[2],
                     accent,
                     in_content && (60..94).contains(&hover_ly),
                     false,
@@ -1136,9 +1343,9 @@ impl SettingsState {
                     c_y + 34,
                     iw,
                     34,
-                    0xF59E0B,
-                    tr(lang, "Курсор-прицел", "Crosshair Cursor"),
-                    self.crosshair_cursor,
+                    0x38BDF8,
+                    tr(lang, "Плавающий док-бар", "Floating Minimal Dock"),
+                    self.toggle_anim[3],
                     accent,
                     in_content && (94..128).contains(&hover_ly),
                     true,
@@ -1149,22 +1356,48 @@ impl SettingsState {
                     c_y + 68,
                     iw,
                     34,
-                    0x3FB950,
-                    tr(lang, "Часы в трее (выкл = аптайм)", "Clock in Tray (off = uptime)"),
-                    self.show_clock,
+                    0xA855F7,
+                    tr(lang, "Плавные анимации UI", "Smooth UI Animations"),
+                    self.toggle_anim[4],
                     accent,
                     in_content && (128..162).contains(&hover_ly),
                     true,
                 );
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 102,
+                    iw,
+                    34,
+                    0xF59E0B,
+                    tr(lang, "Курсор-прицел", "Crosshair Cursor"),
+                    self.toggle_anim[5],
+                    accent,
+                    in_content && (162..196).contains(&hover_ly),
+                    true,
+                );
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 136,
+                    iw,
+                    34,
+                    0x3FB950,
+                    tr(lang, "Часы в трее (выкл = аптайм)", "Clock in Tray (off = uptime)"),
+                    self.toggle_anim[6],
+                    accent,
+                    in_content && (196..230).contains(&hover_ly),
+                    true,
+                );
 
-                let tip_y = wy + 174;
-                if tip_y + 50 <= wy + wh - 10 {
-                    Self::draw_card_frame(canvas, x, tip_y, iw, 50, 12);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 25) as f32, 6.0, accent, 36);
-                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 25) as f32, 2.5, accent, 240);
+                let tip_y = wy + 240;
+                if tip_y + 46 <= wy + wh - 8 {
+                    Self::draw_card_frame(canvas, x, tip_y, iw, 46, 12);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 23) as f32, 6.0, accent, 36);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 23) as f32, 2.5, accent, 240);
                     canvas.draw_text_clipped(
                         x + 32,
-                        tip_y + 10,
+                        tip_y + 8,
                         iw - 44,
                         tr(lang, "Управление окнами", "Window Controls"),
                         0xF1F5F9,
@@ -1172,7 +1405,7 @@ impl SettingsState {
                     );
                     canvas.draw_text_clipped(
                         x + 32,
-                        tip_y + 28,
+                        tip_y + 25,
                         iw - 44,
                         tr(
                             lang,
@@ -1189,7 +1422,7 @@ impl SettingsState {
                     x + 2,
                     y + 2,
                     iw,
-                    tr(lang, "Производительность и ресурсы", "Performance & Resources"),
+                    tr(lang, "Производительность и стекло", "Performance & Glass"),
                     0x94A3B8,
                     1,
                 );
@@ -1240,9 +1473,9 @@ impl SettingsState {
                     0x30363D,
                 );
 
-                // Bottom Grouped ColorOS Spec & Action Card
+                // Bottom Grouped ColorOS Spec & Action Card (4 rows)
                 let c_y = wy + 138;
-                Self::draw_card_frame(canvas, x, c_y, iw, 102, 12);
+                Self::draw_card_frame(canvas, x, c_y, iw, 136, 12);
                 let spd = match (self.snake_tick_div, lang) {
                     (14, Lang::Ru) => "Медленно",
                     (14, Lang::En) => "Slow",
@@ -1250,6 +1483,14 @@ impl SettingsState {
                     (5, Lang::En) => "Turbo",
                     (_, Lang::Ru) => "Норма",
                     (_, Lang::En) => "Normal",
+                };
+                let glass_lbl = match (self.glass_level, lang) {
+                    (1, Lang::Ru) => "Воздушное",
+                    (1, Lang::En) => "Airy Glass",
+                    (2, Lang::Ru) => "Плотное",
+                    (2, Lang::En) => "Solid Dark",
+                    (_, Lang::Ru) => "Стандарт",
+                    (_, Lang::En) => "Standard",
                 };
                 Self::draw_spec_row(
                     canvas,
@@ -1269,6 +1510,18 @@ impl SettingsState {
                     c_y + 34,
                     iw,
                     34,
+                    0xA855F7,
+                    tr(lang, "Интенсивность стекла", "Glass Intensity"),
+                    glass_lbl,
+                    in_content && (172..206).contains(&hover_ly),
+                    true,
+                );
+                Self::draw_spec_row(
+                    canvas,
+                    x,
+                    c_y + 68,
+                    iw,
+                    34,
                     0x38BDF8,
                     tr(lang, "Аптайм системы", "System Uptime"),
                     uptime,
@@ -1278,31 +1531,30 @@ impl SettingsState {
                 Self::draw_spec_row(
                     canvas,
                     x,
-                    c_y + 68,
+                    c_y + 102,
                     iw,
                     34,
                     accent,
                     tr(lang, "Обновить метрики", "Refresh Metrics"),
                     tr(lang, "Нажать", "Run"),
-                    in_content && (206..240).contains(&hover_ly),
+                    in_content && (240..274).contains(&hover_ly),
                     true,
                 );
             }
             SettingsPage::About => {
-                let (wp_tl, wp_br, wp_a, wp_b, _, wp_rib) = self.theme.mesh_palette();
+                let (_, _, _, _, _, wp_rib) = self.theme.mesh_palette();
+                let bento_y = y + 98;
+                let bento_h = 74;
+                let w1 = ((iw - 8) * 45) / 100;
+                let w2 = iw - 8 - w1;
+                let scr_x = x + w1 - 44;
+                let scr_y = bento_y + 11;
 
-                // 1. ColorOS 15/16/17 Luminous Liquid-Glass Hero Poster
-                canvas.fill_luminous_card(
-                    x,
-                    y,
-                    iw,
-                    90,
-                    14,
-                    0x101521,
-                    lerp_rgb(0x161E30, accent, 52, 255),
-                    accent,
-                    wp_rib,
-                );
+                // 1. ColorOS 15/16/17 Luminous Liquid-Glass Hero Poster (cached RGB buffer!)
+                //    + Bento Device Frame drawn first, then cached Mini Wallpaper blitted inside
+                Self::draw_card_frame(canvas, x, bento_y, w1, bento_h, 12);
+                self.blit_cached_hero(canvas, (x, y, iw), (scr_x, scr_y), accent);
+
                 let hero_hov = in_content && (36..=126).contains(&hover_ly);
                 canvas.draw_rounded_rect_alpha(
                     x,
@@ -1360,7 +1612,7 @@ impl SettingsState {
                     1,
                 );
 
-                // Top-right Official Status Capsule + Bottom-right Luminous Orbital Emblem
+                // Top-right Official Status Capsule + Gently Orbiting Luminous Emblem
                 if iw > 265 {
                     let bx = x + iw - 92;
                     let by = y + 13;
@@ -1373,23 +1625,26 @@ impl SettingsState {
 
                     let ex = (x + iw - 42) as f32;
                     let ey = (y + 62) as f32;
-                    canvas.fill_aa_circle(ex, ey, 19.0, 0xFFFFFF, 18);
-                    canvas.fill_aa_circle(ex - 5.0, ey - 2.0, 10.5, accent, 165);
-                    canvas.fill_aa_circle(ex + 5.0, ey + 2.0, 9.5, wp_rib, 155);
+                    let phase = if self.animations {
+                        (tick as f32) * 0.045
+                    } else {
+                        0.45
+                    };
+                    let ox1 = phase.cos() * 5.2;
+                    let oy1 = phase.sin() * 2.4;
+                    let ox2 = (phase + 2.8).cos() * 5.2;
+                    let oy2 = (phase + 2.8).sin() * 2.4;
+                    canvas.fill_aa_circle(ex, ey, 19.5, 0xFFFFFF, 18);
+                    canvas.fill_aa_circle(ex + ox1, ey + oy1, 10.5, accent, 165);
+                    canvas.fill_aa_circle(ex + ox2, ey + oy2, 9.5, wp_rib, 155);
                     canvas.fill_aa_circle(ex, ey, 5.2, 0x0F1522, 225);
                     canvas.fill_aa_circle(ex, ey, 2.2, 0xFFFFFF, 240);
                 }
 
                 // 2. ColorOS 15/16 Asymmetric Bento Duo: Interactive Device Preview + Memory Card
-                let bento_y = y + 98;
-                let bento_h = 74;
-                let w1 = ((iw - 8) * 45) / 100;
-                let w2 = iw - 8 - w1;
                 let left_hov = in_content && (134..=208).contains(&hover_ly) && hover_lx <= 146 + w1;
                 let right_hov = in_content && (134..=208).contains(&hover_ly) && hover_lx > 146 + w1;
 
-                // Left Card: Editable Device Name + Miniature Live-Wallpaper Screen Frame
-                Self::draw_card_frame(canvas, x, bento_y, w1, bento_h, 12);
                 if self.editing_device {
                     canvas.draw_rounded_rect_alpha(x, bento_y, w1, bento_h, 12, accent, 180);
                 } else if left_hov {
@@ -1417,10 +1672,7 @@ impl SettingsState {
                 canvas.blend_rounded_rect(x + 13, bento_y + 47, 50, 17, 8, accent, 38);
                 canvas.draw_text_clipped(x + 18, bento_y + 49, 44, "x86_64", 0xCBD5E1, 1);
 
-                // Miniature ColorOS Screen Thumbnail displaying live ThemePreset wallpaper
-                let scr_x = x + w1 - 44;
-                let scr_y = bento_y + 11;
-                canvas.fill_luminous_card(scr_x, scr_y, 32, 52, 6, wp_tl, wp_br, wp_a, wp_b);
+                // Miniature ColorOS Screen Border + Speaker Notch (Cached wallpaper already blitted above)
                 canvas.draw_rounded_rect_alpha(scr_x, scr_y, 32, 52, 6, 0xFFFFFF, 95);
                 canvas.fill_rounded_rect(scr_x + 11, scr_y + 4, 10, 2, 1, 0x0A0E16);
 
