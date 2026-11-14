@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::font::{GLYPH_H, glyph, measure_text};
+use crate::font::{GLYPH_H, measure_text, rasterize_cached};
 
 /// 32-bit XRGB pixel canvas (0x00RRGGBB).
 pub struct Canvas {
@@ -398,111 +398,73 @@ impl Canvas {
         }
     }
 
-    /// 2001-style Aqua translucent specular sheen on top half of a rounded element.
-    pub fn draw_aqua_sheen(
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_aa_triangle(
         &mut self,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        r: i32,
-        peak_alpha: u8,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        color: u32,
+        alpha: u8,
     ) {
-        let gloss_h = (h / 2).max(2);
-        let r = r.min(w / 2).min(gloss_h).max(0);
-        for dy in 1..gloss_h {
-            let k = 1.0 - (dy as f32 / gloss_h as f32);
-            let a = (peak_alpha as f32 * k * 0.85) as u8;
-            if a == 0 {
-                continue;
-            }
-            if dy >= r {
-                self.blend_rect(x + 1, y + dy, (w - 2).max(0), 1, 0xFFFFFF, a);
-            } else {
-                self.blend_rect(x + r, y + dy, (w - 2 * r).max(0), 1, 0xFFFFFF, a);
-                for dx in 1..r {
-                    let cov = Self::corner_cov(r - 1 - dx, r - 1 - dy, r);
-                    if cov > 0 {
-                        let ca = ((a as u32 * cov as u32) / 255) as u8;
-                        if ca > 0 {
-                            self.blend_pixel(x + dx, y + dy, 0xFFFFFF, ca);
-                            self.blend_pixel(x + w - 1 - dx, y + dy, 0xFFFFFF, ca);
-                        }
+        if alpha == 0 {
+            return;
+        }
+        let min_x = x0.min(x1).min(x2).floor() as i32 - 1;
+        let max_x = x0.max(x1).max(x2).ceil() as i32 + 1;
+        let min_y = y0.min(y1).min(y2).floor() as i32 - 1;
+        let max_y = y0.max(y1).max(y2).ceil() as i32 + 1;
+        let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+        if area.abs() < 0.001 {
+            return;
+        }
+        let sgn = if area > 0.0 { 1.0 } else { -1.0 };
+        let l0 = ((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)).sqrt().max(1.0);
+        let l1 = ((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)).sqrt().max(1.0);
+        let l2 = ((x0 - x2) * (x0 - x2) + (y0 - y2) * (y0 - y2)).sqrt().max(1.0);
+
+        for py in min_y..=max_y {
+            let fy = py as f32 + 0.5;
+            for px in min_x..=max_x {
+                let fx = px as f32 + 0.5;
+                let e0 = ((x1 - x0) * (fy - y0) - (y1 - y0) * (fx - x0)) * sgn / l0;
+                let e1 = ((x2 - x1) * (fy - y1) - (y2 - y1) * (fx - x1)) * sgn / l1;
+                let e2 = ((x0 - x2) * (fy - y2) - (y0 - y2) * (fx - x2)) * sgn / l2;
+                let d = e0.min(e1).min(e2);
+                let cov = (d + 0.5).clamp(0.0, 1.0);
+                if cov > 0.01 {
+                    let a = (alpha as f32 * cov) as u8;
+                    if a > 0 {
+                        self.blend_pixel(px, py, color, a);
                     }
                 }
             }
         }
-    }
-
-    pub fn fill_glossy_orb(&mut self, cx: i32, cy: i32, r: i32, base_col: u32) {
-        let cxf = cx as f32 + 0.5;
-        let cyf = cy as f32 + 0.5;
-        let rf = r as f32;
-        let dark = lerp_rgb(base_col, 0x000000, 120, 255);
-        let bright = lerp_rgb(base_col, 0xFFFFFF, 140, 255);
-        self.fill_aa_circle(cxf, cyf + 1.0, rf + 0.4, 0x000000, 90);
-        self.fill_aa_circle(cxf, cyf, rf, dark, 255);
-        self.fill_aa_circle(cxf, cyf + 0.4, (rf - 0.8).max(1.0), base_col, 255);
-        self.fill_aa_circle(cxf - rf * 0.18, cyf + rf * 0.25, (rf * 0.65).max(1.0), bright, 70);
-        // Aqua top specular drop
-        self.fill_aa_circle(cxf - rf * 0.18, cyf - rf * 0.34, (rf * 0.38).max(1.0), 0xFFFFFF, 195);
     }
 
     pub fn draw_soft_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32) {
-        self.blend_rounded_rect(x - 5, y + 1, w + 10, h + 11, r + 6, 0x000000, 16);
-        self.blend_rounded_rect(x - 2, y + 3, w + 5, h + 7, r + 4, 0x000000, 26);
-        self.blend_rounded_rect(x, y + 4, w + 2, h + 4, r + 2, 0x000000, 38);
-        self.blend_rounded_rect(x + 1, y + 5, w, h + 2, r + 1, 0x000000, 52);
+        self.blend_rounded_rect(x - 6, y + 2, w + 12, h + 14, r + 7, 0x000000, 14);
+        self.blend_rounded_rect(x - 3, y + 4, w + 6, h + 8, r + 4, 0x000000, 24);
+        self.blend_rounded_rect(x, y + 5, w + 2, h + 5, r + 2, 0x000000, 36);
+        self.blend_rounded_rect(x + 1, y + 6, w, h + 2, r + 1, 0x000000, 48);
     }
 
     pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: u32, scale: i32) -> i32 {
-        let g = glyph(ch);
-        let s = scale.max(1);
-        if s == 1 {
-            for (row, &mask) in g.rows.iter().enumerate() {
-                for col in 0..(g.width as usize) {
-                    if (mask & (0x80 >> col)) != 0 {
-                        self.set_pixel(x + col as i32, y + row as i32, color);
-                    }
-                }
-            }
-        } else {
-            let sample = |ix: i32, iy: i32| -> f32 {
-                if ix < 0 || iy < 0 || ix >= g.width as i32 || iy >= GLYPH_H as i32 {
-                    return 0.0;
-                }
-                let m = g.rows[iy as usize];
-                if (m & (0x80 >> (ix as usize))) != 0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            };
-            let out_w = (g.width as i32) * s;
-            let out_h = (GLYPH_H as i32) * s;
-            for oy in 0..out_h {
-                let fy = (oy as f32 + 0.5) / (s as f32) - 0.5;
-                let y0 = fy.floor() as i32;
-                let wy = fy - y0 as f32;
-                for ox in 0..out_w {
-                    let fx = (ox as f32 + 0.5) / (s as f32) - 0.5;
-                    let x0 = fx.floor() as i32;
-                    let wx = fx - x0 as f32;
-                    let v00 = sample(x0, y0);
-                    let v10 = sample(x0 + 1, y0);
-                    let v01 = sample(x0, y0 + 1);
-                    let v11 = sample(x0 + 1, y0 + 1);
-                    let top = v00 * (1.0 - wx) + v10 * wx;
-                    let bot = v01 * (1.0 - wx) + v11 * wx;
-                    let v = top * (1.0 - wy) + bot * wy;
-                    let cov = ((v - 0.30) * 3.15).clamp(0.0, 1.0);
-                    if cov > 0.02 {
-                        self.blend_pixel(x + ox, y + oy, color, (cov * 255.0) as u8);
-                    }
+        let g = rasterize_cached(ch, scale);
+        for row in 0..g.height {
+            let py = y + row as i32;
+            let row_off = row * g.width;
+            for col in 0..g.width {
+                let a = g.alpha[row_off + col];
+                if a > 0 {
+                    self.blend_pixel(x + col as i32, py, color, a);
                 }
             }
         }
-        (g.width as i32) * s
+        g.advance
     }
 
     pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, scale: i32) {
@@ -531,7 +493,7 @@ impl Canvas {
         let limit = x + max_w;
         let mut cx = x;
         for ch in text.chars() {
-            let adv = (glyph(ch).width as i32) * s;
+            let adv = rasterize_cached(ch, s).advance;
             if cx + adv > limit {
                 break;
             }
@@ -551,18 +513,17 @@ impl Canvas {
         bg_color: u32,
         border_color: u32,
     ) {
-        let r = (h / 2).min(7);
-        self.fill_vgradient_rounded_rect(x, y, w, h, r, lerp_rgb(bg_color, 0x000000, 45, 255), bg_color);
+        let r = (h / 2).min(6);
+        self.fill_rounded_rect(x, y, w, h, r, bg_color);
         let pct = percent.min(100) as i32;
         let inner_w = (w - 2).max(0);
         let fill_w = (inner_w * pct) / 100;
         if fill_w > 2 {
-            let hi = lerp_rgb(fill_color, 0xFFFFFF, 95, 255);
+            let hi = lerp_rgb(fill_color, 0xFFFFFF, 45, 255);
             let fr = r.min(fill_w / 2);
             self.fill_hgradient_rounded_rect(x + 1, y + 1, fill_w, (h - 2).max(0), fr, fill_color, hi);
-            self.draw_aqua_sheen(x + 1, y, fill_w, (h - 2).max(2), fr, 85);
         }
-        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 130);
+        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 55);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -577,65 +538,38 @@ impl Canvas {
         fg_color: u32,
         border_color: u32,
     ) {
-        let r = 6.min(w / 2).min(h / 2);
-        let top_col = lerp_rgb(bg_color, 0xFFFFFF, 34, 255);
-        let bot_col = lerp_rgb(bg_color, 0x000000, 34, 255);
+        let r = 7.min(w / 2).min(h / 2);
+        let top_col = lerp_rgb(bg_color, 0xFFFFFF, 10, 255);
+        let bot_col = lerp_rgb(bg_color, 0x000000, 10, 255);
         self.fill_vgradient_rounded_rect(x, y, w, h, r, top_col, bot_col);
-        self.draw_aqua_sheen(x, y, w, h, r, 46);
-        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 150);
+        self.draw_rounded_rect_alpha(x, y, w, h, r, border_color, 85);
         let tw = measure_text(label, 1);
         let tx = x + ((w - tw) / 2).max(4);
         let ty = y + ((h - (GLYPH_H as i32)) / 2).max(1);
-        self.draw_text_clipped(tx, ty + 1, w - 8, label, 0x090C10, 1);
         self.draw_text_clipped(tx, ty, w - 8, label, fg_color, 1);
     }
 
     pub fn draw_toggle(&mut self, x: i32, y: i32, on: bool, accent: u32) {
-        let track = if on { accent } else { 0x262D38 };
-        let track_top = lerp_rgb(track, 0x000000, 48, 255);
-        self.fill_vgradient_rounded_rect(x, y, 36, 18, 9, track_top, track);
-        self.draw_rounded_rect_alpha(x, y, 36, 18, 9, lerp_rgb(track, 0xFFFFFF, 55, 255), 140);
+        let track = if on { accent } else { 0x262B36 };
+        self.fill_rounded_rect(x, y, 36, 18, 9, track);
+        self.draw_rounded_rect_alpha(x, y, 36, 18, 9, 0xFFFFFF, if on { 55 } else { 28 });
         let knob_cx = if on { x + 26 } else { x + 9 };
-        self.fill_glossy_orb(knob_cx, y + 9, 6, 0xE2E8F0);
+        self.fill_aa_circle(knob_cx as f32 + 0.5, y as f32 + 10.2, 6.2, 0x000000, 65);
+        self.fill_aa_circle(knob_cx as f32 + 0.5, y as f32 + 9.0, 6.0, 0xF8FAFC, 255);
     }
 
     pub fn draw_cursor(&mut self, mx: i32, my: i32) {
-        const CURSOR: [&str; 14] = [
-            "X...........",
-            "XX..........",
-            "XWX.........",
-            "XWWX........",
-            "XWWWX.......",
-            "XWWWWX......",
-            "XWWWWWX.....",
-            "XWWWWWWX....",
-            "XWWWWWWWX...",
-            "XWWWWWXXXX..",
-            "XWWXWWX.....",
-            "XWX.XWWX....",
-            "XX...XWX....",
-            "X.....X.....",
-        ];
-        // Soft drop shadow beneath pointer
-        for (dy, row) in CURSOR.iter().enumerate() {
-            for (dx, ch) in row.bytes().enumerate() {
-                if ch != b'.' {
-                    self.blend_pixel(mx + dx as i32 + 2, my + dy as i32 + 2, 0x000000, 85);
-                }
-            }
-        }
-        for (dy, row) in CURSOR.iter().enumerate() {
-            for (dx, ch) in row.bytes().enumerate() {
-                match ch {
-                    b'X' => self.set_pixel(mx + dx as i32, my + dy as i32, 0x0B0F17),
-                    b'W' => {
-                        let col = if dx < 4 { 0xFFFFFF } else { 0xE2E8F0 };
-                        self.set_pixel(mx + dx as i32, my + dy as i32, col);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let x = mx as f32;
+        let y = my as f32;
+        // Soft shadow
+        self.fill_aa_triangle(x + 1.5, y + 2.0, x + 1.5, y + 17.5, x + 13.0, y + 13.0, 0x000000, 75);
+        // Clean modern crisp black interior with white outline
+        self.fill_aa_triangle(x, y, x, y + 15.5, x + 11.2, y + 11.0, 0x090C12, 255);
+        self.fill_aa_triangle(x + 4.8, y + 10.5, x + 8.5, y + 18.0, x + 10.5, y + 16.8, 0x090C12, 255);
+        self.draw_aa_line(x + 0.5, y + 0.5, x + 0.5, y + 15.5, 1.3, 0xFFFFFF, 240);
+        self.draw_aa_line(x + 0.5, y + 0.5, x + 11.2, y + 11.0, 1.3, 0xFFFFFF, 240);
+        self.draw_aa_line(x + 0.5, y + 15.5, x + 5.2, y + 11.8, 1.2, 0xFFFFFF, 230);
+        self.draw_aa_line(x + 5.2, y + 11.8, x + 11.2, y + 11.0, 1.2, 0xFFFFFF, 230);
     }
 
     /// Writes a standard uncompressed 24-bit BMP image for offline inspection.

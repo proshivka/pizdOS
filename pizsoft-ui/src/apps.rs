@@ -571,150 +571,122 @@ impl ThemePreset {
         if w == 0 || h == 0 {
             return;
         }
-        let (top_c, mid_c, bot_c, ridge0_c, ridge1_c, ridge2_c, orb_c, aurora_c1, aurora_c2) =
-            match self {
-                ThemePreset::AuroraPeaks => (
-                    0x070B1A, 0x111E3A, 0x1C3B5C, 0x182B4B, 0x101C32, 0x09101E, 0x7DD3FC,
-                    0x2DD4BF, 0x6366F1,
-                ),
-                ThemePreset::CrimsonSunset => (
-                    0x150818, 0x3D132B, 0x99323B, 0x3B1829, 0x240E1A, 0x12070E, 0xFBBF24,
-                    0xF43F5E, 0xF59E0B,
-                ),
-                ThemePreset::MatrixGlow => (
-                    0x030B06, 0x061D11, 0x0E3B22, 0x0A2616, 0x06180E, 0x020905, 0x4ADE80,
-                    0x22C55E, 0x10B981,
-                ),
-                ThemePreset::OceanGlass => (
-                    0x061424, 0x0C344D, 0x16647B, 0x0F354C, 0x092336, 0x051420, 0x7DD3FC,
-                    0x38BDF8, 0x2DD4BF,
-                ),
-            };
+        // Minimalist silk mesh gradient palettes: base_tl, base_br, blob_a, blob_b, blob_c, ribbon
+        let (base_tl, base_br, blob_a, blob_b, blob_c, ribbon) = match self {
+            ThemePreset::AuroraPeaks => (
+                0x07090F, 0x0C1220, 0x1E3A8A, 0x0F766E, 0x4338CA, 0x38BDF8,
+            ),
+            ThemePreset::CrimsonSunset => (
+                0x0C070C, 0x1A0B14, 0x9F1239, 0xB45309, 0x581C87, 0xFB7185,
+            ),
+            ThemePreset::MatrixGlow => (
+                0x050A07, 0x08170E, 0x065F46, 0x15803D, 0x0F766E, 0x34D399,
+            ),
+            ThemePreset::OceanGlass => (
+                0x050B12, 0x0A1A26, 0x0369A1, 0x0D9488, 0x1D4ED8, 0x2DD4BF,
+            ),
+        };
 
-        let wf = w as f32;
-        let hf = h as f32;
-        let orb_x = wf * 0.72;
-        let orb_y = hf * 0.28;
-        let orb_r = (hf * 0.52).max(90.0);
-        let orb_r2 = orb_r * orb_r;
-        let disc_r = (hf * 0.065).max(16.0);
-        let disc_r2 = disc_r * disc_r;
+        let split_rgb = |c: u32| -> (f32, f32, f32) {
+            (((c >> 16) & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, (c & 0xFF) as f32)
+        };
+        let (tl_r, tl_g, tl_b) = split_rgb(base_tl);
+        let (br_r, br_g, br_b) = split_rgb(base_br);
+        let (ar, ag, ab) = split_rgb(blob_a);
+        let (br2, bg2, bb2) = split_rgb(blob_b);
+        let (cr, cg, cb) = split_rgb(blob_c);
+        let (rr, rg, rb) = split_rgb(ribbon);
 
-        for x in 0..w {
-            let xf = x as f32;
-            let nx = xf / wf;
+        let inv_w = 1.0 / (w as f32).max(1.0);
+        let inv_h = 1.0 / (h as f32).max(1.0);
 
-            // Smooth multi-harmonic mountain profiles
-            let m0 = hf * 0.63
-                - (xf * 0.0085).sin() * (hf * 0.10)
-                - (xf * 0.023 + 1.2).cos() * (hf * 0.045)
-                - (xf * 0.061).sin() * (hf * 0.014);
-            let m1 = hf * 0.73
-                - (xf * 0.012 + 2.1).sin() * (hf * 0.095)
-                - (xf * 0.031 + 0.4).cos() * (hf * 0.038)
-                - (xf * 0.085).sin() * (hf * 0.012);
-            let mut m2 = hf * 0.85
-                - (xf * 0.016 + 0.7).sin() * (hf * 0.065)
-                - (xf * 0.045 + 1.8).cos() * (hf * 0.026);
+        for y in 0..h {
+            let ny = y as f32 * inv_h;
+            let row_off = y * w;
 
-            // Stylized pine silhouettes along foreground ridge
-            if self != ThemePreset::OceanGlass {
-                let period = x % 14;
-                let tree_hash = ((x / 14) as u32).wrapping_mul(2654435761);
-                if (tree_hash & 3) != 0 {
-                    let dist = (period as f32 - 6.5).abs();
-                    let spire = (1.0 - dist / 4.2).max(0.0) * (10.0 + ((tree_hash >> 4) % 8) as f32);
-                    m2 -= spire;
-                }
-            } else {
-                // Ocean water ripple silhouette
-                m2 += (xf * 0.09).sin() * 2.5;
-            }
+            for x in 0..w {
+                let nx = x as f32 * inv_w;
 
-            // Aurora / Sunset Cloud ribbon center & thickness
-            let aur_center = hf * (0.28 + 0.09 * (nx * 5.2 + 0.4).sin() + 0.04 * (nx * 11.5).cos());
-            let aur_band = hf * (0.11 + 0.03 * (nx * 7.0).sin());
-            let aur_mix = ((nx * 4.2).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-            let aur_col = lerp_rgb(aurora_c1, aurora_c2, (aur_mix * 255.0) as u32, 255);
+                // Diagonal calm dark ambient base
+                let diag = (nx * 0.55 + ny * 0.65).clamp(0.0, 1.0);
+                let mut r = tl_r + (br_r - tl_r) * diag;
+                let mut g = tl_g + (br_g - tl_g) * diag;
+                let mut b = tl_b + (br_b - tl_b) * diag;
 
-            for y in 0..h {
-                let yf = y as f32;
-                let base = if y * 2 < h {
-                    lerp_rgb(top_c, mid_c, (y * 2) as u32, h as u32)
-                } else {
-                    lerp_rgb(mid_c, bot_c, ((y * 2) - h) as u32, h as u32)
-                };
-
-                // Soft glowing sun/moon bloom + subtle core disc in upper sky
-                let dx = xf - orb_x;
-                let dy = yf - orb_y;
-                let d2 = dx * dx + dy * dy;
-                let mut px = if d2 < orb_r2 {
-                    let k = 1.0 - d2 / orb_r2;
-                    let strength = (k * k * 135.0) as u32;
-                    let mut c = lerp_rgb(base, orb_c, strength, 255);
-                    if d2 < disc_r2 && yf < m0 {
-                        let edge = ((1.0 - d2 / disc_r2) * 2.5).clamp(0.0, 1.0);
-                        c = lerp_rgb(c, 0xFFFBEB, (edge * 175.0) as u32, 255);
-                    }
-                    c
-                } else {
-                    base
-                };
-
-                // Shimmering aurora / sunset veil in upper/mid sky
-                if yf < m1 {
-                    let dist = (yf - aur_center).abs();
-                    if dist < aur_band {
-                        let bell = 1.0 - dist / aur_band;
-                        let curtain = 0.68 + 0.32 * (xf * 0.055 + yf * 0.025).sin();
-                        let a = (bell * bell * curtain * 105.0) as u32;
-                        px = lerp_rgb(px, aur_col, a, 255);
-                    }
+                // 3 large ultra-soft organic radial mesh clouds (cubic falloff = zero hard edges)
+                let d1 = ((nx - 0.78) * 1.15).powi(2) + ((ny - 0.24) * 1.35).powi(2);
+                if d1 < 1.0 {
+                    let k = 1.0 - d1;
+                    let w1 = k * k * k * 0.44;
+                    r += (ar - r) * w1;
+                    g += (ag - g) * w1;
+                    b += (ab - b) * w1;
                 }
 
-                // Distant atmospheric haze + natural randomized starfield before mountain ridges
-                if yf < m0 {
-                    let mut hash = ((x as u32).wrapping_mul(374761393))
-                        ^ ((y as u32).wrapping_mul(668265263))
-                        ^ 0x9E37_79B9;
-                    hash ^= hash >> 16;
-                    hash = hash.wrapping_mul(0x7FEB_352D);
-                    hash ^= hash >> 15;
-                    hash = hash.wrapping_mul(0x846C_A68B);
-                    hash ^= hash >> 16;
-                    if y * 3 < h * 2 && (hash & 0x3FF) == 0 {
-                        let bright = 100 + ((hash >> 10) & 0x7F);
-                        let star_c = if (hash & 0x400) != 0 { 0xBFDBFE } else { 0xFFFBEB };
-                        px = lerp_rgb(px, star_c, bright.min(230), 255);
-                    }
-                    let fog = (1.0 - ((m0 - yf) / (hf * 0.14)).clamp(0.0, 1.0)) * 52.0;
-                    if fog > 1.0 {
-                        px = lerp_rgb(px, orb_c, fog as u32, 255);
-                    }
-                } else if yf >= m2 {
-                    px = ridge2_c;
-                } else if yf >= m1 {
-                    let depth = ((yf - m1) / (m2 - m1).max(1.0)).clamp(0.0, 1.0);
-                    let crest = (1.0 - (yf - m1) * 0.45).clamp(0.0, 1.0);
-                    px = lerp_rgb(ridge1_c, ridge2_c, (depth * 140.0) as u32, 255);
-                    if crest > 0.01 {
-                        px = lerp_rgb(px, orb_c, (crest * 42.0) as u32, 255);
-                    }
-                } else {
-                    let depth = ((yf - m0) / (m1 - m0).max(1.0)).clamp(0.0, 1.0);
-                    let crest = (1.0 - (yf - m0) * 0.45).clamp(0.0, 1.0);
-                    px = lerp_rgb(ridge0_c, lerp_rgb(ridge0_c, bot_c, 75, 255), (depth * 160.0) as u32, 255);
-                    if crest > 0.01 {
-                        px = lerp_rgb(px, orb_c, (crest * 36.0) as u32, 255);
-                    }
+                let d2 = ((nx - 0.22) * 1.1).powi(2) + ((ny - 0.72) * 1.3).powi(2);
+                if d2 < 1.0 {
+                    let k = 1.0 - d2;
+                    let w2 = k * k * k * 0.36;
+                    r += (br2 - r) * w2;
+                    g += (bg2 - g) * w2;
+                    b += (bb2 - b) * w2;
                 }
 
-                if show_grid && (x % 40 == 0 || y % 40 == 0) {
-                    px = lerp_rgb(px, 0xFFFFFF, 16, 255);
+                let d3 = ((nx - 0.52) * 1.35).powi(2) + ((ny - 0.44) * 1.55).powi(2);
+                if d3 < 1.0 {
+                    let k = 1.0 - d3;
+                    let w3 = k * k * k * 0.26;
+                    r += (cr - r) * w3;
+                    g += (cg - g) * w3;
+                    b += (cb - b) * w3;
                 }
 
-                buf[y * w + x] = px;
+                // Flowing minimalist translucent silk waves
+                let wave1 = 0.54 + 0.14 * (nx * 4.2 + 0.5).sin() + 0.04 * (nx * 8.6).cos();
+                let dist1 = (ny - wave1).abs() * 7.5;
+                if dist1 < 1.0 {
+                    let k = 1.0 - dist1 * dist1;
+                    let wr = k * k * k * (0.14 + 0.06 * (nx * 3.1).cos());
+                    r += (rr - r) * wr;
+                    g += (rg - g) * wr;
+                    b += (rb - b) * wr;
+                }
+
+                let wave2 = 0.62 - 0.11 * (nx * 3.5 + 1.4).sin();
+                let dist2 = (ny - wave2).abs() * 6.0;
+                if dist2 < 1.0 {
+                    let k = 1.0 - dist2 * dist2;
+                    let wr = k * k * k * 0.08;
+                    r += (ar - r) * wr;
+                    g += (ag - g) * wr;
+                    b += (ab - b) * wr;
+                }
+
+                // Subtle edge vignette for minimalist focus
+                let vx = (nx - 0.5) * 1.4;
+                let vy = (ny - 0.5) * 1.4;
+                let vig = (1.0 - (vx * vx + vy * vy) * 0.16).clamp(0.75, 1.0);
+                r *= vig;
+                g *= vig;
+                b *= vig;
+
+                // Subtle optional minimalist dot matrix
+                if show_grid && x % 32 == 0 && y % 32 == 0 {
+                    r += (255.0 - r) * 0.12;
+                    g += (255.0 - g) * 0.12;
+                    b += (255.0 - b) * 0.12;
+                }
+
+                // Micro film dither to eliminate 8-bit gradient banding completely
+                let mut hsh = ((x as u32).wrapping_mul(374761393)) ^ ((y as u32).wrapping_mul(668265263));
+                hsh ^= hsh >> 13;
+                hsh = hsh.wrapping_mul(1274126177);
+                let dither = (((hsh >> 24) & 3) as f32) * 0.35 - 0.52;
+
+                let ur = (r + dither).clamp(0.0, 255.0) as u32;
+                let ug = (g + dither).clamp(0.0, 255.0) as u32;
+                let ub = (b + dither).clamp(0.0, 255.0) as u32;
+                buf[row_off + x] = (ur << 16) | (ug << 8) | ub;
             }
         }
     }
@@ -822,13 +794,13 @@ impl SettingsState {
         let lang = self.lang;
         let accent = self.theme.accent();
 
-        // Sidebar
+        // Minimalist flat sidebar
         let sb_x = wx + 10;
         let sb_y = wy + 34;
         let sb_w = 126;
         let sb_h = wh - 44;
-        canvas.fill_vgradient_rounded_rect(sb_x, sb_y, sb_w, sb_h, 7, 0x111722, 0x0D121B);
-        canvas.draw_rounded_rect_alpha(sb_x, sb_y, sb_w, sb_h, 7, 0xFFFFFF, 26);
+        canvas.fill_rounded_rect(sb_x, sb_y, sb_w, sb_h, 8, 0x11151E);
+        canvas.draw_rounded_rect_alpha(sb_x, sb_y, sb_w, sb_h, 8, 0xFFFFFF, 18);
 
         let tabs = [
             (SettingsPage::Display, tr(lang, "Экран и язык", "Display & Lang")),
@@ -840,21 +812,10 @@ impl SettingsState {
             let ty = sb_y + 6 + (i as i32) * 30;
             let active = self.page == *p;
             if active {
-                canvas.fill_hgradient_rounded_rect(
-                    sb_x + 5,
-                    ty,
-                    sb_w - 10,
-                    24,
-                    6,
-                    accent,
-                    lerp_rgb(accent, 0xFFFFFF, 45, 255),
-                );
-                canvas.draw_aqua_sheen(sb_x + 5, ty, sb_w - 10, 24, 6, 48);
-                canvas.fill_rounded_rect(sb_x + 7, ty + 5, 3, 14, 1, 0xFFFFFF);
-            } else {
-                canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 24, 6, 0xFFFFFF, 10);
+                canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 25, 6, accent, 42);
+                canvas.fill_rounded_rect(sb_x + 7, ty + 6, 3, 13, 1, accent);
             }
-            let fg = if active { 0xFFFFFF } else { 0xCBD5E1 };
+            let fg = if active { 0xF8FAFC } else { 0x94A3B8 };
             canvas.draw_text_clipped(sb_x + 15, ty + 6, sb_w - 22, label, fg, 1);
         }
 
@@ -987,50 +948,41 @@ impl SettingsState {
                 );
             }
             SettingsPage::About => {
-                // ColorOS-style Gradient Hero Banner Card
-                let card_right = lerp_rgb(0x162436, accent, 105, 255);
-                canvas.fill_hgradient_rounded_rect(x, y, iw, 78, 9, 0x121D2D, card_right);
-                canvas.draw_aqua_sheen(x, y, iw, 78, 9, 32);
-                canvas.fill_rounded_rect(x + 3, y + 14, 3, 50, 1, lerp_rgb(accent, 0xFFFFFF, 90, 255));
-                canvas.draw_rounded_rect_alpha(x, y, iw, 78, 9, lerp_rgb(accent, 0xFFFFFF, 60, 255), 115);
+                // Minimalist ColorOS-inspired Dark Hero Banner Card
+                let card_right = lerp_rgb(0x161B26, accent, 38, 255);
+                canvas.fill_hgradient_rounded_rect(x, y, iw, 78, 10, 0x131720, card_right);
+                canvas.fill_rounded_rect(x + 6, y + 16, 3, 46, 1, accent);
+                canvas.draw_rounded_rect_alpha(x, y, iw, 78, 10, 0xFFFFFF, 26);
 
-                canvas.draw_text_clipped(x + 15, y + 10, iw - 110, "pizdOS 2.0", 0xFFFFFF, 2);
+                canvas.draw_text_clipped(x + 18, y + 10, iw - 114, "pizdOS 2.0", 0xF8FAFC, 2);
                 canvas.draw_text_clipped(
-                    x + 15,
+                    x + 18,
                     y + 39,
-                    iw - 110,
+                    iw - 114,
                     "Bratukha Edition • Pizsoft UI",
-                    0x93C5FD,
+                    0x94A3B8,
                     1,
                 );
                 canvas.draw_text_clipped(
-                    x + 15,
-                    y + 57,
-                    iw - 110,
+                    x + 18,
+                    y + 56,
+                    iw - 114,
                     "by prosh1vka, Lowyk, KiryxaTipa",
                     0x6EE7B7,
                     1,
                 );
 
-                // Sleek capsule emblem badge on right of Hero Card
+                // Clean capsule emblem badge on right of Hero Card
                 if iw > 260 {
                     let bx = x + iw - 92;
                     let by = y + 25;
-                    canvas.blend_rounded_rect(bx, by, 80, 26, 13, 0x090D14, 175);
-                    canvas.draw_rounded_rect_alpha(
-                        bx,
-                        by,
-                        80,
-                        26,
-                        13,
-                        lerp_rgb(accent, 0xFFFFFF, 85, 255),
-                        135,
-                    );
-                    canvas.fill_aa_circle((bx + 14) as f32, (by + 13) as f32, 4.0, 0x3FB950, 255);
-                    canvas.draw_text_clipped(bx + 23, by + 7, 54, "NO GNU", 0xF8FAFC, 1);
+                    canvas.blend_rounded_rect(bx, by, 80, 26, 13, 0x0A0D13, 195);
+                    canvas.draw_rounded_rect_alpha(bx, by, 80, 26, 13, 0xFFFFFF, 34);
+                    canvas.fill_aa_circle((bx + 14) as f32, (by + 13) as f32, 3.5, 0x3FB950, 255);
+                    canvas.draw_text_clipped(bx + 23, by + 6, 54, "NO GNU", 0xF1F5F9, 1);
                 }
 
-                // 2-Column ColorOS Info Tiles
+                // Minimalist 2-Column Info Tiles
                 let col_w = (iw - 8) / 2;
                 let ram_str = format!("{} MB Total", mem.total_mb);
                 let tiles = [
@@ -1050,10 +1002,10 @@ impl SettingsState {
                     if ty + 44 > wy + wh - 10 {
                         break;
                     }
-                    canvas.fill_vgradient_rounded_rect(tx, ty, col_w, 44, 7, 0x1F2733, 0x161C25);
-                    canvas.draw_rounded_rect_alpha(tx, ty, col_w, 44, 7, 0xFFFFFF, 26);
-                    canvas.fill_aa_circle((tx + 12) as f32, (ty + 12) as f32, 3.0, *dot_col, 255);
-                    canvas.draw_text_clipped(tx + 20, ty + 6, col_w - 26, label, 0x94A3B8, 1);
+                    canvas.fill_rounded_rect(tx, ty, col_w, 44, 8, 0x171C27);
+                    canvas.draw_rounded_rect_alpha(tx, ty, col_w, 44, 8, 0xFFFFFF, 18);
+                    canvas.fill_aa_circle((tx + 12) as f32, (ty + 13) as f32, 2.8, *dot_col, 255);
+                    canvas.draw_text_clipped(tx + 20, ty + 6, col_w - 26, label, 0x8B949E, 1);
                     canvas.draw_text_clipped(tx + 11, ty + 23, col_w - 18, val, 0xF1F5F9, 1);
                 }
             }
@@ -1183,9 +1135,8 @@ impl CalcState {
         let x = wx + 12;
         let y = wy + 34;
         let iw = ww - 24;
-        canvas.fill_vgradient_rounded_rect(x, y, iw, 42, 7, 0x0A1017, 0x0F1722);
-        canvas.draw_aqua_sheen(x, y, iw, 42, 7, 22);
-        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 7, 0xFFFFFF, 34);
+        canvas.fill_rounded_rect(x, y, iw, 42, 8, 0x0B0E14);
+        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 8, 0xFFFFFF, 22);
         if let (Some(a), Some(op)) = (self.acc, self.op) {
             canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
         }

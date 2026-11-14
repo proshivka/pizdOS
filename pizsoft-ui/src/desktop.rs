@@ -8,7 +8,7 @@ use crate::apps::{
     CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsState, SnakeState,
     TerminalState, ThemePreset, tr,
 };
-use crate::gfx::{Canvas, lerp_rgb};
+use crate::gfx::Canvas;
 use crate::sys::{
     CpuSample, MemInfo, PkgSummary, ProcInfo, list_processes, load_packages, read_cpu_sample,
     read_kernel_version, read_loadavg, read_meminfo, read_uptime_str,
@@ -243,6 +243,9 @@ impl Desktop {
             }),
         };
 
+        if let Some(sys) = d.windows.iter_mut().find(|w| w.id == AppId::System) {
+            sys.minimized = true;
+        }
         d.reload_packages();
         d.reload_files();
         d
@@ -707,32 +710,28 @@ impl Desktop {
             self.draw_window(canvas, win, Some(idx) == top_vis);
         }
 
-        // 4. Frosted-glass Taskbar (ONLY open windows)
+        // 4. Minimalist Dark Frosted Taskbar (ONLY open windows)
         let task_y = if self.settings.taskbar_top { 0 } else { h - 36 };
-        canvas.blend_rect(0, task_y, w, 36, 0x0A0F17, 218);
-        canvas.blend_rect(0, task_y + 1, w, 17, 0xFFFFFF, 12);
+        canvas.blend_rect(0, task_y, w, 36, 0x0B0E14, 228);
         let rim_y = if self.settings.taskbar_top { task_y + 35 } else { task_y };
-        canvas.blend_rect(0, rim_y, w, 1, 0xFFFFFF, 46);
+        canvas.blend_rect(0, rim_y, w, 1, 0xFFFFFF, 22);
 
         let start_hovered =
             self.mouse_x >= 8 && self.mouse_x <= 94 && self.mouse_y >= task_y + 6 && self.mouse_y <= task_y + 30;
-        let (start_top, start_bot) = if self.start_menu_open {
-            (0xFB7185, 0xBE123C)
-        } else if start_hovered {
-            (0xF43F5E, 0x9F1239)
+        if self.start_menu_open {
+            canvas.blend_rounded_rect(8, task_y + 6, 86, 24, 7, accent, 55);
+            canvas.draw_rounded_rect_alpha(8, task_y + 6, 86, 24, 7, accent, 115);
         } else {
-            (0xE11D48, 0x881337)
-        };
-        canvas.fill_vgradient_rounded_rect(8, task_y + 6, 86, 24, 8, start_top, start_bot);
-        canvas.draw_aqua_sheen(8, task_y + 6, 86, 24, 8, 65);
-        canvas.draw_rounded_rect_alpha(8, task_y + 6, 86, 24, 8, 0xFFFFFF, 72);
-        // Smooth 4-orb PizdOS Start emblem
-        canvas.fill_aa_circle(19.0, (task_y + 15) as f32, 2.2, 0xFFFFFF, 245);
-        canvas.fill_aa_circle(25.0, (task_y + 15) as f32, 2.2, 0xFECDD3, 235);
-        canvas.fill_aa_circle(19.0, (task_y + 21) as f32, 2.2, 0xFECDD3, 235);
-        canvas.fill_aa_circle(25.0, (task_y + 21) as f32, 2.2, 0xFDA4AF, 235);
-        canvas.draw_text_clipped(34, task_y + 13, 56, tr(lang, "Пуск", "Start"), 0x4C0519, 1);
-        canvas.draw_text_clipped(34, task_y + 12, 56, tr(lang, "Пуск", "Start"), 0xFFFFFF, 1);
+            let start_alpha = if start_hovered { 28 } else { 15 };
+            canvas.blend_rounded_rect(8, task_y + 6, 86, 24, 7, 0xFFFFFF, start_alpha);
+            canvas.draw_rounded_rect_alpha(8, task_y + 6, 86, 24, 7, 0xFFFFFF, 28);
+        }
+        // Minimalist 2x2 dot-grid emblem
+        canvas.fill_aa_circle(19.0, (task_y + 15) as f32, 1.7, accent, 255);
+        canvas.fill_aa_circle(25.0, (task_y + 15) as f32, 1.7, 0xE2E8F0, 220);
+        canvas.fill_aa_circle(19.0, (task_y + 21) as f32, 1.7, 0xE2E8F0, 220);
+        canvas.fill_aa_circle(25.0, (task_y + 21) as f32, 1.7, 0x94A3B8, 220);
+        canvas.draw_text_clipped(34, task_y + 11, 56, tr(lang, "Пуск", "Start"), 0xF1F5F9, 1);
 
         let open_wins: Vec<(usize, &Window)> = self
             .windows
@@ -749,50 +748,46 @@ impl Desktop {
                 && self.mouse_y >= task_y + 6
                 && self.mouse_y <= task_y + 30;
             if is_top {
-                let top_c = lerp_rgb(accent, 0xFFFFFF, 42, 255);
-                let bot_c = lerp_rgb(accent, 0x000000, 30, 255);
-                canvas.fill_vgradient_rounded_rect(bx, task_y + 6, pill_w, 24, 7, top_c, bot_c);
-                canvas.draw_aqua_sheen(bx, task_y + 6, pill_w, 24, 7, 56);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 85);
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 24);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 34);
             } else if win.minimized {
-                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 10);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 22);
-            } else {
-                let a = if pill_hovered { 36 } else { 22 };
+                let a = if pill_hovered { 16 } else { 7 };
                 canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
-                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 38);
+            } else {
+                let a = if pill_hovered { 20 } else { 12 };
+                canvas.blend_rounded_rect(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, a);
+                canvas.draw_rounded_rect_alpha(bx, task_y + 6, pill_w, 24, 7, 0xFFFFFF, 18);
             }
 
-            let fg = if win.minimized { 0x94A3B8 } else { 0xF8FAFC };
-            if pill_w > 34 {
-                let dot_col = if is_top { 0xFFFFFF } else { win.id.color() };
-                canvas.fill_aa_circle((bx + 10) as f32, (task_y + 18) as f32, 2.7, dot_col, 255);
-                canvas.draw_text_clipped(bx + 17, task_y + 12, pill_w - 22, win.id.title(lang), fg, 1);
+            let fg = if win.minimized {
+                0x8B949E
+            } else if is_top {
+                0xF8FAFC
             } else {
-                canvas.draw_text_clipped(bx + 5, task_y + 12, pill_w - 8, win.id.title(lang), fg, 1);
+                0xCBD5E1
+            };
+            if pill_w > 34 {
+                canvas.fill_aa_circle((bx + 11) as f32, (task_y + 18) as f32, 2.5, win.id.color(), 255);
+                canvas.draw_text_clipped(bx + 19, task_y + 11, pill_w - 24, win.id.title(lang), fg, 1);
+            } else {
+                canvas.draw_text_clipped(bx + 5, task_y + 11, pill_w - 8, win.id.title(lang), fg, 1);
             }
             if is_top {
-                canvas.fill_rounded_rect(bx + 12, task_y + 27, (pill_w - 24).max(8), 2, 1, 0xFFFFFF);
+                canvas.fill_rounded_rect(bx + 14, task_y + 27, (pill_w - 28).max(8), 2, 1, accent);
             }
             bx += pill_w + 4;
         }
 
         let lang_x = (w - 144).max(bx + 8);
-        // Frosted System Tray capsule
-        let tray_w = (w - lang_x - 4).max(40);
-        canvas.blend_rounded_rect(lang_x - 4, task_y + 4, tray_w + 2, 28, 8, 0xFFFFFF, 16);
-        canvas.draw_rounded_rect_alpha(lang_x - 4, task_y + 4, tray_w + 2, 28, 8, 0xFFFFFF, 34);
-
         let lang_lbl = match lang {
             Lang::Ru => "RU",
             Lang::En => "EN",
         };
-        canvas.fill_vgradient_rounded_rect(lang_x, task_y + 6, 36, 24, 6, 0x2B3442, 0x1B222C);
-        canvas.draw_aqua_sheen(lang_x, task_y + 6, 36, 24, 6, 40);
-        canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 6, lerp_rgb(accent, 0xFFFFFF, 75, 255), 115);
-        canvas.draw_text_clipped(lang_x + 11, task_y + 12, 26, lang_lbl, 0xF8FAFC, 1);
-        canvas.fill_aa_circle((lang_x + 45) as f32, (task_y + 18) as f32, 2.8, 0x3FB950, 255);
-        canvas.draw_text_clipped(lang_x + 52, task_y + 12, (w - lang_x - 58).max(20), &self.uptime, 0xE2E8F0, 1);
+        canvas.blend_rounded_rect(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 15);
+        canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 26);
+        canvas.draw_text_clipped(lang_x + 10, task_y + 11, 26, lang_lbl, 0xE2E8F0, 1);
+        canvas.fill_aa_circle((lang_x + 46) as f32, (task_y + 18) as f32, 2.5, 0x3FB950, 255);
+        canvas.draw_text_clipped(lang_x + 54, task_y + 11, (w - lang_x - 60).max(20), &self.uptime, 0xCBD5E1, 1);
 
         // 5. Start Menu popup
         if self.start_menu_open {
@@ -822,32 +817,23 @@ impl Desktop {
             (tr(lang, "Обновить", "Refresh"), 0xD29922),
             (tr(lang, "Выход", "Exit"), 0xF85149),
         ];
-        canvas.draw_soft_shadow(cx, cy, 184, 134, 8);
-        canvas.blend_rounded_rect(cx, cy, 184, 134, 8, 0x131A24, 238);
-        canvas.draw_aqua_sheen(cx, cy, 184, 34, 8, 28);
-        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 8, 0xFFFFFF, 55);
+        canvas.draw_soft_shadow(cx, cy, 184, 134, 9);
+        canvas.blend_rounded_rect(cx, cy, 184, 134, 9, 0x121620, 242);
+        canvas.draw_rounded_rect_alpha(cx, cy, 184, 134, 9, 0xFFFFFF, 26);
         for (i, (label, dot_col)) in items.iter().enumerate() {
             let iy = cy + 4 + (i as i32) * 25;
             if i == 4 {
-                canvas.blend_rect(cx + 10, iy - 1, 164, 1, 0xFFFFFF, 26);
+                canvas.blend_rect(cx + 10, iy - 1, 164, 1, 0xFFFFFF, 18);
             }
             if self.mouse_x >= cx
                 && self.mouse_x <= cx + 184
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 23
             {
-                canvas.fill_hgradient_rounded_rect(
-                    cx + 4,
-                    iy,
-                    176,
-                    23,
-                    5,
-                    accent,
-                    lerp_rgb(accent, 0xFFFFFF, 35, 255),
-                );
+                canvas.blend_rounded_rect(cx + 4, iy, 176, 23, 6, accent, 52);
             }
-            canvas.fill_aa_circle((cx + 14) as f32, (iy + 11) as f32, 3.0, *dot_col, 255);
-            let col = if i == 4 { 0xFF7B72 } else { 0xF0F6FC };
+            canvas.fill_aa_circle((cx + 14) as f32, (iy + 11) as f32, 2.7, *dot_col, 255);
+            let col = if i == 4 { 0xFF7B72 } else { 0xE2E8F0 };
             canvas.draw_text_clipped(cx + 24, iy + 5, 150, label, col, 1);
         }
     }
@@ -863,49 +849,41 @@ impl Desktop {
             task_y - menu_h - 4
         };
 
-        canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 10);
-        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 10, 0x131A24, 238);
-        canvas.draw_rounded_rect_alpha(menu_x, menu_y, menu_w, menu_h, 10, 0xFFFFFF, 55);
+        canvas.draw_soft_shadow(menu_x, menu_y, menu_w, menu_h, 11);
+        canvas.blend_rounded_rect(menu_x, menu_y, menu_w, menu_h, 11, 0x121620, 244);
+        canvas.draw_rounded_rect_alpha(menu_x, menu_y, menu_w, menu_h, 11, 0xFFFFFF, 26);
 
-        canvas.fill_hgradient_rounded_rect(
-            menu_x + 2,
-            menu_y + 2,
-            menu_w - 4,
-            28,
-            8,
-            lerp_rgb(accent, 0x0B0F17, 45, 255),
-            accent,
-        );
-        canvas.draw_aqua_sheen(menu_x + 2, menu_y + 2, menu_w - 4, 28, 8, 52);
+        canvas.blend_rect(menu_x + 10, menu_y + 30, menu_w - 20, 1, 0xFFFFFF, 18);
+        canvas.fill_aa_circle((menu_x + 15) as f32, (menu_y + 15) as f32, 3.0, accent, 255);
         canvas.draw_text_clipped(
-            menu_x + 12,
-            menu_y + 9,
-            menu_w - 76,
-            tr(lang, "pizdOS 2.0 • Пуск", "pizdOS 2.0 • Start"),
-            0xFFFFFF,
+            menu_x + 24,
+            menu_y + 8,
+            menu_w - 86,
+            tr(lang, "pizdOS 2.0", "pizdOS 2.0"),
+            0xF8FAFC,
             1,
         );
-        canvas.draw_text_clipped(menu_x + menu_w - 58, menu_y + 9, 50, "NO GNU", 0xE2E8F0, 1);
+        canvas.draw_text_clipped(menu_x + menu_w - 58, menu_y + 8, 50, "NO GNU", 0x94A3B8, 1);
 
         for (i, app_opt) in START_ITEMS.iter().enumerate() {
             let iy = menu_y + 34 + (i as i32) * 24;
             if app_opt.is_none() {
-                canvas.blend_rect(menu_x + 10, iy - 1, menu_w - 20, 1, 0xFFFFFF, 26);
+                canvas.blend_rect(menu_x + 10, iy - 1, menu_w - 20, 1, 0xFFFFFF, 18);
             }
             let hovered = self.mouse_x >= menu_x
                 && self.mouse_x <= menu_x + menu_w
                 && self.mouse_y >= iy
                 && self.mouse_y < iy + 22;
             if hovered {
-                canvas.blend_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 6, 0xFFFFFF, 26);
-                canvas.fill_rounded_rect(menu_x + 6, iy + 4, 3, 14, 1, accent);
+                canvas.blend_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 6, 0xFFFFFF, 22);
+                canvas.fill_rounded_rect(menu_x + 6, iy + 5, 3, 12, 1, accent);
             }
             let (label, col, dot_col) = match app_opt {
                 Some(id) => (id.title(lang), 0xE6EDF3, id.color()),
                 None => (tr(lang, "Выход", "Exit"), 0xFF7B72, 0xF85149),
             };
-            canvas.fill_aa_circle((menu_x + 18) as f32, (iy + 11) as f32, 3.3, dot_col, 255);
-            canvas.draw_text_clipped(menu_x + 28, iy + 5, menu_w - 38, label, col, 1);
+            canvas.fill_aa_circle((menu_x + 18) as f32, (iy + 11) as f32, 2.7, dot_col, 255);
+            canvas.draw_text_clipped(menu_x + 28, iy + 4, menu_w - 38, label, col, 1);
         }
     }
 
@@ -923,154 +901,141 @@ impl Desktop {
             && self.mouse_y >= y - 2
             && self.mouse_y <= y + 58;
         if hovered {
-            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 10, 0xFFFFFF, 34);
-            canvas.draw_rounded_rect_alpha(x - 2, y - 4, 72, 62, 10, 0xFFFFFF, 85);
+            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, 20);
+            canvas.draw_rounded_rect_alpha(x - 2, y - 4, 72, 62, 11, 0xFFFFFF, 40);
         }
 
-        // Smooth Aqua vector icon badge (x + 12 .. x + 54, y .. y + 38)
-        let bx = x + 13;
+        // Cohesive minimalist dark-glass squircle container + monoline vector glyphs
+        let bx = x + 14;
         let by = y;
-        let cx = bx as f32 + 20.0;
+        let cx = bx as f32 + 19.0;
         let cy = by as f32 + 19.0;
+
+        canvas.draw_soft_shadow(bx, by, 38, 38, 11);
+        canvas.blend_rounded_rect(bx, by, 38, 38, 11, 0x11151F, 224);
+        canvas.fill_aa_circle(cx, cy, 12.5, accent, 26);
+        canvas.draw_rounded_rect_alpha(
+            bx,
+            by,
+            38,
+            38,
+            11,
+            0xFFFFFF,
+            if hovered { 64 } else { 30 },
+        );
 
         match id {
             AppId::Terminal => {
-                canvas.draw_soft_shadow(bx, by, 40, 38, 10);
-                canvas.fill_vgradient_rounded_rect(bx, by, 40, 38, 10, 0x1F2937, 0x090D14);
-                canvas.draw_aqua_sheen(bx, by, 40, 38, 10, 56);
-                canvas.draw_rounded_rect_alpha(bx, by, 40, 38, 10, 0xFFFFFF, 55);
-                canvas.fill_aa_circle((bx + 8) as f32, (by + 7) as f32, 2.0, 0xF87171, 255);
-                canvas.fill_aa_circle((bx + 14) as f32, (by + 7) as f32, 2.0, 0xFBBF24, 255);
-                canvas.fill_aa_circle((bx + 20) as f32, (by + 7) as f32, 2.0, 0x4ADE80, 255);
-                canvas.draw_aa_line((bx + 9) as f32, (by + 16) as f32, (bx + 16) as f32, (by + 21) as f32, 2.2, accent, 255);
-                canvas.draw_aa_line((bx + 16) as f32, (by + 21) as f32, (bx + 9) as f32, (by + 26) as f32, 2.2, accent, 255);
-                canvas.draw_aa_line((bx + 20) as f32, (by + 26) as f32, (bx + 29) as f32, (by + 26) as f32, 2.2, 0xE2E8F0, 255);
+                canvas.draw_aa_line(cx - 8.5, cy - 5.0, cx - 2.0, cy, 1.8, accent, 255);
+                canvas.draw_aa_line(cx - 2.0, cy, cx - 8.5, cy + 5.0, 1.8, accent, 255);
+                canvas.draw_aa_line(cx + 1.0, cy + 5.0, cx + 8.5, cy + 5.0, 1.8, 0xE2E8F0, 240);
             }
             AppId::PizGet => {
-                canvas.draw_soft_shadow(bx + 1, by, 38, 38, 10);
-                canvas.fill_vgradient_rounded_rect(bx + 1, by, 38, 38, 10, 0xF59E0B, 0xB45309);
-                canvas.draw_aqua_sheen(bx + 1, by, 38, 38, 10, 68);
-                canvas.draw_rounded_rect_alpha(bx + 1, by, 38, 38, 10, 0xFDE68A, 110);
-                // Satin ribbon cross
-                canvas.fill_rounded_rect(bx + 17, by + 2, 6, 34, 2, 0x1E293B);
-                canvas.fill_rounded_rect(bx + 3, by + 16, 34, 6, 2, 0x1E293B);
-                canvas.fill_aa_circle(cx, cy, 4.5, 0x38BDF8, 255);
+                // Minimalist package tray + download arrow
+                canvas.draw_aa_line(cx, cy - 8.0, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
+                canvas.draw_aa_line(cx - 4.5, cy - 1.5, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
+                canvas.draw_aa_line(cx + 4.5, cy - 1.5, cx, cy + 3.0, 1.8, 0xFBBF24, 255);
+                canvas.draw_aa_line(cx - 8.0, cy + 4.5, cx - 8.0, cy + 7.5, 1.7, 0xE2E8F0, 230);
+                canvas.draw_aa_line(cx - 8.0, cy + 7.5, cx + 8.0, cy + 7.5, 1.7, 0xE2E8F0, 230);
+                canvas.draw_aa_line(cx + 8.0, cy + 7.5, cx + 8.0, cy + 4.5, 1.7, 0xE2E8F0, 230);
             }
             AppId::Paint => {
-                // Smooth vector artist palette + colorful glossy blobs + brush
-                canvas.fill_aa_circle(cx + 1.0, cy + 3.0, 18.0, 0x000000, 95);
-                canvas.fill_aa_circle(cx, cy, 17.5, 0xE2E8F0, 255);
-                canvas.fill_aa_circle(cx - 2.0, cy - 2.0, 14.5, 0xFFFFFF, 130);
-                canvas.fill_aa_circle(cx - 7.5, cy - 5.5, 3.6, 0xEF4444, 255);
-                canvas.fill_aa_circle(cx + 2.5, cy - 8.5, 3.6, 0xF59E0B, 255);
-                canvas.fill_aa_circle(cx + 9.0, cy - 1.5, 3.6, 0x22C55E, 255);
-                canvas.fill_aa_circle(cx - 7.0, cy + 5.5, 3.6, 0x3B82F6, 255);
-                // Thumb hole
-                canvas.fill_aa_circle(cx + 5.5, cy + 7.5, 4.0, 0x1B263B, 240);
-                // Diagonal brush handle
-                canvas.draw_aa_line(cx - 2.0, cy + 12.0, cx + 14.0, cy - 12.0, 3.0, 0x8B5CF6, 255);
-                canvas.fill_aa_circle(cx + 14.0, cy - 12.0, 2.5, 0xFDE047, 255);
+                // Minimalist stylus stroke + tri-color palette dots
+                canvas.draw_aa_line(cx - 7.5, cy + 6.5, cx + 6.5, cy - 7.5, 2.0, 0xA78BFA, 255);
+                canvas.fill_aa_circle(cx + 6.5, cy - 7.5, 2.0, 0xF472B6, 255);
+                canvas.fill_aa_circle(cx - 7.0, cy - 5.5, 2.2, 0x38BDF8, 255);
+                canvas.fill_aa_circle(cx + 1.0, cy + 7.0, 2.2, 0xFBBF24, 255);
+                canvas.fill_aa_circle(cx + 7.5, cy + 3.0, 2.2, 0x4ADE80, 255);
             }
             AppId::Snake => {
-                canvas.draw_soft_shadow(bx, by, 40, 38, 10);
-                canvas.fill_vgradient_rounded_rect(bx, by, 40, 38, 10, 0x14532D, 0x052E16);
-                canvas.draw_aqua_sheen(bx, by, 40, 38, 10, 56);
-                canvas.draw_rounded_rect_alpha(bx, by, 40, 38, 10, 0x86EFAC, 80);
-                canvas.draw_aa_line((bx + 9) as f32, (by + 27) as f32, (bx + 20) as f32, (by + 27) as f32, 5.0, 0x22C55E, 255);
-                canvas.draw_aa_line((bx + 20) as f32, (by + 27) as f32, (bx + 20) as f32, (by + 12) as f32, 5.0, 0x4ADE80, 255);
-                canvas.draw_aa_line((bx + 20) as f32, (by + 12) as f32, (bx + 29) as f32, (by + 12) as f32, 5.0, 0x86EFAC, 255);
-                canvas.fill_aa_circle((bx + 29) as f32, (by + 12) as f32, 3.2, 0x86EFAC, 255);
-                canvas.fill_aa_circle((bx + 30) as f32, (by + 11) as f32, 1.0, 0x052E16, 255);
-                canvas.fill_aa_circle((bx + 30) as f32, (by + 25) as f32, 4.2, 0xEF4444, 255);
-                canvas.fill_aa_circle((bx + 29) as f32, by as f32 + 23.5, 1.4, 0xFFFFFF, 210);
+                // Sleek monoline snake path + target
+                canvas.draw_aa_line(cx - 8.0, cy + 6.0, cx - 1.0, cy + 6.0, 2.6, 0x4ADE80, 255);
+                canvas.draw_aa_line(cx - 1.0, cy + 6.0, cx - 1.0, cy - 5.0, 2.6, 0x4ADE80, 255);
+                canvas.draw_aa_line(cx - 1.0, cy - 5.0, cx + 7.5, cy - 5.0, 2.6, 0x86EFAC, 255);
+                canvas.fill_aa_circle(cx + 7.5, cy - 5.0, 2.2, 0x86EFAC, 255);
+                canvas.fill_aa_circle(cx + 7.5, cy + 5.5, 2.6, 0xFB7185, 255);
             }
             AppId::Notepad => {
-                canvas.draw_soft_shadow(bx + 3, by, 34, 38, 7);
-                canvas.fill_vgradient_rounded_rect(bx + 3, by, 34, 38, 7, 0xF8FAFC, 0xCBD5E1);
-                canvas.fill_vgradient_rounded_rect(bx + 3, by, 34, 9, 6, 0x3B82F6, 0x1D4ED8);
-                canvas.draw_aqua_sheen(bx + 3, by, 34, 9, 6, 70);
-                for row_y in [14, 20, 26, 32] {
-                    canvas.draw_aa_line((bx + 9) as f32, (by + row_y) as f32, (bx + 29) as f32, (by + row_y) as f32, 1.4, 0x64748B, 210);
-                }
-                // Stylus / Pencil
-                canvas.draw_aa_line((bx + 22) as f32, (by + 30) as f32, (bx + 34) as f32, (by + 14) as f32, 3.2, 0xF59E0B, 255);
+                canvas.draw_rounded_rect_alpha(bx + 10, by + 9, 18, 20, 4, 0x93C5FD, 215);
+                canvas.draw_aa_line(cx - 5.0, cy - 4.0, cx + 5.0, cy - 4.0, 1.5, 0xE2E8F0, 235);
+                canvas.draw_aa_line(cx - 5.0, cy, cx + 5.0, cy, 1.5, 0x94A3B8, 215);
+                canvas.draw_aa_line(cx - 5.0, cy + 4.0, cx + 2.0, cy + 4.0, 1.5, 0x94A3B8, 215);
             }
             AppId::Settings => {
-                // Smooth radial 8-tooth metallic cogwheel + ruby Aqua center
-                canvas.fill_aa_circle(cx + 1.0, cy + 3.0, 17.5, 0x000000, 95);
+                // Clean 8-spoke monoline gear emblem
                 for k in 0..8 {
                     let ang = (k as f32) * std::f32::consts::FRAC_PI_4;
-                    let tx = cx + ang.cos() * 14.0;
-                    let ty = cy + ang.sin() * 14.0;
-                    canvas.fill_aa_circle(tx, ty, 4.2, 0xCBD5E1, 255);
+                    let x1 = cx + ang.cos() * 6.5;
+                    let y1 = cy + ang.sin() * 6.5;
+                    let x2 = cx + ang.cos() * 10.2;
+                    let y2 = cy + ang.sin() * 10.2;
+                    canvas.draw_aa_line(x1, y1, x2, y2, 2.1, 0xCBD5E1, 235);
                 }
-                canvas.fill_aa_circle(cx, cy, 13.5, 0x94A3B8, 255);
-                canvas.fill_aa_circle(cx - 1.5, cy - 2.0, 11.5, 0xF1F5F9, 210);
-                canvas.fill_glossy_orb(cx as i32, cy as i32, 6, accent);
+                canvas.fill_aa_circle(cx, cy, 6.8, 0xE2E8F0, 255);
+                canvas.fill_aa_circle(cx, cy, 3.6, 0x11151F, 255);
+                canvas.fill_aa_circle(cx, cy, 2.2, accent, 255);
             }
             AppId::Calc => {
-                canvas.draw_soft_shadow(bx + 3, by, 34, 38, 8);
-                canvas.fill_vgradient_rounded_rect(bx + 3, by, 34, 38, 8, 0x334155, 0x1E293B);
-                canvas.draw_aqua_sheen(bx + 3, by, 34, 38, 8, 52);
-                canvas.draw_rounded_rect_alpha(bx + 3, by, 34, 38, 8, 0xFFFFFF, 55);
-                canvas.fill_rounded_rect(bx + 8, by + 6, 24, 9, 3, 0x0EA5E9);
-                for gy in [19, 26] {
-                    for gx in [9, 16, 23] {
-                        canvas.fill_aa_circle((bx + gx + 1) as f32, (by + gy + 1) as f32, 2.0, 0xE2E8F0, 245);
-                    }
-                }
-                canvas.fill_rounded_rect(bx + 27, by + 18, 5, 13, 2, 0xF59E0B);
+                canvas.draw_aa_line(cx - 7.5, cy - 4.5, cx - 2.5, cy - 4.5, 1.7, 0xE2E8F0, 235);
+                canvas.draw_aa_line(cx - 5.0, cy - 7.0, cx - 5.0, cy - 2.0, 1.7, 0xE2E8F0, 235);
+                canvas.draw_aa_line(cx + 2.5, cy - 4.5, cx + 7.5, cy - 4.5, 1.7, 0xE2E8F0, 235);
+                canvas.draw_aa_line(cx - 7.0, cy + 2.5, cx - 3.0, cy + 6.5, 1.7, 0x94A3B8, 235);
+                canvas.draw_aa_line(cx - 3.0, cy + 2.5, cx - 7.0, cy + 6.5, 1.7, 0x94A3B8, 235);
+                canvas.draw_aa_line(cx + 2.5, cy + 3.2, cx + 7.5, cy + 3.2, 1.7, 0x38BDF8, 255);
+                canvas.draw_aa_line(cx + 2.5, cy + 6.2, cx + 7.5, cy + 6.2, 1.7, 0x38BDF8, 255);
             }
             AppId::Matrix => {
-                canvas.draw_soft_shadow(bx, by, 40, 38, 10);
-                canvas.fill_vgradient_rounded_rect(bx, by, 40, 38, 10, 0x064E3B, 0x021710);
-                canvas.draw_aqua_sheen(bx, by, 40, 38, 10, 52);
-                canvas.draw_rounded_rect_alpha(bx, by, 40, 38, 10, 0x4ADE80, 95);
-                canvas.draw_aa_line((bx + 11) as f32, (by + 7) as f32, (bx + 11) as f32, (by + 28) as f32, 2.2, 0x22C55E, 235);
-                canvas.draw_aa_line((bx + 20) as f32, (by + 11) as f32, (bx + 20) as f32, (by + 30) as f32, 2.4, 0x4ADE80, 255);
-                canvas.draw_aa_line((bx + 29) as f32, (by + 6) as f32, (bx + 29) as f32, (by + 23) as f32, 2.2, 0x86EFAC, 255);
-                canvas.fill_aa_circle((bx + 20) as f32, (by + 30) as f32, 2.0, 0xFFFFFF, 255);
-                canvas.fill_aa_circle((bx + 29) as f32, (by + 23) as f32, 2.0, 0xFFFFFF, 255);
+                canvas.draw_aa_line(cx - 6.0, cy - 8.0, cx - 6.0, cy + 5.0, 1.6, 0x22C55E, 220);
+                canvas.draw_aa_line(cx, cy - 5.0, cx, cy + 8.0, 1.8, 0x4ADE80, 255);
+                canvas.draw_aa_line(cx + 6.0, cy - 9.0, cx + 6.0, cy + 2.0, 1.6, 0x34D399, 230);
+                canvas.fill_aa_circle(cx, cy + 8.0, 1.8, 0xF8FAFC, 255);
+                canvas.fill_aa_circle(cx + 6.0, cy + 2.0, 1.6, 0xE2E8F0, 235);
             }
             _ => {}
         }
 
-        canvas.draw_text_clipped(x + 3, y + 43, 76, label, 0x05080D, 1);
-        canvas.draw_text_clipped(x + 2, y + 42, 76, label, 0xF8FAFC, 1);
+        let tw = crate::font::measure_text(label, 1).min(78);
+        let lx = x + 33 - tw / 2;
+        canvas.draw_text_clipped(lx + 1, y + 43, 80, label, 0x05080D, 1);
+        canvas.draw_text_clipped(lx, y + 42, 80, label, 0xE2E8F0, 1);
     }
 
     fn draw_window(&self, canvas: &mut Canvas, win: &Window, focused: bool) {
         let lang = self.settings.lang;
         let accent = self.settings.theme.accent();
 
-        canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 10);
-        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 10, 0x151B24);
-        let border = if focused {
-            lerp_rgb(accent, 0xFFFFFF, 75, 255)
-        } else {
-            0x475569
-        };
-        canvas.draw_rounded_rect_alpha(win.x, win.y, win.w, win.h, 10, border, if focused { 145 } else { 85 });
+        canvas.draw_soft_shadow(win.x, win.y, win.w, win.h, 11);
+        canvas.fill_rounded_rect(win.x, win.y, win.w, win.h, 11, 0x131720);
+        canvas.draw_rounded_rect_alpha(
+            win.x,
+            win.y,
+            win.w,
+            win.h,
+            11,
+            0xFFFFFF,
+            if focused { 36 } else { 18 },
+        );
 
-        let (tb_top, tb_bot) = if focused {
-            (lerp_rgb(accent, 0xFFFFFF, 42, 255), lerp_rgb(accent, 0x0D1117, 58, 255))
-        } else {
-            (0x2B3340, 0x1D232C)
-        };
-        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 9, tb_top, tb_bot);
-        canvas.draw_aqua_sheen(win.x + 1, win.y + 1, win.w - 2, 26, 9, if focused { 76 } else { 36 });
-        canvas.blend_rect(win.x + 1, win.y + 27, win.w - 2, 1, 0x000000, 145);
-        canvas.fill_aa_circle((win.x + 14) as f32, (win.y + 14) as f32, 4.0, win.id.color(), 255);
+        let tb_col = if focused { 0x181D29 } else { 0x141822 };
+        canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 10, tb_col, tb_col);
+        canvas.blend_rect(win.x + 1, win.y + 27, win.w - 2, 1, 0xFFFFFF, 16);
+        canvas.fill_aa_circle(
+            (win.x + 14) as f32,
+            (win.y + 14) as f32,
+            3.0,
+            win.id.color(),
+            if focused { 245 } else { 125 },
+        );
         canvas.draw_text_clipped(
             win.x + 24,
-            win.y + 8,
+            win.y + 7,
             win.w - 106,
             win.id.title(lang),
-            if focused { 0xFFFFFF } else { 0x94A3B8 },
+            if focused { 0xF1F5F9 } else { 0x7D8590 },
             1,
         );
 
-        // Aqua traffic-light glossy orbs: Minimize [_], Maximize [+], Close [×]
+        // Minimalist flat monochrome window controls: ─, □, ×
         let btn_y = win.y + 5;
         let cy = btn_y + 9;
         let hover_y = self.mouse_y >= btn_y && self.mouse_y <= btn_y + 18;
@@ -1081,18 +1046,26 @@ impl Desktop {
         let max_hov = hover_y && (max_x..=max_x + 20).contains(&self.mouse_x);
         let cls_hov = hover_y && (cls_x..=cls_x + 20).contains(&self.mouse_x);
 
-        canvas.fill_glossy_orb(min_x + 10, cy, 6, if min_hov { 0xFBBF24 } else { 0xD97706 });
-        canvas.fill_glossy_orb(max_x + 10, cy, 6, if max_hov { 0x4ADE80 } else { 0x16A34A });
-        canvas.fill_glossy_orb(cls_x + 10, cy, 6, if cls_hov { 0xF87171 } else { 0xDC2626 });
+        if min_hov {
+            canvas.fill_aa_circle((min_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
+        }
+        if max_hov {
+            canvas.fill_aa_circle((max_x + 10) as f32, cy as f32, 9.0, 0xFFFFFF, 22);
+        }
+        if cls_hov {
+            canvas.fill_aa_circle((cls_x + 10) as f32, cy as f32, 9.0, 0xEF4444, 195);
+        }
 
-        let min_a = if min_hov { 245 } else { 150 };
-        canvas.draw_aa_line((min_x + 7) as f32, (cy + 1) as f32, (min_x + 13) as f32, (cy + 1) as f32, 1.4, 0x1E293B, min_a);
-        let max_a = if max_hov { 245 } else { 150 };
-        canvas.draw_aa_line((max_x + 7) as f32, cy as f32, (max_x + 13) as f32, cy as f32, 1.4, 0x052E16, max_a);
-        canvas.draw_aa_line((max_x + 10) as f32, (cy - 3) as f32, (max_x + 10) as f32, (cy + 3) as f32, 1.4, 0x052E16, max_a);
-        let cls_a = if cls_hov { 255 } else { 175 };
-        canvas.draw_aa_line((cls_x + 7) as f32, (cy - 3) as f32, (cls_x + 13) as f32, (cy + 3) as f32, 1.4, 0x450A0A, cls_a);
-        canvas.draw_aa_line((cls_x + 13) as f32, (cy - 3) as f32, (cls_x + 7) as f32, (cy + 3) as f32, 1.4, 0x450A0A, cls_a);
+        let min_a = if min_hov { 245 } else { 155 };
+        canvas.draw_aa_line((min_x + 6) as f32, (cy + 1) as f32, (min_x + 14) as f32, (cy + 1) as f32, 1.3, 0xE2E8F0, min_a);
+
+        let max_a = if max_hov { 245 } else { 155 };
+        canvas.draw_rounded_rect_alpha(max_x + 6, cy - 4, 8, 8, 1, 0xE2E8F0, max_a);
+
+        let cls_col = if cls_hov { 0xFFFFFF } else { 0xE2E8F0 };
+        let cls_a = if cls_hov { 255 } else { 170 };
+        canvas.draw_aa_line((cls_x + 6) as f32, (cy - 4) as f32, (cls_x + 14) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
+        canvas.draw_aa_line((cls_x + 14) as f32, (cy - 4) as f32, (cls_x + 6) as f32, (cy + 4) as f32, 1.3, cls_col, cls_a);
 
         match win.id {
             AppId::System => self.draw_system_contents(canvas, win),

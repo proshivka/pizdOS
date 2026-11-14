@@ -266,6 +266,7 @@ mod win32 {
         fn GetClientRect(hwnd: Hwnd, lp_rect: *mut Rect) -> i32;
         fn ValidateRect(hwnd: Hwnd, lp_rect: *const Rect) -> i32;
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> isize;
+        fn SetProcessDPIAware() -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -316,6 +317,9 @@ mod win32 {
     }
 
     pub fn run_win32_gui() -> io::Result<()> {
+        // Disable automatic Windows DPI bitmap stretching so every pixel matches native screen DPI 1:1.
+        unsafe { SetProcessDPIAware() };
+
         let class_name = utf16("PizsoftUIClass");
         let title = utf16("Pizsoft UI — pizdOS 2.0");
 
@@ -343,8 +347,8 @@ mod win32 {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                960,
-                600,
+                1160,
+                720,
                 0,
                 0,
                 h_inst,
@@ -355,8 +359,8 @@ mod win32 {
             return Err(io::Error::other("CreateWindowExW failed"));
         }
 
-        let mut canvas = Canvas::new(960, 600);
-        let mut desktop = Desktop::new(960, 600);
+        let mut canvas = Canvas::new(1160, 720);
+        let mut desktop = Desktop::new(1160, 720);
         let mut msg = Msg::default();
 
         while desktop.running {
