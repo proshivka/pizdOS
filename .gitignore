@@ -1,0 +1,5 @@
+build/
+*.bin
+*.img
+*.ppm
+test_boot.py
