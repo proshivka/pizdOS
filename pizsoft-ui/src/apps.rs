@@ -942,3 +942,249 @@ impl SettingsState {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// 6. Calculator
+// ---------------------------------------------------------------------------
+pub struct CalcState {
+    pub display: String,
+    pub acc: Option<i64>,
+    pub op: Option<char>,
+    pub clear_next: bool,
+}
+
+const CALC_BUTTONS: [&str; 16] = [
+    "7", "8", "9", "/",
+    "4", "5", "6", "*",
+    "1", "2", "3", "-",
+    "C", "0", "=", "+",
+];
+
+impl CalcState {
+    pub fn new() -> Self {
+        Self {
+            display: String::from("0"),
+            acc: None,
+            op: None,
+            clear_next: false,
+        }
+    }
+
+    pub fn press(&mut self, token: &str) {
+        match token {
+            "C" => {
+                self.display = String::from("0");
+                self.acc = None;
+                self.op = None;
+                self.clear_next = false;
+            }
+            "+" | "-" | "*" | "/" => {
+                self.eval_pending();
+                self.acc = Some(self.display.parse::<i64>().unwrap_or(0));
+                self.op = token.chars().next();
+                self.clear_next = true;
+            }
+            "=" => {
+                self.eval_pending();
+                self.op = None;
+                self.acc = None;
+                self.clear_next = true;
+            }
+            digit => {
+                if self.clear_next || self.display == "0" || self.display == "ERR" {
+                    self.display = digit.to_string();
+                    self.clear_next = false;
+                } else if self.display.len() < 16 {
+                    self.display.push_str(digit);
+                }
+            }
+        }
+    }
+
+    fn eval_pending(&mut self) {
+        let Some(lhs) = self.acc else { return };
+        let Some(op) = self.op else { return };
+        let rhs = self.display.parse::<i64>().unwrap_or(0);
+        let res = match op {
+            '+' => Some(lhs.saturating_add(rhs)),
+            '-' => Some(lhs.saturating_sub(rhs)),
+            '*' => Some(lhs.saturating_mul(rhs)),
+            '/' => lhs.checked_div(rhs),
+            _ => Some(rhs),
+        };
+        self.display = match res {
+            Some(v) => v.to_string(),
+            None => String::from("ERR"),
+        };
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        match key {
+            KeyEvent::Char(c) if c.is_ascii_digit() => {
+                let mut buf = [0u8; 1];
+                let s = c.encode_utf8(&mut buf);
+                self.press(s);
+            }
+            KeyEvent::Char('+') => self.press("+"),
+            KeyEvent::Char('-') => self.press("-"),
+            KeyEvent::Char('*') => self.press("*"),
+            KeyEvent::Char('/') => self.press("/"),
+            KeyEvent::Char('=') | KeyEvent::Enter => self.press("="),
+            KeyEvent::Char('c') | KeyEvent::Char('C') => self.press("C"),
+            KeyEvent::Backspace => {
+                if self.display.len() > 1 {
+                    self.display.pop();
+                } else {
+                    self.display = String::from("0");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) {
+        let gx = 12;
+        let gy = 82;
+        let gw = ww - 24;
+        let gh = wh - 94;
+        if lx < gx || ly < gy || lx >= gx + gw || ly >= gy + gh {
+            return;
+        }
+        let col_w = gw / 4;
+        let row_h = gh / 4;
+        let col = ((lx - gx) / col_w).clamp(0, 3);
+        let row = ((ly - gy) / row_h).clamp(0, 3);
+        let idx = (row * 4 + col) as usize;
+        if let Some(tok) = CALC_BUTTONS.get(idx) {
+            self.press(tok);
+        }
+    }
+
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
+        let x = wx + 12;
+        let y = wy + 34;
+        let iw = ww - 24;
+        canvas.fill_rounded_rect(x, y, iw, 40, 6, 0x090C10);
+        canvas.draw_rounded_rect(x, y, iw, 40, 6, 0x30363D);
+        canvas.draw_text_clipped(x + 12, y + 10, iw - 24, &self.display, 0xFFFFFF, 2);
+
+        let gy = wy + 82;
+        let gh = wh - 94;
+        let col_w = iw / 4;
+        let row_h = gh / 4;
+
+        for (idx, tok) in CALC_BUTTONS.iter().enumerate() {
+            let col = (idx % 4) as i32;
+            let row = (idx / 4) as i32;
+            let bx = x + col * col_w + 2;
+            let by = gy + row * row_h + 2;
+            let bw = col_w - 4;
+            let bh = row_h - 4;
+            let (bg, border) = match *tok {
+                "=" => (accent, 0x79C0FF),
+                "C" => (0xB62324, 0xFF7B72),
+                "+" | "-" | "*" | "/" => (0x1F2937, 0x388BFD),
+                _ => (0x21262D, 0x30363D),
+            };
+            canvas.draw_button(bx, by, bw, bh, tok, bg, 0xFFFFFF, border);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Matrix Rain App
+// ---------------------------------------------------------------------------
+pub struct MatrixState {
+    pub drops: Vec<(i32, i32, i32)>, // (y_px, speed, len)
+    pub color_idx: usize,
+    rng: u64,
+}
+
+const MATRIX_COLORS: [u32; 4] = [0x3FB950, 0x38BDF8, 0xF85149, 0xD29922];
+
+impl MatrixState {
+    pub fn new() -> Self {
+        let mut m = Self {
+            drops: Vec::new(),
+            color_idx: 0,
+            rng: 0xC0FF_EE00_DEAD_BEEF,
+        };
+        m.init(34);
+        m
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    fn init(&mut self, cols: usize) {
+        self.drops.clear();
+        for _ in 0..cols {
+            let r = self.next_rand();
+            self.drops.push((
+                (r % 180) as i32,
+                3 + ((r >> 8) % 5) as i32,
+                5 + ((r >> 16) % 7) as i32,
+            ));
+        }
+    }
+
+    pub fn step(&mut self, max_h: i32) {
+        for drop in &mut self.drops {
+            drop.0 += drop.1;
+            if drop.0 - drop.2 * 12 > max_h {
+                drop.0 = 0;
+            }
+        }
+    }
+
+    pub fn cycle_color(&mut self) {
+        self.color_idx = (self.color_idx + 1) % MATRIX_COLORS.len();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, tick: u64, lang: Lang) {
+        let x = wx + 10;
+        let y = wy + 34;
+        let iw = ww - 20;
+        let ih = wh - 70;
+        canvas.fill_rounded_rect(x, y, iw, ih, 6, 0x050A06);
+        canvas.draw_rounded_rect(x, y, iw, ih, 6, 0x30363D);
+
+        let glyphs = ['0', '1', 'P', 'Z', 'Я', 'Ж', 'Ф', '@', '#', '7'];
+        let base_col = MATRIX_COLORS[self.color_idx];
+        let cols = (iw / 10).max(1) as usize;
+        for col in 0..cols.min(self.drops.len()) {
+            let (head_y, _, len) = self.drops[col];
+            for k in 0..len {
+                let py = y + 4 + head_y - k * 12;
+                if py >= y + 4 && py + 12 < y + ih - 2 {
+                    let g_idx = ((tick as usize) / 3 + col * 7 + k as usize) % glyphs.len();
+                    let col_c = if k == 0 {
+                        0xFFFFFF
+                    } else {
+                        lerp_rgb(base_col, 0x050A06, k as u32, len as u32)
+                    };
+                    canvas.draw_char(x + 6 + (col as i32) * 10, py, glyphs[g_idx], col_c, 1);
+                }
+            }
+        }
+
+        canvas.draw_button(
+            wx + 12,
+            wy + wh - 30,
+            130,
+            22,
+            tr(lang, "Сменить цвет", "Cycle Color"),
+            0x21262D,
+            0xFFFFFF,
+            base_col,
+        );
+    }
+}

@@ -95,6 +95,7 @@ mod linux_fb {
 
         let stdin = io::stdin();
         let mut raw_buf = Vec::with_capacity(w * h * 4);
+        let mut prev_right = false;
 
         while desktop.running {
             if let Some(ref mut m) = mice {
@@ -106,6 +107,7 @@ mod linux_fb {
                     let nx = desktop.mouse_x + dx;
                     let ny = desktop.mouse_y + dy;
                     let left = (buttons & 1) != 0;
+                    let right = (buttons & 2) != 0;
                     if left && !desktop.mouse_down {
                         desktop.on_mouse_down(nx, ny, w as i32, h as i32);
                     } else if !left && desktop.mouse_down {
@@ -113,6 +115,10 @@ mod linux_fb {
                     } else {
                         desktop.on_mouse_move(nx, ny, w as i32, h as i32);
                     }
+                    if right && !prev_right {
+                        desktop.on_right_click(nx, ny, w as i32, h as i32);
+                    }
+                    prev_right = right;
                 }
             }
 
@@ -154,6 +160,7 @@ mod win32 {
     const WM_MOUSEMOVE: u32 = 0x0200;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_RBUTTONDOWN: u32 = 0x0204;
     const VK_BACK: usize = 0x08;
     const VK_RETURN: usize = 0x0D;
     const VK_ESCAPE: usize = 0x1B;
@@ -369,6 +376,9 @@ mod win32 {
                         desktop.on_mouse_down(x, y, canvas.width as i32, canvas.height as i32)
                     }
                     WM_LBUTTONUP => desktop.on_mouse_up(),
+                    WM_RBUTTONDOWN => {
+                        desktop.on_right_click(x, y, canvas.width as i32, canvas.height as i32)
+                    }
                     WM_KEYDOWN => match msg.w_param {
                         VK_ESCAPE => desktop.running = false,
                         VK_LEFT => desktop.on_key(KeyEvent::Left),

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    KeyEvent, Lang, NotepadState, PaintState, SettingsState, SnakeState, TerminalState,
-    ThemePreset, tr,
+    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsState, SnakeState,
+    TerminalState, ThemePreset, tr,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
@@ -24,15 +24,17 @@ pub enum AppId {
     Snake,
     Notepad,
     Settings,
+    Calc,
+    Matrix,
 }
 
 impl AppId {
     pub fn title(self, lang: Lang) -> &'static str {
         match (self, lang) {
             (AppId::System, Lang::Ru) => "Система",
-            (AppId::System, Lang::En) => "System Monitor",
-            (AppId::PizGet, Lang::Ru) => "Пакеты piz-get",
-            (AppId::PizGet, Lang::En) => "piz-get Store",
+            (AppId::System, Lang::En) => "System",
+            (AppId::PizGet, Lang::Ru) => "Пакеты",
+            (AppId::PizGet, Lang::En) => "piz-get",
             (AppId::Files, Lang::Ru) => "Файлы",
             (AppId::Files, Lang::En) => "Files",
             (AppId::Terminal, Lang::Ru) => "Терминал",
@@ -45,6 +47,10 @@ impl AppId {
             (AppId::Notepad, Lang::En) => "PizPad",
             (AppId::Settings, Lang::Ru) => "Настройки",
             (AppId::Settings, Lang::En) => "Settings",
+            (AppId::Calc, Lang::Ru) => "Калькулятор",
+            (AppId::Calc, Lang::En) => "Calculator",
+            (AppId::Matrix, Lang::Ru) => "Матрица",
+            (AppId::Matrix, Lang::En) => "Matrix",
         }
     }
 }
@@ -57,6 +63,25 @@ pub struct Window {
     pub w: i32,
     pub h: i32,
     pub open: bool,
+    pub minimized: bool,
+    pub maximized: bool,
+    pub saved_rect: (i32, i32, i32, i32),
+}
+
+impl Window {
+    fn new(id: AppId, x: i32, y: i32, w: i32, h: i32, open: bool) -> Self {
+        Self {
+            id,
+            x,
+            y,
+            w,
+            h,
+            open,
+            minimized: false,
+            maximized: false,
+            saved_rect: (x, y, w, h),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,16 +91,29 @@ pub struct FileItem {
     pub path: PathBuf,
 }
 
-const START_ITEMS: [Option<AppId>; 9] = [
+const START_ITEMS: [Option<AppId>; 11] = [
     Some(AppId::Terminal),
+    Some(AppId::Calc),
     Some(AppId::Paint),
     Some(AppId::Snake),
     Some(AppId::Notepad),
+    Some(AppId::Matrix),
     Some(AppId::Files),
     Some(AppId::PizGet),
     Some(AppId::System),
     Some(AppId::Settings),
     None,
+];
+
+const DESKTOP_ICONS: [(AppId, i32, i32, u32); 8] = [
+    (AppId::Terminal, 18, 42, 0x3FB950),
+    (AppId::PizGet, 18, 114, 0xD29922),
+    (AppId::Paint, 18, 186, 0xBC8CFF),
+    (AppId::Snake, 18, 258, 0x2EA043),
+    (AppId::Notepad, 18, 330, 0x58A6FF),
+    (AppId::Settings, 18, 402, 0xF85149),
+    (AppId::Calc, 102, 42, 0x38BDF8),
+    (AppId::Matrix, 102, 114, 0x22C55E),
 ];
 
 struct WallpaperCache {
@@ -86,6 +124,7 @@ struct WallpaperCache {
 pub struct Desktop {
     pub running: bool,
     pub start_menu_open: bool,
+    pub ctx_menu: Option<(i32, i32)>,
     pub mouse_x: i32,
     pub mouse_y: i32,
     pub mouse_down: bool,
@@ -96,6 +135,7 @@ pub struct Desktop {
 
     // System metrics
     pub cpu_pct: u8,
+    pub cpu_history: [u8; 32],
     pub last_cpu: Option<CpuSample>,
     pub mem: MemInfo,
     pub uptime: String,
@@ -119,6 +159,8 @@ pub struct Desktop {
     pub snake: SnakeState,
     pub notepad: NotepadState,
     pub settings: SettingsState,
+    pub calc: CalcState,
+    pub matrix: MatrixState,
 
     wp_cache: RefCell<WallpaperCache>,
 }
@@ -135,80 +177,28 @@ impl Desktop {
         let mut d = Self {
             running: true,
             start_menu_open: false,
+            ctx_menu: None,
             mouse_x: width / 2,
             mouse_y: height / 2,
             mouse_down: false,
             dragging: None,
             windows: vec![
-                Window {
-                    id: AppId::Files,
-                    x: 150,
-                    y: 70,
-                    w: 400,
-                    h: 300,
-                    open: false,
-                },
-                Window {
-                    id: AppId::PizGet,
-                    x: 190,
-                    y: 90,
-                    w: 440,
-                    h: 310,
-                    open: false,
-                },
-                Window {
-                    id: AppId::Terminal,
-                    x: 120,
-                    y: 60,
-                    w: 440,
-                    h: 280,
-                    open: false,
-                },
-                Window {
-                    id: AppId::Paint,
-                    x: 240,
-                    y: 110,
-                    w: 368,
-                    h: 268,
-                    open: false,
-                },
-                Window {
-                    id: AppId::Snake,
-                    x: 280,
-                    y: 100,
-                    w: 320,
-                    h: 278,
-                    open: false,
-                },
-                Window {
-                    id: AppId::Notepad,
-                    x: 210,
-                    y: 130,
-                    w: 420,
-                    h: 270,
-                    open: false,
-                },
-                Window {
-                    id: AppId::System,
-                    x: 110,
-                    y: 45,
-                    w: 380,
-                    h: 270,
-                    open: true,
-                },
-                Window {
-                    id: AppId::Settings,
-                    x: 370,
-                    y: 90,
-                    w: 520,
-                    h: 344,
-                    open: true,
-                },
+                Window::new(AppId::Files, 150, 70, 400, 300, false),
+                Window::new(AppId::PizGet, 190, 90, 440, 310, false),
+                Window::new(AppId::Terminal, 120, 60, 450, 290, false),
+                Window::new(AppId::Paint, 240, 110, 368, 268, false),
+                Window::new(AppId::Snake, 280, 100, 320, 278, false),
+                Window::new(AppId::Notepad, 210, 130, 430, 270, false),
+                Window::new(AppId::Calc, 300, 90, 260, 310, false),
+                Window::new(AppId::Matrix, 240, 80, 380, 280, false),
+                Window::new(AppId::System, 190, 46, 390, 290, true),
+                Window::new(AppId::Settings, 370, 90, 520, 344, true),
             ],
             tick: 0,
             status: String::from("0% GNU | 0 Deps"),
 
             cpu_pct: 12,
+            cpu_history: [8, 12, 10, 14, 18, 15, 11, 9, 13, 16, 20, 14, 10, 12, 15, 18, 14, 11, 9, 13, 15, 12, 10, 14, 17, 13, 11, 10, 12, 15, 14, 12],
             last_cpu: read_cpu_sample(),
             mem: read_meminfo(),
             uptime: read_uptime_str(),
@@ -229,6 +219,8 @@ impl Desktop {
             snake: SnakeState::new(),
             notepad: NotepadState::new(lang),
             settings,
+            calc: CalcState::new(),
+            matrix: MatrixState::new(),
 
             wp_cache: RefCell::new(WallpaperCache {
                 key: (0, 0, ThemePreset::AuroraPeaks, false),
@@ -285,7 +277,12 @@ impl Desktop {
                 self.cpu_pct = now.percent_since(prev);
             }
             self.last_cpu = Some(now);
+        } else {
+            self.cpu_pct = 8 + ((self.tick * 5) % 24) as u8;
         }
+        self.cpu_history.rotate_left(1);
+        self.cpu_history[31] = self.cpu_pct;
+
         self.mem = read_meminfo();
         self.uptime = read_uptime_str();
         self.loadavg = read_loadavg();
@@ -299,9 +296,20 @@ impl Desktop {
         }
         let div = self.settings.snake_tick_div.max(1);
         if self.tick.is_multiple_of(div)
-            && self.windows.iter().any(|w| w.id == AppId::Snake && w.open)
+            && self
+                .windows
+                .iter()
+                .any(|w| w.id == AppId::Snake && w.open && !w.minimized)
         {
             self.snake.step();
+        }
+        if self.tick.is_multiple_of(2)
+            && let Some(m) = self
+                .windows
+                .iter()
+                .find(|w| w.id == AppId::Matrix && w.open && !w.minimized)
+        {
+            self.matrix.step(m.h - 70);
         }
     }
 
@@ -309,7 +317,44 @@ impl Desktop {
         if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
             let mut win = self.windows.remove(pos);
             win.open = true;
+            win.minimized = false;
             self.windows.push(win);
+        }
+    }
+
+    fn toggle_taskbar_window(&mut self, id: AppId) {
+        let is_top_visible = self
+            .windows
+            .iter()
+            .rev()
+            .find(|w| w.open && !w.minimized)
+            .is_some_and(|w| w.id == id);
+
+        if is_top_visible {
+            if let Some(win) = self.windows.iter_mut().find(|w| w.id == id) {
+                win.minimized = true;
+            }
+        } else {
+            self.focus_or_open(id);
+        }
+    }
+
+    fn toggle_maximize(&mut self, idx: usize, canvas_w: i32, canvas_h: i32) {
+        let win = &mut self.windows[idx];
+        if win.maximized {
+            let (sx, sy, sw, sh) = win.saved_rect;
+            win.x = sx;
+            win.y = sy;
+            win.w = sw;
+            win.h = sh;
+            win.maximized = false;
+        } else {
+            win.saved_rect = (win.x, win.y, win.w, win.h);
+            win.x = 0;
+            win.y = if self.settings.taskbar_top { 36 } else { 0 };
+            win.w = canvas_w;
+            win.h = (canvas_h - 36).max(160);
+            win.maximized = true;
         }
     }
 
@@ -327,13 +372,14 @@ impl Desktop {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        let Some(top) = self.windows.iter().rev().find(|w| w.open) else {
+        let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized) else {
             return;
         };
         match top.id {
             AppId::Terminal => self.terminal.on_key(key, &self.kernel, &self.mem),
             AppId::Snake => self.snake.on_key(key),
             AppId::Notepad => self.notepad.on_key(key),
+            AppId::Calc => self.calc.on_key(key),
             _ => {}
         }
     }
@@ -345,19 +391,29 @@ impl Desktop {
         if let Some((id, off_x, off_y)) = self.dragging
             && let Some(win) = self.windows.iter_mut().find(|w| w.id == id)
         {
-            win.x = (self.mouse_x - off_x).clamp(0, (canvas_w - 60).max(0));
-            win.y = (self.mouse_y - off_y).clamp(0, (canvas_h - 60).max(0));
+            if !win.maximized {
+                win.x = (self.mouse_x - off_x).clamp(0, (canvas_w - 60).max(0));
+                win.y = (self.mouse_y - off_y).clamp(0, (canvas_h - 60).max(0));
+            }
             return;
         }
 
         if self.mouse_down
-            && let Some(top) = self.windows.last()
-            && top.open
+            && let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized)
             && top.id == AppId::Paint
         {
             self.paint
                 .paint_at(self.mouse_x - top.x, self.mouse_y - top.y);
         }
+    }
+
+    pub fn on_right_click(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
+        self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
+        self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+        self.start_menu_open = false;
+        let mx = x.min((canvas_w - 190).max(0));
+        let my = y.min((canvas_h - 170).max(0));
+        self.ctx_menu = Some((mx, my));
     }
 
     fn taskbar_pill_width(&self, canvas_w: i32, open_count: usize) -> i32 {
@@ -373,20 +429,44 @@ impl Desktop {
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
         self.mouse_down = true;
 
+        // 0. Right-click context menu hit test
+        if let Some((cx, cy)) = self.ctx_menu {
+            self.ctx_menu = None;
+            if x >= cx && x <= cx + 180 && y >= cy && y <= cy + 130 {
+                let row = (y - cy - 4) / 25;
+                match row {
+                    0 => self.focus_or_open(AppId::Terminal),
+                    1 => {
+                        self.settings.theme = match self.settings.theme {
+                            ThemePreset::AuroraPeaks => ThemePreset::CrimsonSunset,
+                            ThemePreset::CrimsonSunset => ThemePreset::MatrixGlow,
+                            ThemePreset::MatrixGlow => ThemePreset::OceanGlass,
+                            ThemePreset::OceanGlass => ThemePreset::AuroraPeaks,
+                        };
+                    }
+                    2 => self.focus_or_open(AppId::Settings),
+                    3 => self.refresh_metrics(),
+                    4 => self.running = false,
+                    _ => {}
+                }
+                return;
+            }
+        }
+
         let task_y = if self.settings.taskbar_top { 0 } else { canvas_h - 36 };
 
         // 1. Start Menu popup hit test
         if self.start_menu_open {
-            let menu_h = (START_ITEMS.len() as i32) * 26 + 38;
+            let menu_h = (START_ITEMS.len() as i32) * 24 + 36;
             let menu_y = if self.settings.taskbar_top {
                 38
             } else {
                 task_y - menu_h - 4
             };
             if (8..=228).contains(&x) && y >= menu_y && y < menu_y + menu_h {
-                let rel_y = y - (menu_y + 32);
+                let rel_y = y - (menu_y + 30);
                 if rel_y >= 0 {
-                    let idx = (rel_y / 26) as usize;
+                    let idx = (rel_y / 24) as usize;
                     if let Some(app_opt) = START_ITEMS.get(idx) {
                         self.start_menu_open = false;
                         match app_opt {
@@ -407,7 +487,6 @@ impl Desktop {
                 self.start_menu_open = !self.start_menu_open;
                 return;
             }
-            // Language pill [RU/EN] on right side of taskbar
             let lang_x = (canvas_w - 144).max(108);
             if x >= lang_x && x <= lang_x + 36 {
                 self.settings.lang = match self.settings.lang {
@@ -427,7 +506,7 @@ impl Desktop {
             let mut bx = 102;
             for id in open_ids {
                 if x >= bx && x <= bx + pill_w {
-                    self.focus_or_open(id);
+                    self.toggle_taskbar_window(id);
                     return;
                 }
                 bx += pill_w + 4;
@@ -435,10 +514,16 @@ impl Desktop {
             return;
         }
 
-        // 3. Topmost open window hit test
+        // 3. Topmost visible window hit test
         let mut hit_idx = None;
         for (idx, win) in self.windows.iter().enumerate().rev() {
-            if win.open && x >= win.x && x < win.x + win.w && y >= win.y && y < win.y + win.h {
+            if win.open
+                && !win.minimized
+                && x >= win.x
+                && x < win.x + win.w
+                && y >= win.y
+                && y < win.y + win.h
+            {
                 hit_idx = Some(idx);
                 break;
             }
@@ -449,15 +534,27 @@ impl Desktop {
             self.windows.push(win.clone());
             let top_idx = self.windows.len() - 1;
 
-            // Close button [×]
-            if x >= win.x + win.w - 28 && x <= win.x + win.w - 6 && y >= win.y + 5 && y <= win.y + 23
-            {
-                self.windows[top_idx].open = false;
-                self.dragging = None;
-                return;
+            if y >= win.y + 5 && y <= win.y + 23 {
+                // Close button [×]
+                if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 {
+                    self.windows[top_idx].open = false;
+                    self.dragging = None;
+                    return;
+                }
+                // Maximize/Restore button [□]
+                if x >= win.x + win.w - 49 && x <= win.x + win.w - 29 {
+                    self.toggle_maximize(top_idx, canvas_w, canvas_h);
+                    self.dragging = None;
+                    return;
+                }
+                // Minimize button [_]
+                if x >= win.x + win.w - 72 && x <= win.x + win.w - 52 {
+                    self.windows[top_idx].minimized = true;
+                    self.dragging = None;
+                    return;
+                }
             }
 
-            // Titlebar drag
             if y < win.y + 28 {
                 self.dragging = Some((win.id, x - win.x, y - win.y));
                 return;
@@ -467,20 +564,13 @@ impl Desktop {
             return;
         }
 
-        // 4. Desktop icons on the left
-        if self.settings.show_icons && (14..=94).contains(&x) {
-            if (40..=98).contains(&y) {
-                self.focus_or_open(AppId::Terminal);
-            } else if (112..=170).contains(&y) {
-                self.focus_or_open(AppId::PizGet);
-            } else if (184..=242).contains(&y) {
-                self.focus_or_open(AppId::Paint);
-            } else if (256..=314).contains(&y) {
-                self.focus_or_open(AppId::Snake);
-            } else if (328..=386).contains(&y) {
-                self.focus_or_open(AppId::Notepad);
-            } else if (400..=458).contains(&y) {
-                self.focus_or_open(AppId::Settings);
+        // 4. Desktop icons
+        if self.settings.show_icons {
+            for &(id, ix, iy, _) in &DESKTOP_ICONS {
+                if x >= ix - 4 && x <= ix + 74 && y >= iy - 2 && y <= iy + 58 {
+                    self.focus_or_open(id);
+                    return;
+                }
             }
         }
     }
@@ -536,6 +626,12 @@ impl Desktop {
             AppId::Paint => self.paint.on_click(lx, ly, win.h),
             AppId::Snake => self.snake.on_click(lx, ly, win.h),
             AppId::Notepad => self.notepad.on_click(lx, ly, win.h, lang),
+            AppId::Calc => self.calc.on_click(lx, ly, win.w, win.h),
+            AppId::Matrix => {
+                if ly >= win.h - 32 && ly <= win.h - 8 && (12..=142).contains(&lx) {
+                    self.matrix.cycle_color();
+                }
+            }
             AppId::Settings => {
                 if self.settings.on_click(lx, ly) {
                     self.refresh_metrics();
@@ -575,24 +671,28 @@ impl Desktop {
 
         // 2. Desktop Icons
         if self.settings.show_icons {
-            self.draw_desktop_icon(canvas, 18, 42, AppId::Terminal.title(lang), 0x3FB950, ">_");
-            self.draw_desktop_icon(canvas, 18, 114, "piz-get", 0xD29922, "PKG");
-            self.draw_desktop_icon(canvas, 18, 186, "PizPaint", 0xBC8CFF, "ART");
-            self.draw_desktop_icon(canvas, 18, 258, AppId::Snake.title(lang), 0x2EA043, "S~");
-            self.draw_desktop_icon(canvas, 18, 330, AppId::Notepad.title(lang), 0x58A6FF, "TXT");
-            self.draw_desktop_icon(canvas, 18, 402, AppId::Settings.title(lang), 0xF85149, "OS");
+            for &(id, ix, iy, col) in &DESKTOP_ICONS {
+                self.draw_desktop_icon(canvas, ix, iy, id, id.title(lang), col);
+            }
         }
 
-        // 3. Open Windows
+        // 3. Visible Windows
+        let top_vis = self
+            .windows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, win)| win.open && !win.minimized)
+            .map(|(i, _)| i);
+
         for (idx, win) in self.windows.iter().enumerate() {
-            if !win.open {
+            if !win.open || win.minimized {
                 continue;
             }
-            let focused = idx + 1 == self.windows.len();
-            self.draw_window(canvas, win, focused);
+            self.draw_window(canvas, win, Some(idx) == top_vis);
         }
 
-        // 4. Frosted-glass Taskbar (shows ONLY currently open windows)
+        // 4. Frosted-glass Taskbar (ONLY open windows)
         let task_y = if self.settings.taskbar_top { 0 } else { h - 36 };
         canvas.blend_rect(0, task_y, w, 36, 0x0D1117, 215);
         canvas.fill_rect(0, task_y, w, 1, 0x38424F);
@@ -609,27 +709,29 @@ impl Desktop {
             0xFF7B72,
         );
 
-        let open_wins: Vec<&Window> = self.windows.iter().filter(|win| win.open).collect();
+        let open_wins: Vec<(usize, &Window)> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, win)| win.open)
+            .collect();
         let pill_w = self.taskbar_pill_width(w, open_wins.len());
         let mut bx = 102;
-        for (i, win) in open_wins.iter().enumerate() {
-            let is_top = i + 1 == open_wins.len();
-            let bg = if is_top { accent } else { 0x21262D };
+        for (orig_idx, win) in open_wins {
+            let is_top = Some(orig_idx) == top_vis;
+            let bg = if is_top {
+                accent
+            } else if win.minimized {
+                0x161B22
+            } else {
+                0x21262D
+            };
             let border = if is_top { 0x79C0FF } else { 0x30363D };
-            canvas.draw_button(
-                bx,
-                task_y + 6,
-                pill_w,
-                24,
-                win.id.title(lang),
-                bg,
-                0xFFFFFF,
-                border,
-            );
+            let fg = if win.minimized { 0x8B949E } else { 0xFFFFFF };
+            canvas.draw_button(bx, task_y + 6, pill_w, 24, win.id.title(lang), bg, fg, border);
             bx += pill_w + 4;
         }
 
-        // Quick RU / EN language button + Uptime
         let lang_x = (w - 144).max(bx + 8);
         let lang_lbl = match lang {
             Lang::Ru => "RU",
@@ -638,12 +740,17 @@ impl Desktop {
         canvas.draw_button(lang_x, task_y + 6, 36, 24, lang_lbl, 0x21262D, 0xFFFFFF, accent);
         canvas.draw_text_clipped(lang_x + 44, task_y + 12, 96, &self.uptime, 0xC9D1D9, 1);
 
-        // 5. Frosted Start Menu popup
+        // 5. Start Menu popup
         if self.start_menu_open {
             self.draw_start_menu(canvas, task_y, accent);
         }
 
-        // 6. Mouse cursor
+        // 6. Right-click Context Menu
+        if let Some((cx, cy)) = self.ctx_menu {
+            self.draw_context_menu(canvas, cx, cy, accent);
+        }
+
+        // 7. Mouse cursor
         if self.settings.crosshair_cursor {
             canvas.fill_rect(self.mouse_x - 6, self.mouse_y, 13, 1, 0xFFFFFF);
             canvas.fill_rect(self.mouse_x, self.mouse_y - 6, 1, 13, 0xFFFFFF);
@@ -652,10 +759,36 @@ impl Desktop {
         }
     }
 
+    fn draw_context_menu(&self, canvas: &mut Canvas, cx: i32, cy: i32, accent: u32) {
+        let lang = self.settings.lang;
+        let items = [
+            tr(lang, "Открыть Терминал", "Open Terminal"),
+            tr(lang, "Сменить обои", "Next Wallpaper"),
+            tr(lang, "Настройки", "Settings"),
+            tr(lang, "Обновить", "Refresh"),
+            tr(lang, "Выход", "Exit"),
+        ];
+        canvas.draw_soft_shadow(cx, cy, 180, 132, 6);
+        canvas.blend_rounded_rect(cx, cy, 180, 132, 6, 0x161B22, 240);
+        canvas.draw_rounded_rect(cx, cy, 180, 132, 6, accent);
+        for (i, label) in items.iter().enumerate() {
+            let iy = cy + 4 + (i as i32) * 25;
+            if self.mouse_x >= cx
+                && self.mouse_x <= cx + 180
+                && self.mouse_y >= iy
+                && self.mouse_y < iy + 23
+            {
+                canvas.fill_rounded_rect(cx + 4, iy, 172, 23, 4, accent);
+            }
+            let col = if i == 4 { 0xFF7B72 } else { 0xE6EDF3 };
+            canvas.draw_text_clipped(cx + 12, iy + 5, 156, label, col, 1);
+        }
+    }
+
     fn draw_start_menu(&self, canvas: &mut Canvas, task_y: i32, accent: u32) {
         let lang = self.settings.lang;
         let menu_w = 220;
-        let menu_h = (START_ITEMS.len() as i32) * 26 + 38;
+        let menu_h = (START_ITEMS.len() as i32) * 24 + 36;
         let menu_x = 8;
         let menu_y = if self.settings.taskbar_top {
             38
@@ -678,19 +811,19 @@ impl Desktop {
         );
 
         for (i, app_opt) in START_ITEMS.iter().enumerate() {
-            let iy = menu_y + 32 + (i as i32) * 26;
+            let iy = menu_y + 30 + (i as i32) * 24;
             let hovered = self.mouse_x >= menu_x
                 && self.mouse_x <= menu_x + menu_w
                 && self.mouse_y >= iy
-                && self.mouse_y < iy + 24;
+                && self.mouse_y < iy + 22;
             if hovered {
-                canvas.fill_rounded_rect(menu_x + 6, iy, menu_w - 12, 24, 5, 0x262D38);
+                canvas.fill_rounded_rect(menu_x + 6, iy, menu_w - 12, 22, 5, 0x262D38);
             }
             let (label, col) = match app_opt {
                 Some(id) => (id.title(lang), 0xE6EDF3),
                 None => (tr(lang, "Выход", "Exit"), 0xFF7B72),
             };
-            canvas.draw_text_clipped(menu_x + 14, iy + 6, menu_w - 28, label, col, 1);
+            canvas.draw_text_clipped(menu_x + 14, iy + 5, menu_w - 28, label, col, 1);
         }
     }
 
@@ -699,15 +832,70 @@ impl Desktop {
         canvas: &mut Canvas,
         x: i32,
         y: i32,
+        id: AppId,
         label: &str,
         accent: u32,
-        badge: &str,
     ) {
+        let hovered = self.mouse_x >= x - 4
+            && self.mouse_x <= x + 74
+            && self.mouse_y >= y - 2
+            && self.mouse_y <= y + 58;
+        if hovered {
+            canvas.blend_rounded_rect(x - 2, y - 4, 72, 62, 8, 0xFFFFFF, 28);
+        }
         canvas.draw_soft_shadow(x + 12, y, 42, 38, 8);
         canvas.blend_rounded_rect(x + 12, y, 42, 38, 8, 0x1B222C, 225);
-        canvas.fill_rounded_rect(x + 12, y, 42, 9, 4, accent);
-        canvas.draw_rounded_rect(x + 12, y, 42, 38, 8, 0x38424F);
-        canvas.draw_text_clipped(x + 19, y + 17, 32, badge, 0xFFFFFF, 1);
+        canvas.draw_rounded_rect(x + 12, y, 42, 38, 8, accent);
+
+        // Mini pixel-art glyph inside icon
+        let ix = x + 22;
+        let iy = y + 9;
+        match id {
+            AppId::Terminal => {
+                canvas.fill_rect(ix, iy, 22, 18, 0x090C10);
+                canvas.draw_text(ix + 3, iy + 3, ">_", accent, 1);
+            }
+            AppId::PizGet => {
+                canvas.fill_rounded_rect(ix + 2, iy + 2, 18, 16, 3, accent);
+                canvas.fill_rect(ix + 2, iy + 7, 18, 2, 0x161B22);
+                canvas.fill_rect(ix + 10, iy + 2, 2, 16, 0x161B22);
+            }
+            AppId::Paint => {
+                canvas.fill_rounded_rect(ix + 2, iy + 2, 18, 16, 6, 0x30363D);
+                canvas.fill_rect(ix + 5, iy + 5, 4, 4, 0xF85149);
+                canvas.fill_rect(ix + 12, iy + 5, 4, 4, 0x3FB950);
+                canvas.fill_rect(ix + 8, iy + 11, 5, 4, 0x58A6FF);
+            }
+            AppId::Snake => {
+                canvas.fill_rect(ix + 2, iy + 12, 12, 4, accent);
+                canvas.fill_rect(ix + 10, iy + 6, 4, 8, accent);
+                canvas.fill_rect(ix + 10, iy + 4, 8, 4, 0x56D364);
+                canvas.fill_rect(ix + 17, iy + 12, 3, 3, 0xF85149);
+            }
+            AppId::Notepad => {
+                canvas.fill_rounded_rect(ix + 3, iy + 1, 16, 18, 2, 0xE6EDF3);
+                canvas.fill_rect(ix + 6, iy + 5, 10, 2, 0x1F6FEB);
+                canvas.fill_rect(ix + 6, iy + 9, 10, 2, 0x6E7681);
+                canvas.fill_rect(ix + 6, iy + 13, 7, 2, 0x6E7681);
+            }
+            AppId::Settings => {
+                canvas.fill_rounded_rect(ix + 3, iy + 1, 16, 16, 8, accent);
+                canvas.fill_rounded_rect(ix + 7, iy + 5, 8, 8, 4, 0x1B222C);
+            }
+            AppId::Calc => {
+                canvas.fill_rounded_rect(ix + 3, iy + 1, 16, 18, 3, 0x30363D);
+                canvas.fill_rect(ix + 5, iy + 3, 12, 4, accent);
+                canvas.fill_rect(ix + 5, iy + 9, 3, 3, 0xE6EDF3);
+                canvas.fill_rect(ix + 10, iy + 9, 3, 3, 0xE6EDF3);
+                canvas.fill_rect(ix + 14, iy + 9, 3, 7, 0xF59E0B);
+            }
+            AppId::Matrix => {
+                canvas.fill_rect(ix + 4, iy + 2, 2, 14, 0x2EA043);
+                canvas.fill_rect(ix + 10, iy + 5, 2, 12, 0x56D364);
+                canvas.fill_rect(ix + 16, iy + 1, 2, 11, 0xFFFFFF);
+            }
+            _ => {}
+        }
 
         canvas.draw_text_clipped(x + 3, y + 43, 76, label, 0x090C10, 1);
         canvas.draw_text_clipped(x + 2, y + 42, 76, label, 0xF0F6FC, 1);
@@ -727,21 +915,16 @@ impl Desktop {
         canvas.draw_text_clipped(
             win.x + 12,
             win.y + 8,
-            win.w - 48,
+            win.w - 92,
             win.id.title(lang),
             0xFFFFFF,
             1,
         );
-        canvas.draw_button(
-            win.x + win.w - 26,
-            win.y + 5,
-            20,
-            18,
-            "×",
-            0xDA3633,
-            0xFFFFFF,
-            0xFF7B72,
-        );
+
+        // Minimize [_], Maximize [□], Close [×]
+        canvas.draw_button(win.x + win.w - 72, win.y + 5, 20, 18, "_", 0x21262D, 0xFFFFFF, 0x484F58);
+        canvas.draw_button(win.x + win.w - 49, win.y + 5, 20, 18, "+", 0x21262D, 0xFFFFFF, 0x484F58);
+        canvas.draw_button(win.x + win.w - 26, win.y + 5, 20, 18, "×", 0xDA3633, 0xFFFFFF, 0xFF7B72);
 
         match win.id {
             AppId::System => self.draw_system_contents(canvas, win),
@@ -751,6 +934,8 @@ impl Desktop {
             AppId::Paint => self.paint.draw(canvas, win.x, win.y, win.w, win.h, lang),
             AppId::Snake => self.snake.draw(canvas, win.x, win.y, win.w, win.h, lang),
             AppId::Notepad => self.notepad.draw(canvas, win.x, win.y, win.w, win.h, lang),
+            AppId::Calc => self.calc.draw(canvas, win.x, win.y, win.w, win.h, accent),
+            AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
             AppId::Settings => self.settings.draw(
                 canvas,
                 win.x,
@@ -783,18 +968,32 @@ impl Desktop {
             x,
             y + 16,
             iw,
-            &format!("{}: {}", tr(lang, "Аптайм", "Uptime"), self.uptime),
+            &format!("{}: {}  |  Load: {}", tr(lang, "Аптайм", "Uptime"), self.uptime, self.loadavg),
             0xE6EDF3,
             1,
         );
-        canvas.draw_text_clipped(x, y + 32, iw, &format!("Load  : {}", self.loadavg), 0xE6EDF3, 1);
 
-        canvas.draw_text_clipped(x, y + 54, iw, &format!("CPU: {}%", self.cpu_pct), 0x79C0FF, 1);
-        canvas.draw_progress_bar(x, y + 68, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
+        canvas.draw_text_clipped(x, y + 38, iw, &format!("CPU: {}%", self.cpu_pct), 0x79C0FF, 1);
+        canvas.draw_progress_bar(x, y + 52, iw, 14, self.cpu_pct, 0x2EA043, 0x0D1117, 0x30363D);
+
+        // Live CPU Area Chart
+        let gx = x;
+        let gy = y + 72;
+        let gh = 42;
+        canvas.fill_rounded_rect(gx, gy, iw, gh, 4, 0x0D1117);
+        canvas.draw_rounded_rect(gx, gy, iw, gh, 4, 0x30363D);
+        let bar_w = (iw / 32).max(2);
+        for (i, &val) in self.cpu_history.iter().enumerate() {
+            let bh = ((val as i32) * (gh - 6)) / 100;
+            let bx = gx + 2 + (i as i32) * bar_w;
+            if bx + bar_w < gx + iw {
+                canvas.fill_rect(bx, gy + gh - 3 - bh, bar_w - 1, bh.max(1), 0x2EA043);
+            }
+        }
 
         canvas.draw_text_clipped(
             x,
-            y + 90,
+            y + 122,
             iw,
             &format!(
                 "RAM: {} / {} MB ({}%)",
@@ -805,7 +1004,7 @@ impl Desktop {
         );
         canvas.draw_progress_bar(
             x,
-            y + 104,
+            y + 136,
             iw,
             14,
             self.mem.percent,
@@ -816,16 +1015,16 @@ impl Desktop {
 
         canvas.draw_text_clipped(
             x,
-            y + 128,
+            y + 158,
             iw,
             &format!("{}: {}", tr(lang, "Процессы", "Processes"), self.procs.len()),
             0x8B949E,
             1,
         );
-        for (i, p) in self.procs.iter().take(4).enumerate() {
+        for (i, p) in self.procs.iter().take(3).enumerate() {
             canvas.draw_text_clipped(
                 x,
-                y + 144 + (i as i32) * 14,
+                y + 174 + (i as i32) * 14,
                 iw,
                 &format!("{:<5} {} {:>5}K {}", p.pid, p.state, p.mem_kb, p.name),
                 0xC9D1D9,
@@ -835,7 +1034,7 @@ impl Desktop {
 
         canvas.draw_button(
             x,
-            win.y + win.h - 36,
+            win.y + win.h - 34,
             110,
             24,
             tr(lang, "Обновить", "Refresh"),
@@ -888,36 +1087,9 @@ impl Desktop {
         }
 
         let by = win.y + win.h - 36;
-        canvas.draw_button(
-            x,
-            by,
-            90,
-            24,
-            tr(lang, "Обновить", "Update"),
-            0x21262D,
-            0xFFFFFF,
-            0x58A6FF,
-        );
-        canvas.draw_button(
-            x + 98,
-            by,
-            90,
-            24,
-            tr(lang, "Поставить", "Install"),
-            0x238636,
-            0xFFFFFF,
-            0x3FB950,
-        );
-        canvas.draw_button(
-            x + 196,
-            by,
-            90,
-            24,
-            tr(lang, "Снести", "Remove"),
-            0xB62324,
-            0xFFFFFF,
-            0xFF7B72,
-        );
+        canvas.draw_button(x, by, 90, 24, tr(lang, "Обновить", "Update"), 0x21262D, 0xFFFFFF, 0x58A6FF);
+        canvas.draw_button(x + 98, by, 90, 24, tr(lang, "Поставить", "Install"), 0x238636, 0xFFFFFF, 0x3FB950);
+        canvas.draw_button(x + 196, by, 90, 24, tr(lang, "Снести", "Remove"), 0xB62324, 0xFFFFFF, 0xFF7B72);
     }
 
     fn draw_files_contents(&self, canvas: &mut Canvas, win: &Window) {

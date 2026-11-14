@@ -118,6 +118,17 @@ mod tests {
         desktop.focus_or_open(desktop::AppId::Paint);
         desktop.focus_or_open(desktop::AppId::Snake);
         desktop.focus_or_open(desktop::AppId::Notepad);
+        desktop.focus_or_open(desktop::AppId::Calc);
+        desktop.focus_or_open(desktop::AppId::Matrix);
+
+        desktop.calc.press("2");
+        desktop.calc.press("+");
+        desktop.calc.press("3");
+        desktop.calc.press("=");
+        assert_eq!(desktop.calc.display, "5");
+
+        desktop.on_right_click(500, 300, 960, 600);
+        assert!(desktop.ctx_menu.is_some());
 
         desktop.render(&mut canvas);
         assert!(canvas.pixels.iter().any(|&p| p != 0x101822));
