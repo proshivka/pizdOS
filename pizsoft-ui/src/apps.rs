@@ -673,15 +673,22 @@ impl ThemePreset {
                     }
                 }
 
-                // Distant atmospheric haze before mountain ridges
+                // Distant atmospheric haze + natural randomized starfield before mountain ridges
                 if yf < m0 {
-                    let hash =
-                        (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
-                    if y * 3 < h * 2 && (hash & 0x2FF) == 0 {
-                        let bright = 110 + ((hash >> 10) & 0x7F);
-                        px = lerp_rgb(px, 0xFFFFFF, bright.min(230), 255);
+                    let mut hash = ((x as u32).wrapping_mul(374761393))
+                        ^ ((y as u32).wrapping_mul(668265263))
+                        ^ 0x9E37_79B9;
+                    hash ^= hash >> 16;
+                    hash = hash.wrapping_mul(0x7FEB_352D);
+                    hash ^= hash >> 15;
+                    hash = hash.wrapping_mul(0x846C_A68B);
+                    hash ^= hash >> 16;
+                    if y * 3 < h * 2 && (hash & 0x3FF) == 0 {
+                        let bright = 100 + ((hash >> 10) & 0x7F);
+                        let star_c = if (hash & 0x400) != 0 { 0xBFDBFE } else { 0xFFFBEB };
+                        px = lerp_rgb(px, star_c, bright.min(230), 255);
                     }
-                    let fog = (1.0 - ((m0 - yf) / (hf * 0.14)).clamp(0.0, 1.0)) * 50.0;
+                    let fog = (1.0 - ((m0 - yf) / (hf * 0.14)).clamp(0.0, 1.0)) * 52.0;
                     if fog > 1.0 {
                         px = lerp_rgb(px, orb_c, fog as u32, 255);
                     }
@@ -689,10 +696,18 @@ impl ThemePreset {
                     px = ridge2_c;
                 } else if yf >= m1 {
                     let depth = ((yf - m1) / (m2 - m1).max(1.0)).clamp(0.0, 1.0);
+                    let crest = (1.0 - (yf - m1) * 0.45).clamp(0.0, 1.0);
                     px = lerp_rgb(ridge1_c, ridge2_c, (depth * 140.0) as u32, 255);
+                    if crest > 0.01 {
+                        px = lerp_rgb(px, orb_c, (crest * 42.0) as u32, 255);
+                    }
                 } else {
                     let depth = ((yf - m0) / (m1 - m0).max(1.0)).clamp(0.0, 1.0);
+                    let crest = (1.0 - (yf - m0) * 0.45).clamp(0.0, 1.0);
                     px = lerp_rgb(ridge0_c, lerp_rgb(ridge0_c, bot_c, 75, 255), (depth * 160.0) as u32, 255);
+                    if crest > 0.01 {
+                        px = lerp_rgb(px, orb_c, (crest * 36.0) as u32, 255);
+                    }
                 }
 
                 if show_grid && (x % 40 == 0 || y % 40 == 0) {
@@ -812,8 +827,8 @@ impl SettingsState {
         let sb_y = wy + 34;
         let sb_w = 126;
         let sb_h = wh - 44;
-        canvas.fill_rounded_rect(sb_x, sb_y, sb_w, sb_h, 6, 0x0D1117);
-        canvas.draw_rounded_rect(sb_x, sb_y, sb_w, sb_h, 6, 0x30363D);
+        canvas.fill_vgradient_rounded_rect(sb_x, sb_y, sb_w, sb_h, 7, 0x111722, 0x0D121B);
+        canvas.draw_rounded_rect_alpha(sb_x, sb_y, sb_w, sb_h, 7, 0xFFFFFF, 26);
 
         let tabs = [
             (SettingsPage::Display, tr(lang, "Экран и язык", "Display & Lang")),
@@ -830,15 +845,16 @@ impl SettingsState {
                     ty,
                     sb_w - 10,
                     24,
-                    5,
+                    6,
                     accent,
-                    lerp_rgb(accent, 0xFFFFFF, 40, 255),
+                    lerp_rgb(accent, 0xFFFFFF, 45, 255),
                 );
-                canvas.fill_rounded_rect(sb_x + 7, ty + 4, 3, 16, 1, 0xFFFFFF);
+                canvas.draw_aqua_sheen(sb_x + 5, ty, sb_w - 10, 24, 6, 48);
+                canvas.fill_rounded_rect(sb_x + 7, ty + 5, 3, 14, 1, 0xFFFFFF);
             } else {
-                canvas.fill_rounded_rect(sb_x + 5, ty, sb_w - 10, 24, 5, 0x161B22);
+                canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 24, 6, 0xFFFFFF, 10);
             }
-            let fg = if active { 0xFFFFFF } else { 0xC9D1D9 };
+            let fg = if active { 0xFFFFFF } else { 0xCBD5E1 };
             canvas.draw_text_clipped(sb_x + 15, ty + 6, sb_w - 22, label, fg, 1);
         }
 
@@ -972,38 +988,46 @@ impl SettingsState {
             }
             SettingsPage::About => {
                 // ColorOS-style Gradient Hero Banner Card
-                let card_right = lerp_rgb(0x162436, accent, 110, 255);
-                canvas.fill_hgradient_rounded_rect(x, y, iw, 78, 8, 0x121D2C, card_right);
-                canvas.blend_rect(x + 8, y + 1, iw - 16, 1, 0xFFFFFF, 48);
-                canvas.fill_rounded_rect(x, y, 6, 78, 3, accent);
-                canvas.draw_rounded_rect(x, y, iw, 78, 8, accent);
+                let card_right = lerp_rgb(0x162436, accent, 105, 255);
+                canvas.fill_hgradient_rounded_rect(x, y, iw, 78, 9, 0x121D2D, card_right);
+                canvas.draw_aqua_sheen(x, y, iw, 78, 9, 32);
+                canvas.fill_rounded_rect(x + 3, y + 14, 3, 50, 1, lerp_rgb(accent, 0xFFFFFF, 90, 255));
+                canvas.draw_rounded_rect_alpha(x, y, iw, 78, 9, lerp_rgb(accent, 0xFFFFFF, 60, 255), 115);
 
-                canvas.draw_text_clipped(x + 16, y + 10, iw - 110, "pizdOS 2.0", 0xFFFFFF, 2);
+                canvas.draw_text_clipped(x + 15, y + 10, iw - 110, "pizdOS 2.0", 0xFFFFFF, 2);
                 canvas.draw_text_clipped(
-                    x + 16,
-                    y + 38,
+                    x + 15,
+                    y + 39,
                     iw - 110,
-                    "Bratukha Edition | Pizsoft UI",
-                    0x79C0FF,
+                    "Bratukha Edition • Pizsoft UI",
+                    0x93C5FD,
                     1,
                 );
                 canvas.draw_text_clipped(
-                    x + 16,
-                    y + 56,
+                    x + 15,
+                    y + 57,
                     iw - 110,
                     "by prosh1vka, Lowyk, KiryxaTipa",
-                    0x3FB950,
+                    0x6EE7B7,
                     1,
                 );
 
-                // Emblem badge on right of Hero Card
+                // Sleek capsule emblem badge on right of Hero Card
                 if iw > 260 {
-                    let bx = x + iw - 84;
-                    let by = y + 14;
-                    canvas.blend_rounded_rect(bx, by, 72, 50, 8, 0x090C10, 145);
-                    canvas.draw_rounded_rect(bx, by, 72, 50, 8, lerp_rgb(accent, 0xFFFFFF, 65, 255));
-                    canvas.draw_text_clipped(bx + 14, by + 10, 56, "NO", 0xFFFFFF, 1);
-                    canvas.draw_text_clipped(bx + 14, by + 26, 56, "GNU", 0x3FB950, 1);
+                    let bx = x + iw - 92;
+                    let by = y + 25;
+                    canvas.blend_rounded_rect(bx, by, 80, 26, 13, 0x090D14, 175);
+                    canvas.draw_rounded_rect_alpha(
+                        bx,
+                        by,
+                        80,
+                        26,
+                        13,
+                        lerp_rgb(accent, 0xFFFFFF, 85, 255),
+                        135,
+                    );
+                    canvas.fill_aa_circle((bx + 14) as f32, (by + 13) as f32, 4.0, 0x3FB950, 255);
+                    canvas.draw_text_clipped(bx + 23, by + 7, 54, "NO GNU", 0xF8FAFC, 1);
                 }
 
                 // 2-Column ColorOS Info Tiles
@@ -1026,11 +1050,11 @@ impl SettingsState {
                     if ty + 44 > wy + wh - 10 {
                         break;
                     }
-                    canvas.fill_vgradient_rounded_rect(tx, ty, col_w, 44, 6, 0x222933, 0x181E27);
-                    canvas.draw_rounded_rect(tx, ty, col_w, 44, 6, 0x343D4B);
-                    canvas.fill_rounded_rect(tx + 9, ty + 10, 5, 5, 2, *dot_col);
-                    canvas.draw_text_clipped(tx + 18, ty + 6, col_w - 26, label, 0x94A3B8, 1);
-                    canvas.draw_text_clipped(tx + 10, ty + 23, col_w - 18, val, 0xF0F6FC, 1);
+                    canvas.fill_vgradient_rounded_rect(tx, ty, col_w, 44, 7, 0x1F2733, 0x161C25);
+                    canvas.draw_rounded_rect_alpha(tx, ty, col_w, 44, 7, 0xFFFFFF, 26);
+                    canvas.fill_aa_circle((tx + 12) as f32, (ty + 12) as f32, 3.0, *dot_col, 255);
+                    canvas.draw_text_clipped(tx + 20, ty + 6, col_w - 26, label, 0x94A3B8, 1);
+                    canvas.draw_text_clipped(tx + 11, ty + 23, col_w - 18, val, 0xF1F5F9, 1);
                 }
             }
         }
@@ -1159,9 +1183,9 @@ impl CalcState {
         let x = wx + 12;
         let y = wy + 34;
         let iw = ww - 24;
-        canvas.fill_vgradient_rounded_rect(x, y, iw, 42, 6, 0x0A1017, 0x0F1722);
-        canvas.blend_rect(x + 6, y + 1, iw - 12, 1, 0xFFFFFF, 32);
-        canvas.draw_rounded_rect(x, y, iw, 42, 6, 0x30363D);
+        canvas.fill_vgradient_rounded_rect(x, y, iw, 42, 7, 0x0A1017, 0x0F1722);
+        canvas.draw_aqua_sheen(x, y, iw, 42, 7, 22);
+        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 7, 0xFFFFFF, 34);
         if let (Some(a), Some(op)) = (self.acc, self.op) {
             canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
         }
