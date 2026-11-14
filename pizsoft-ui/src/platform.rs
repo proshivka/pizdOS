@@ -384,7 +384,11 @@ mod win32 {
                         desktop.on_right_click(x, y, canvas.width as i32, canvas.height as i32)
                     }
                     WM_KEYDOWN => match msg.w_param {
-                        VK_ESCAPE => desktop.running = false,
+                        VK_ESCAPE => {
+                            if !desktop.on_escape() {
+                                desktop.running = false;
+                            }
+                        }
                         VK_LEFT => desktop.on_key(KeyEvent::Left),
                         VK_UP => desktop.on_key(KeyEvent::Up),
                         VK_RIGHT => desktop.on_key(KeyEvent::Right),
@@ -412,7 +416,10 @@ mod win32 {
             unsafe { GetClientRect(hwnd, &mut rect) };
             let cw = (rect.right - rect.left).max(320) as usize;
             let ch = (rect.bottom - rect.top).max(240) as usize;
-            canvas.resize(cw, ch);
+            if cw != canvas.width || ch != canvas.height {
+                canvas.resize(cw, ch);
+                desktop.on_viewport_resize(cw as i32, ch as i32);
+            }
 
             desktop.on_tick();
             desktop.render(&mut canvas);

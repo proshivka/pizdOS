@@ -661,6 +661,31 @@ impl Canvas {
         self.draw_aa_line(x + 5.2, y + 11.8, x + 11.2, y + 11.0, 1.2, 0xFFFFFF, 230);
     }
 
+    pub fn draw_resize_cursor(&mut self, mx: i32, my: i32, ux: f32, uy: f32) {
+        let len = (ux * ux + uy * uy).sqrt().max(0.001);
+        let vx = ux / len;
+        let vy = uy / len;
+        let px = -vy;
+        let py = vx;
+        let cx = mx as f32;
+        let cy = my as f32;
+        let half = 7.5;
+        let x0 = cx - vx * half;
+        let y0 = cy - vy * half;
+        let x1 = cx + vx * half;
+        let y1 = cy + vy * half;
+
+        // Crisp dark halo under bright white vector arrows for legibility on dark/light backgrounds
+        for &(col, w, a) in &[(0x090C12, 3.0, 220u8), (0xF8FAFC, 1.4, 245u8)] {
+            self.draw_aa_line(x0, y0, x1, y1, w, col, a);
+            let h_len = 3.5;
+            self.draw_aa_line(x0, y0, x0 + vx * h_len + px * h_len, y0 + vy * h_len + py * h_len, w, col, a);
+            self.draw_aa_line(x0, y0, x0 + vx * h_len - px * h_len, y0 + vy * h_len - py * h_len, w, col, a);
+            self.draw_aa_line(x1, y1, x1 - vx * h_len + px * h_len, y1 - vy * h_len + py * h_len, w, col, a);
+            self.draw_aa_line(x1, y1, x1 - vx * h_len - px * h_len, y1 - vy * h_len - py * h_len, w, col, a);
+        }
+    }
+
     /// Writes a standard uncompressed 24-bit BMP image for offline inspection.
     pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
         let w = self.width as u32;

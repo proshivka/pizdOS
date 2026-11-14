@@ -143,4 +143,56 @@ mod tests {
         assert!(bytes.starts_with(b"BM"));
         let _ = fs::remove_file(&bmp_path);
     }
+
+    #[test]
+    fn test_window_resize_and_interactive_about_os() {
+        let mut desktop = Desktop::new(1160, 720);
+
+        // 1. Resize topmost window ("Settings" at 370, 90, 520, 344) via bottom-right corner
+        let sx = desktop.windows.last().unwrap().x + desktop.windows.last().unwrap().w - 3;
+        let sy = desktop.windows.last().unwrap().y + desktop.windows.last().unwrap().h - 3;
+        desktop.on_mouse_down(sx, sy, 1160, 720);
+        assert!(desktop.resizing.is_some());
+        desktop.on_mouse_move(sx + 60, sy + 50, 1160, 720);
+        desktop.on_mouse_up();
+        assert_eq!(desktop.windows.last().unwrap().w, 580);
+        assert_eq!(desktop.windows.last().unwrap().h, 394);
+
+        // Shrink below minimum size -> clamps to AppId::Settings.min_size() (440, 310)
+        let sx2 = desktop.windows.last().unwrap().x + desktop.windows.last().unwrap().w - 3;
+        let sy2 = desktop.windows.last().unwrap().y + desktop.windows.last().unwrap().h - 3;
+        desktop.on_mouse_down(sx2, sy2, 1160, 720);
+        desktop.on_mouse_move(100, 100, 1160, 720);
+        desktop.on_mouse_up();
+        assert_eq!(desktop.windows.last().unwrap().w, 440);
+        assert_eq!(desktop.windows.last().unwrap().h, 310);
+
+        // 2. Click Hero Banner in About OS -> increments update taps
+        let win = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(win.x + 200, win.y + 70, 1160, 720);
+        assert_eq!(desktop.settings.update_taps, 1);
+
+        // 3. Click Device card in About OS -> inline device rename via keyboard + Enter
+        desktop.on_mouse_down(win.x + 190, win.y + 165, 1160, 720);
+        assert!(desktop.settings.editing_device);
+        for _ in 0..10 {
+            desktop.on_key(apps::KeyEvent::Backspace);
+        }
+        for c in "ProBox".chars() {
+            desktop.on_key(apps::KeyEvent::Char(c));
+        }
+        desktop.on_key(apps::KeyEvent::Enter);
+        assert!(!desktop.settings.editing_device);
+        assert_eq!(desktop.settings.device_name, "ProBox");
+
+        // 4. Click Packages row in bottom ColorOS list -> opens PizGet window
+        desktop.on_mouse_down(win.x + 200, win.y + 272, 1160, 720);
+        assert_eq!(desktop.windows.last().unwrap().id, desktop::AppId::PizGet);
+        assert!(desktop.windows.last().unwrap().open);
+
+        // 5. Click tray clock/uptime area -> toggles show_clock
+        let orig_clock = desktop.settings.show_clock;
+        desktop.on_mouse_down(1100, 700, 1160, 720);
+        assert_ne!(desktop.settings.show_clock, orig_clock);
+    }
 }

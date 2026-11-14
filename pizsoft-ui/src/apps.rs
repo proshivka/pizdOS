@@ -23,6 +23,7 @@ pub enum KeyEvent {
     Char(char),
     Enter,
     Backspace,
+    Escape,
     Up,
     Down,
     Left,
@@ -488,7 +489,8 @@ impl NotepadState {
         canvas.fill_rounded_rect(x, y, iw, ih, 6, 0x0D1117);
         canvas.draw_rounded_rect(x, y, iw, ih, 6, 0x30363D);
 
-        for (i, line) in self.lines.iter().take(12).enumerate() {
+        let max_lines = ((ih - 8) / 15).max(1) as usize;
+        for (i, line) in self.lines.iter().take(max_lines).enumerate() {
             let cursor = if i + 1 == self.lines.len() { "_" } else { "" };
             canvas.draw_text_clipped(
                 x + 8,
@@ -696,6 +698,14 @@ impl ThemePreset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsAction {
+    None,
+    RefreshMetrics,
+    OpenTerminal,
+    OpenPizGet,
+}
+
 pub struct SettingsState {
     pub page: SettingsPage,
     pub lang: Lang,
@@ -704,7 +714,12 @@ pub struct SettingsState {
     pub show_icons: bool,
     pub taskbar_top: bool,
     pub crosshair_cursor: bool,
+    pub show_clock: bool,
     pub snake_tick_div: u64,
+    pub device_name: String,
+    pub editing_device: bool,
+    pub update_taps: u8,
+    pub license_alt: bool,
 }
 
 impl SettingsState {
@@ -717,14 +732,43 @@ impl SettingsState {
             show_icons: true,
             taskbar_top: false,
             crosshair_cursor: false,
+            show_clock: true,
             snake_tick_div: 10,
+            device_name: String::from("pizdOS PC"),
+            editing_device: false,
+            update_taps: 0,
+            license_alt: false,
         }
     }
 
-    pub fn on_click(&mut self, lx: i32, ly: i32) -> bool {
+    pub fn on_key(&mut self, key: KeyEvent) {
+        if !self.editing_device {
+            return;
+        }
+        match key {
+            KeyEvent::Char(c) => {
+                if self.device_name.chars().count() < 18 {
+                    self.device_name.push(c);
+                }
+            }
+            KeyEvent::Backspace => {
+                self.device_name.pop();
+            }
+            KeyEvent::Enter | KeyEvent::Escape => {
+                if self.device_name.trim().is_empty() {
+                    self.device_name = String::from("pizdOS PC");
+                }
+                self.editing_device = false;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) -> SettingsAction {
         // Left sidebar (x: 10..136)
         if (10..=136).contains(&lx) && ly >= 36 {
             let idx = (ly - 36) / 30;
+            self.editing_device = false;
             match idx {
                 0 => self.page = SettingsPage::Display,
                 1 => self.page = SettingsPage::Taskbar,
@@ -732,54 +776,181 @@ impl SettingsState {
                 3 => self.page = SettingsPage::About,
                 _ => {}
             }
-            return false;
+            return SettingsAction::None;
         }
 
         if lx < 146 {
-            return false;
+            return SettingsAction::None;
         }
 
+        let iw = ww - 158;
         match self.page {
             SettingsPage::Display => {
-                if (68..=94).contains(&ly) {
+                self.editing_device = false;
+                if (60..94).contains(&ly) {
                     self.theme = match self.theme {
                         ThemePreset::AuroraPeaks => ThemePreset::CrimsonSunset,
                         ThemePreset::CrimsonSunset => ThemePreset::MatrixGlow,
                         ThemePreset::MatrixGlow => ThemePreset::OceanGlass,
                         ThemePreset::OceanGlass => ThemePreset::AuroraPeaks,
                     };
-                } else if (112..=138).contains(&ly) {
+                } else if (94..128).contains(&ly) {
                     self.lang = match self.lang {
                         Lang::Ru => Lang::En,
                         Lang::En => Lang::Ru,
                     };
-                } else if (156..=182).contains(&ly) {
+                } else if (138..172).contains(&ly) {
                     self.show_grid = !self.show_grid;
-                } else if (200..=226).contains(&ly) {
+                } else if (172..206).contains(&ly) {
                     self.show_icons = !self.show_icons;
+                } else if (218..=270).contains(&ly) && iw >= 160 {
+                    let sw_w = ((iw - 18) / 4).max(20);
+                    let rel_x = lx - 146;
+                    let idx = (rel_x / (sw_w + 6)) as usize;
+                    let presets = [
+                        ThemePreset::AuroraPeaks,
+                        ThemePreset::CrimsonSunset,
+                        ThemePreset::MatrixGlow,
+                        ThemePreset::OceanGlass,
+                    ];
+                    if let Some(&preset) = presets.get(idx) {
+                        self.theme = preset;
+                    }
                 }
             }
             SettingsPage::Taskbar => {
-                if (68..=94).contains(&ly) {
+                self.editing_device = false;
+                if (60..94).contains(&ly) {
                     self.taskbar_top = !self.taskbar_top;
-                } else if (112..=138).contains(&ly) {
+                } else if (94..128).contains(&ly) {
                     self.crosshair_cursor = !self.crosshair_cursor;
+                } else if (128..162).contains(&ly) {
+                    self.show_clock = !self.show_clock;
                 }
             }
             SettingsPage::System => {
-                if (68..=94).contains(&ly) {
+                self.editing_device = false;
+                if (138..172).contains(&ly) {
                     self.snake_tick_div = match self.snake_tick_div {
                         14 => 10,
                         10 => 5,
                         _ => 14,
                     };
-                } else if (192..=218).contains(&ly) {
-                    return true;
+                } else if (206..240).contains(&ly) {
+                    return SettingsAction::RefreshMetrics;
                 }
             }
-            SettingsPage::About => {}
+            SettingsPage::About => {
+                // Hero OS Banner click: check updates / dev-mode easter egg
+                if (36..=126).contains(&ly) {
+                    self.editing_device = false;
+                    self.update_taps = self.update_taps.saturating_add(1);
+                    return SettingsAction::None;
+                }
+                // Middle Bento Row (ly: 134..=208)
+                let w1 = ((iw - 8) * 45) / 100;
+                if (134..=208).contains(&ly) {
+                    if lx <= 146 + w1 {
+                        if self.editing_device && self.device_name.trim().is_empty() {
+                            self.device_name = String::from("pizdOS PC");
+                        }
+                        self.editing_device = !self.editing_device;
+                    } else {
+                        self.editing_device = false;
+                        self.page = SettingsPage::System;
+                        return SettingsAction::RefreshMetrics;
+                    }
+                    return SettingsAction::None;
+                }
+                self.editing_device = false;
+                // Bottom Grouped ColorOS List Card
+                let grp_ly = 216;
+                let grp_h = (wh - 12 - grp_ly).clamp(96, 114);
+                if ly >= grp_ly && ly < grp_ly + grp_h {
+                    let row_h = (grp_h / 4).max(1);
+                    let row = (ly - grp_ly) / row_h;
+                    match row {
+                        0 => {
+                            self.page = SettingsPage::System;
+                            return SettingsAction::RefreshMetrics;
+                        }
+                        1 => return SettingsAction::OpenTerminal,
+                        2 => return SettingsAction::OpenPizGet,
+                        3 => self.license_alt = !self.license_alt,
+                        _ => {}
+                    }
+                }
+            }
         }
-        false
+        SettingsAction::None
+    }
+
+    fn draw_card_frame(canvas: &mut Canvas, x: i32, y: i32, w: i32, h: i32, r: i32) {
+        canvas.fill_rounded_rect(x, y, w, h, r, 0x161B26);
+        canvas.draw_rounded_rect_alpha(x, y, w, h, r, 0xFFFFFF, 22);
+        canvas.blend_rect(x + r, y + 1, (w - 2 * r).max(0), 1, 0xFFFFFF, 18);
+    }
+
+    fn draw_chevron(canvas: &mut Canvas, ch_x: f32, ch_y: f32) {
+        canvas.draw_aa_line(ch_x - 2.0, ch_y - 3.0, ch_x + 1.5, ch_y, 1.2, 0x64748B, 175);
+        canvas.draw_aa_line(ch_x + 1.5, ch_y, ch_x - 2.0, ch_y + 3.0, 1.2, 0x64748B, 175);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_spec_row(
+        canvas: &mut Canvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        row_h: i32,
+        dot_col: u32,
+        label: &str,
+        value: &str,
+        hovered: bool,
+        divider_top: bool,
+    ) {
+        if divider_top {
+            canvas.blend_rect(x + 14, y, w - 28, 1, 0xFFFFFF, 12);
+        }
+        if hovered {
+            canvas.blend_rounded_rect(x + 4, y + 2, w - 8, row_h - 4, 8, 0xFFFFFF, 12);
+        }
+        let mid_y = y + row_h / 2;
+        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, dot_col, 32);
+        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, dot_col, 240);
+        canvas.draw_text_clipped(x + 32, mid_y - 7, 150, label, 0xE2E8F0, 1);
+
+        let max_vw = (w - 190).max(40);
+        let vw = crate::font::measure_text(value, 1).min(max_vw);
+        canvas.draw_text_clipped(x + w - 24 - vw, mid_y - 7, max_vw, value, 0x94A3B8, 1);
+        Self::draw_chevron(canvas, (x + w - 14) as f32, mid_y as f32);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_toggle_row(
+        canvas: &mut Canvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        row_h: i32,
+        dot_col: u32,
+        label: &str,
+        on: bool,
+        accent: u32,
+        hovered: bool,
+        divider_top: bool,
+    ) {
+        if divider_top {
+            canvas.blend_rect(x + 14, y, w - 28, 1, 0xFFFFFF, 12);
+        }
+        if hovered {
+            canvas.blend_rounded_rect(x + 4, y + 2, w - 8, row_h - 4, 8, 0xFFFFFF, 12);
+        }
+        let mid_y = y + row_h / 2;
+        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, dot_col, 32);
+        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, dot_col, 240);
+        canvas.draw_text_clipped(x + 32, mid_y - 7, w - 82, label, 0xE2E8F0, 1);
+        canvas.draw_toggle(x + w - 48, mid_y - 9, on, accent);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -794,6 +965,8 @@ impl SettingsState {
         mem: &MemInfo,
         cpu_pct: u8,
         uptime: &str,
+        hover_lx: i32,
+        hover_ly: i32,
     ) {
         let lang = self.lang;
         let accent = self.theme.accent();
@@ -815,9 +988,14 @@ impl SettingsState {
         for (i, (p, label)) in tabs.iter().enumerate() {
             let ty = sb_y + 6 + (i as i32) * 30;
             let active = self.page == *p;
+            let local_ty = 40 + (i as i32) * 30;
+            let hovered = (10..=136).contains(&hover_lx)
+                && (local_ty..local_ty + 25).contains(&hover_ly);
             if active {
                 canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 25, 6, accent, 42);
                 canvas.fill_rounded_rect(sb_x + 7, ty + 6, 3, 13, 1, accent);
+            } else if hovered {
+                canvas.blend_rounded_rect(sb_x + 5, ty, sb_w - 10, 25, 6, 0xFFFFFF, 12);
             }
             let fg = if active { 0xF8FAFC } else { 0x94A3B8 };
             canvas.draw_text_clipped(sb_x + 15, ty + 6, sb_w - 22, label, fg, 1);
@@ -826,129 +1004,288 @@ impl SettingsState {
         let x = wx + 146;
         let y = wy + 36;
         let iw = ww - 158;
+        let in_content = hover_lx >= 146 && hover_lx < ww - 12;
 
         match self.page {
             SettingsPage::Display => {
                 canvas.draw_text_clipped(
-                    x,
-                    y,
+                    x + 2,
+                    y + 2,
                     iw,
                     tr(lang, "Экран, обои и язык", "Display, Wallpaper & Lang"),
-                    0xFFFFFF,
+                    0x94A3B8,
                     1,
                 );
-                canvas.draw_button(
+
+                // Grouped ColorOS Card 1: Theme + Language
+                let c1_y = wy + 60;
+                Self::draw_card_frame(canvas, x, c1_y, iw, 68, 12);
+                Self::draw_spec_row(
+                    canvas,
                     x,
-                    wy + 68,
+                    c1_y,
                     iw,
-                    26,
-                    &format!("{}: {}", tr(lang, "Обои", "Wallpaper"), self.theme.name(lang)),
-                    0x21262D,
-                    0xFFFFFF,
+                    34,
                     accent,
+                    tr(lang, "Тема и обои", "Wallpaper"),
+                    self.theme.name(lang),
+                    in_content && (60..94).contains(&hover_ly),
+                    false,
                 );
-                canvas.draw_button(
+                Self::draw_spec_row(
+                    canvas,
                     x,
-                    wy + 112,
+                    c1_y + 34,
                     iw,
-                    26,
-                    tr(lang, "Язык: Русский (RU)", "Language: English (EN)"),
-                    0x21262D,
-                    0xFFFFFF,
-                    accent,
+                    34,
+                    0x38BDF8,
+                    tr(lang, "Язык интерфейса", "Language"),
+                    tr(lang, "Русский (RU)", "English (EN)"),
+                    in_content && (94..128).contains(&hover_ly),
+                    true,
                 );
 
-                // Toggle rows
-                canvas.fill_rounded_rect(x, wy + 156, iw, 26, 5, 0x21262D);
-                canvas.draw_text_clipped(
-                    x + 10,
-                    wy + 163,
-                    iw - 56,
+                // Grouped ColorOS Card 2: Desktop Toggles
+                let c2_y = wy + 138;
+                Self::draw_card_frame(canvas, x, c2_y, iw, 68, 12);
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c2_y,
+                    iw,
+                    34,
+                    0xA855F7,
                     tr(lang, "Сетка поверх обоев", "Wallpaper Grid"),
-                    0xE6EDF3,
-                    1,
+                    self.show_grid,
+                    accent,
+                    in_content && (138..172).contains(&hover_ly),
+                    false,
                 );
-                canvas.draw_toggle(x + iw - 44, wy + 160, self.show_grid, accent);
-
-                canvas.fill_rounded_rect(x, wy + 200, iw, 26, 5, 0x21262D);
-                canvas.draw_text_clipped(
-                    x + 10,
-                    wy + 207,
-                    iw - 56,
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c2_y + 34,
+                    iw,
+                    34,
+                    0x3FB950,
                     tr(lang, "Иконки на рабочем столе", "Desktop Icons"),
-                    0xE6EDF3,
-                    1,
+                    self.show_icons,
+                    accent,
+                    in_content && (172..206).contains(&hover_ly),
+                    true,
                 );
-                canvas.draw_toggle(x + iw - 44, wy + 204, self.show_icons, accent);
+
+                // Interactive ColorOS Luminous Theme Swatches
+                let sw_y = wy + 218;
+                if sw_y + 52 <= wy + wh - 10 && iw >= 160 {
+                    let sw_w = ((iw - 18) / 4).max(20);
+                    let presets = [
+                        ThemePreset::AuroraPeaks,
+                        ThemePreset::CrimsonSunset,
+                        ThemePreset::MatrixGlow,
+                        ThemePreset::OceanGlass,
+                    ];
+                    for (i, preset) in presets.iter().enumerate() {
+                        let sx = x + (i as i32) * (sw_w + 6);
+                        let (tl, br, ba, _, _, rib) = preset.mesh_palette();
+                        canvas.fill_luminous_card(sx, sw_y, sw_w, 52, 10, tl, br, ba, rib);
+                        let selected = *preset == self.theme;
+                        canvas.draw_rounded_rect_alpha(
+                            sx,
+                            sw_y,
+                            sw_w,
+                            52,
+                            10,
+                            0xFFFFFF,
+                            if selected { 175 } else { 28 },
+                        );
+                        if selected {
+                            canvas.fill_aa_circle((sx + sw_w - 11) as f32, (sw_y + 11) as f32, 3.2, 0xFFFFFF, 240);
+                        }
+                    }
+                }
             }
             SettingsPage::Taskbar => {
                 canvas.draw_text_clipped(
-                    x,
-                    y,
+                    x + 2,
+                    y + 2,
                     iw,
-                    tr(lang, "Панель задач и курсор", "Taskbar & Cursor"),
-                    0xFFFFFF,
+                    tr(lang, "Панель задач и поведение", "Taskbar & Behaviour"),
+                    0x94A3B8,
                     1,
                 );
-                canvas.fill_rounded_rect(x, wy + 68, iw, 26, 5, 0x21262D);
-                canvas.draw_text_clipped(
-                    x + 10,
-                    wy + 75,
-                    iw - 56,
-                    tr(lang, "Панель задач сверху", "Taskbar on Top"),
-                    0xE6EDF3,
-                    1,
-                );
-                canvas.draw_toggle(x + iw - 44, wy + 72, self.taskbar_top, accent);
 
-                canvas.fill_rounded_rect(x, wy + 112, iw, 26, 5, 0x21262D);
-                canvas.draw_text_clipped(
-                    x + 10,
-                    wy + 119,
-                    iw - 56,
-                    tr(lang, "Курсор-прицел", "Crosshair Cursor"),
-                    0xE6EDF3,
-                    1,
+                let c_y = wy + 60;
+                Self::draw_card_frame(canvas, x, c_y, iw, 102, 12);
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y,
+                    iw,
+                    34,
+                    accent,
+                    tr(lang, "Панель задач сверху", "Taskbar on Top"),
+                    self.taskbar_top,
+                    accent,
+                    in_content && (60..94).contains(&hover_ly),
+                    false,
                 );
-                canvas.draw_toggle(x + iw - 44, wy + 116, self.crosshair_cursor, accent);
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 34,
+                    iw,
+                    34,
+                    0xF59E0B,
+                    tr(lang, "Курсор-прицел", "Crosshair Cursor"),
+                    self.crosshair_cursor,
+                    accent,
+                    in_content && (94..128).contains(&hover_ly),
+                    true,
+                );
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 68,
+                    iw,
+                    34,
+                    0x3FB950,
+                    tr(lang, "Часы в трее (выкл = аптайм)", "Clock in Tray (off = uptime)"),
+                    self.show_clock,
+                    accent,
+                    in_content && (128..162).contains(&hover_ly),
+                    true,
+                );
+
+                let tip_y = wy + 174;
+                if tip_y + 50 <= wy + wh - 10 {
+                    Self::draw_card_frame(canvas, x, tip_y, iw, 50, 12);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 25) as f32, 6.0, accent, 36);
+                    canvas.fill_aa_circle((x + 19) as f32, (tip_y + 25) as f32, 2.5, accent, 240);
+                    canvas.draw_text_clipped(
+                        x + 32,
+                        tip_y + 10,
+                        iw - 44,
+                        tr(lang, "Управление окнами", "Window Controls"),
+                        0xF1F5F9,
+                        1,
+                    );
+                    canvas.draw_text_clipped(
+                        x + 32,
+                        tip_y + 28,
+                        iw - 44,
+                        tr(
+                            lang,
+                            "Тяни любой край или угол окна для изменения размера",
+                            "Drag any window edge or corner to resize dynamically",
+                        ),
+                        0x8B949E,
+                        1,
+                    );
+                }
             }
             SettingsPage::System => {
                 canvas.draw_text_clipped(
-                    x,
-                    y,
+                    x + 2,
+                    y + 2,
                     iw,
-                    tr(lang, "Производительность", "Performance & Metrics"),
-                    0xFFFFFF,
+                    tr(lang, "Производительность и ресурсы", "Performance & Resources"),
+                    0x94A3B8,
                     1,
                 );
-                let spd = match (self.snake_tick_div, lang) {
-                    (14, Lang::Ru) => "Скорость Змейки: Медленно",
-                    (14, Lang::En) => "Snake Speed: Slow",
-                    (5, Lang::Ru) => "Скорость Змейки: Турбо",
-                    (5, Lang::En) => "Snake Speed: Turbo",
-                    (_, Lang::Ru) => "Скорость Змейки: Норма",
-                    (_, Lang::En) => "Snake Speed: Normal",
-                };
-                canvas.draw_button(x, wy + 68, iw, 26, spd, 0x21262D, 0xFFFFFF, accent);
-                canvas.draw_text_clipped(x, wy + 114, iw, &format!("CPU: {cpu_pct}%"), 0x79C0FF, 1);
+
+                // Top 2 ColorOS Metric Bento Cards: CPU & RAM
+                let b_y = wy + 60;
+                let bw = (iw - 8) / 2;
+                Self::draw_card_frame(canvas, x, b_y, bw, 68, 12);
+                canvas.draw_text_clipped(x + 13, b_y + 9, bw - 50, "CPU Load", 0x8B949E, 1);
                 canvas.draw_text_clipped(
-                    x,
-                    wy + 134,
-                    iw,
-                    &format!("RAM: {} / {} MB", mem.used_mb, mem.total_mb),
+                    x + bw - 38,
+                    b_y + 9,
+                    28,
+                    &format!("{cpu_pct}%"),
+                    accent,
+                    1,
+                );
+                canvas.draw_text_clipped(x + 13, b_y + 25, bw - 24, "x86_64 Native", 0xF8FAFC, 1);
+                canvas.draw_progress_bar(x + 13, b_y + 49, bw - 26, 7, cpu_pct, accent, 0x0B0E16, 0x30363D);
+
+                let rx = x + bw + 8;
+                Self::draw_card_frame(canvas, rx, b_y, bw, 68, 12);
+                canvas.draw_text_clipped(rx + 13, b_y + 9, bw - 50, "RAM Usage", 0x8B949E, 1);
+                canvas.draw_text_clipped(
+                    rx + bw - 38,
+                    b_y + 9,
+                    28,
+                    &format!("{}%", mem.percent),
                     0xD29922,
                     1,
                 );
-                canvas.draw_text_clipped(x, wy + 154, iw, &format!("Uptime: {uptime}"), 0x3FB950, 1);
-                canvas.draw_button(
+                canvas.draw_text_clipped(
+                    rx + 13,
+                    b_y + 25,
+                    bw - 24,
+                    &format!("{} / {} MB", mem.used_mb, mem.total_mb),
+                    0xF8FAFC,
+                    1,
+                );
+                canvas.draw_progress_bar(
+                    rx + 13,
+                    b_y + 49,
+                    bw - 26,
+                    7,
+                    mem.percent,
+                    0xD29922,
+                    0x0B0E16,
+                    0x30363D,
+                );
+
+                // Bottom Grouped ColorOS Spec & Action Card
+                let c_y = wy + 138;
+                Self::draw_card_frame(canvas, x, c_y, iw, 102, 12);
+                let spd = match (self.snake_tick_div, lang) {
+                    (14, Lang::Ru) => "Медленно",
+                    (14, Lang::En) => "Slow",
+                    (5, Lang::Ru) => "Турбо",
+                    (5, Lang::En) => "Turbo",
+                    (_, Lang::Ru) => "Норма",
+                    (_, Lang::En) => "Normal",
+                };
+                Self::draw_spec_row(
+                    canvas,
                     x,
-                    wy + 192,
-                    150,
-                    26,
-                    tr(lang, "Обновить метрики", "Refresh Metrics"),
-                    0x238636,
-                    0xFFFFFF,
+                    c_y,
+                    iw,
+                    34,
                     0x3FB950,
+                    tr(lang, "Скорость Змейки", "Snake Speed"),
+                    spd,
+                    in_content && (138..172).contains(&hover_ly),
+                    false,
+                );
+                Self::draw_spec_row(
+                    canvas,
+                    x,
+                    c_y + 34,
+                    iw,
+                    34,
+                    0x38BDF8,
+                    tr(lang, "Аптайм системы", "System Uptime"),
+                    uptime,
+                    false,
+                    true,
+                );
+                Self::draw_spec_row(
+                    canvas,
+                    x,
+                    c_y + 68,
+                    iw,
+                    34,
+                    accent,
+                    tr(lang, "Обновить метрики", "Refresh Metrics"),
+                    tr(lang, "Нажать", "Run"),
+                    in_content && (206..240).contains(&hover_ly),
+                    true,
                 );
             }
             SettingsPage::About => {
@@ -966,7 +1303,16 @@ impl SettingsState {
                     accent,
                     wp_rib,
                 );
-                canvas.draw_rounded_rect_alpha(x, y, iw, 90, 14, 0xFFFFFF, 34);
+                let hero_hov = in_content && (36..=126).contains(&hover_ly);
+                canvas.draw_rounded_rect_alpha(
+                    x,
+                    y,
+                    iw,
+                    90,
+                    14,
+                    0xFFFFFF,
+                    if hero_hov { 64 } else { 34 },
+                );
 
                 // Wordmark + Floating Liquid-Glass Version Pill
                 canvas.draw_text_clipped(x + 18, y + 13, iw - 126, "pizdOS", 0xFFFFFF, 2);
@@ -978,12 +1324,31 @@ impl SettingsState {
                     canvas.draw_text_clipped(pill_x + 9, y + 18, 24, "2.0", 0xFFFFFF, 1);
                 }
 
+                let sub_msg = if self.update_taps >= 5 {
+                    tr(
+                        lang,
+                        "Bratukha Dev Mode ON • Root разблокирован",
+                        "Bratukha Dev Mode ON • Root unlocked",
+                    )
+                } else if self.update_taps > 0 {
+                    tr(
+                        lang,
+                        "Актуальная сборка • GNU удалён навсегда",
+                        "Up to date • GNU permanently removed",
+                    )
+                } else {
+                    tr(
+                        lang,
+                        "Bratukha Edition • Официальная сборка",
+                        "Bratukha Edition • Official Build",
+                    )
+                };
                 canvas.draw_text_clipped(
                     x + 18,
                     y + 43,
                     iw - 108,
-                    tr(lang, "Bratukha Edition • Официальная сборка", "Bratukha Edition • Official Build"),
-                    0xCBD5E1,
+                    sub_msg,
+                    if self.update_taps >= 5 { 0xFBBF24 } else { 0xCBD5E1 },
                     1,
                 );
                 canvas.draw_text_clipped(
@@ -1001,8 +1366,10 @@ impl SettingsState {
                     let by = y + 13;
                     canvas.blend_rounded_rect(bx, by, 80, 23, 11, 0x090D14, 195);
                     canvas.draw_rounded_rect_alpha(bx, by, 80, 23, 11, 0xFFFFFF, 46);
-                    canvas.fill_aa_circle((bx + 13) as f32, (by + 11) as f32 + 0.5, 3.0, 0x3FB950, 255);
-                    canvas.draw_text_clipped(bx + 22, by + 5, 54, "NO GNU", 0xF8FAFC, 1);
+                    let dot_c = if self.update_taps >= 5 { 0xF59E0B } else { 0x3FB950 };
+                    let badge_txt = if self.update_taps >= 5 { "DEV ON" } else { "NO GNU" };
+                    canvas.fill_aa_circle((bx + 13) as f32, (by + 11) as f32 + 0.5, 3.0, dot_c, 255);
+                    canvas.draw_text_clipped(bx + 22, by + 5, 54, badge_txt, 0xF8FAFC, 1);
 
                     let ex = (x + iw - 42) as f32;
                     let ey = (y + 62) as f32;
@@ -1013,26 +1380,40 @@ impl SettingsState {
                     canvas.fill_aa_circle(ex, ey, 2.2, 0xFFFFFF, 240);
                 }
 
-                // 2. ColorOS 15/16 Asymmetric Bento Duo: Live Device Preview + Multi-Segment RAM Card
+                // 2. ColorOS 15/16 Asymmetric Bento Duo: Interactive Device Preview + Memory Card
                 let bento_y = y + 98;
                 let bento_h = 74;
                 let w1 = ((iw - 8) * 45) / 100;
                 let w2 = iw - 8 - w1;
+                let left_hov = in_content && (134..=208).contains(&hover_ly) && hover_lx <= 146 + w1;
+                let right_hov = in_content && (134..=208).contains(&hover_ly) && hover_lx > 146 + w1;
 
-                // Left Card: Device Name + Miniature Live-Wallpaper Screen Frame
-                canvas.fill_rounded_rect(x, bento_y, w1, bento_h, 12, 0x161B26);
-                canvas.draw_rounded_rect_alpha(x, bento_y, w1, bento_h, 12, 0xFFFFFF, 22);
-                canvas.blend_rect(x + 12, bento_y + 1, w1 - 24, 1, 0xFFFFFF, 18);
+                // Left Card: Editable Device Name + Miniature Live-Wallpaper Screen Frame
+                Self::draw_card_frame(canvas, x, bento_y, w1, bento_h, 12);
+                if self.editing_device {
+                    canvas.draw_rounded_rect_alpha(x, bento_y, w1, bento_h, 12, accent, 180);
+                } else if left_hov {
+                    canvas.draw_rounded_rect_alpha(x, bento_y, w1, bento_h, 12, 0xFFFFFF, 55);
+                }
 
                 canvas.draw_text_clipped(
                     x + 13,
                     bento_y + 11,
                     w1 - 56,
-                    tr(lang, "Устройство", "Device"),
-                    0x8B949E,
+                    if self.editing_device {
+                        tr(lang, "Имя (Enter)", "Name (Enter)")
+                    } else {
+                        tr(lang, "Устройство", "Device")
+                    },
+                    if self.editing_device { accent } else { 0x8B949E },
                     1,
                 );
-                canvas.draw_text_clipped(x + 13, bento_y + 28, w1 - 56, "pizdOS PC", 0xF8FAFC, 1);
+                let shown_name = if self.editing_device {
+                    format!("{}_", self.device_name)
+                } else {
+                    self.device_name.clone()
+                };
+                canvas.draw_text_clipped(x + 13, bento_y + 28, w1 - 56, &shown_name, 0xF8FAFC, 1);
                 canvas.blend_rounded_rect(x + 13, bento_y + 47, 50, 17, 8, accent, 38);
                 canvas.draw_text_clipped(x + 18, bento_y + 49, 44, "x86_64", 0xCBD5E1, 1);
 
@@ -1045,9 +1426,10 @@ impl SettingsState {
 
                 // Right Card: RAM + Signature ColorOS 15/16 Multi-Segment Pill Bar
                 let rx = x + w1 + 8;
-                canvas.fill_rounded_rect(rx, bento_y, w2, bento_h, 12, 0x161B26);
-                canvas.draw_rounded_rect_alpha(rx, bento_y, w2, bento_h, 12, 0xFFFFFF, 22);
-                canvas.blend_rect(rx + 12, bento_y + 1, w2 - 24, 1, 0xFFFFFF, 18);
+                Self::draw_card_frame(canvas, rx, bento_y, w2, bento_h, 12);
+                if right_hov {
+                    canvas.draw_rounded_rect_alpha(rx, bento_y, w2, bento_h, 12, 0xFFFFFF, 55);
+                }
 
                 canvas.draw_text_clipped(
                     rx + 13,
@@ -1091,40 +1473,41 @@ impl SettingsState {
                     canvas.fill_rounded_rect(bar_x + seg1 + seg2 + 2, bar_y, seg3, 8, 3, 0xA855F7);
                 }
 
-                // 3. ColorOS 15/16 Grouped Spec List Card (Left Label <-> Right Value + '>')
+                // 3. ColorOS 15/16 Interactive Grouped Spec List Card
                 let grp_y = y + 180;
                 let grp_h = (wy + wh - 12 - grp_y).clamp(96, 114);
                 if grp_y + 84 <= wy + wh - 6 {
-                    canvas.fill_rounded_rect(x, grp_y, iw, grp_h, 13, 0x161B26);
-                    canvas.draw_rounded_rect_alpha(x, grp_y, iw, grp_h, 13, 0xFFFFFF, 22);
-                    canvas.blend_rect(x + 14, grp_y + 1, iw - 28, 1, 0xFFFFFF, 16);
+                    Self::draw_card_frame(canvas, x, grp_y, iw, grp_h, 13);
 
+                    let lic_val = if self.license_alt {
+                        tr(lang, "0% GNU • Чистый Rust", "0% GNU • Pure Rust")
+                    } else {
+                        "MIT • NO GNU (0 Deps)"
+                    };
                     let rows = [
                         (tr(lang, "Ядро", "Kernel"), kernel, 0xA855F7),
                         (tr(lang, "Базовый стек", "Core Stack"), "musl + BusyBox", 0x38BDF8),
                         (tr(lang, "Пакетный менеджер", "Packages"), "piz-get 0.1.0", 0xF43F5E),
-                        (tr(lang, "Лицензия", "License"), "MIT • NO GNU (0 Deps)", 0x3FB950),
+                        (tr(lang, "Лицензия", "License"), lic_val, 0x3FB950),
                     ];
-                    let row_h = grp_h / 4;
+                    let row_h = (grp_h / 4).max(1);
+                    let grp_ly = 216;
                     for (idx, (lbl, val, dot_col)) in rows.iter().enumerate() {
                         let ry = grp_y + (idx as i32) * row_h;
-                        if idx > 0 {
-                            canvas.blend_rect(x + 14, ry, iw - 28, 1, 0xFFFFFF, 12);
-                        }
-                        let mid_y = ry + row_h / 2;
-                        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, *dot_col, 32);
-                        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, *dot_col, 240);
-                        canvas.draw_text_clipped(x + 32, mid_y - 7, 130, lbl, 0xE2E8F0, 1);
-
-                        let max_vw = (iw - 180).max(50);
-                        let vw = crate::font::measure_text(val, 1).min(max_vw);
-                        let vx = x + iw - 24 - vw;
-                        canvas.draw_text_clipped(vx, mid_y - 7, max_vw, val, 0x94A3B8, 1);
-
-                        let ch_x = (x + iw - 14) as f32;
-                        let ch_y = mid_y as f32;
-                        canvas.draw_aa_line(ch_x - 2.0, ch_y - 3.0, ch_x + 1.5, ch_y, 1.2, 0x64748B, 175);
-                        canvas.draw_aa_line(ch_x + 1.5, ch_y, ch_x - 2.0, ch_y + 3.0, 1.2, 0x64748B, 175);
+                        let r_ly0 = grp_ly + (idx as i32) * row_h;
+                        let hov = in_content && hover_ly >= r_ly0 && hover_ly < r_ly0 + row_h;
+                        Self::draw_spec_row(
+                            canvas,
+                            x,
+                            ry,
+                            iw,
+                            row_h,
+                            *dot_col,
+                            lbl,
+                            val,
+                            hov,
+                            idx > 0,
+                        );
                     }
                 }
             }

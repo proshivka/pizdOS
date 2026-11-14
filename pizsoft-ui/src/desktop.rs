@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsState, SnakeState,
-    TerminalState, ThemePreset, tr,
+    CalcState, KeyEvent, Lang, MatrixState, NotepadState, PaintState, SettingsAction,
+    SettingsState, SnakeState, TerminalState, ThemePreset, tr,
 };
 use crate::gfx::Canvas;
 use crate::sys::{
     CpuSample, MemInfo, PkgSummary, ProcInfo, list_processes, load_packages, read_cpu_sample,
-    read_kernel_version, read_loadavg, read_meminfo, read_uptime_str,
+    read_kernel_version, read_loadavg, read_local_clock_str, read_meminfo, read_uptime_str,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,95 @@ impl AppId {
             AppId::Calc => 0x38BDF8,
             AppId::Matrix => 0x22C55E,
         }
+    }
+
+    pub fn min_size(self) -> (i32, i32) {
+        match self {
+            AppId::Settings => (440, 310),
+            AppId::Paint => (368, 268),
+            AppId::Snake => (316, 274),
+            AppId::Calc => (220, 260),
+            _ => (250, 180),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeEdge {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl ResizeEdge {
+    pub const fn none() -> Self {
+        Self {
+            left: false,
+            right: false,
+            top: false,
+            bottom: false,
+        }
+    }
+
+    pub const fn any(self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+
+    pub fn axis(self) -> (f32, f32) {
+        let x = if self.right {
+            1.0
+        } else if self.left {
+            -1.0
+        } else {
+            0.0
+        };
+        let y = if self.bottom {
+            1.0
+        } else if self.top {
+            -1.0
+        } else {
+            0.0
+        };
+        (x, y)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeDrag {
+    pub id: AppId,
+    pub edge: ResizeEdge,
+    pub start_mx: i32,
+    pub start_my: i32,
+    pub start_rect: (i32, i32, i32, i32),
+}
+
+fn detect_resize_edge(win: &Window, x: i32, y: i32) -> ResizeEdge {
+    if win.maximized {
+        return ResizeEdge::none();
+    }
+    if x < win.x - 4 || x > win.x + win.w + 4 || y < win.y - 4 || y > win.y + win.h + 4 {
+        return ResizeEdge::none();
+    }
+    // Generous bottom-right corner grip zone (14x14)
+    if x >= win.x + win.w - 14 && y >= win.y + win.h - 14 {
+        return ResizeEdge {
+            left: false,
+            right: true,
+            top: false,
+            bottom: true,
+        };
+    }
+    let left = x <= win.x + 5;
+    let right = x >= win.x + win.w - 5 && y > win.y + 24;
+    let bottom = y >= win.y + win.h - 5;
+    // Protect close/min/max titlebar buttons in upper-right
+    let top = y <= win.y + 4 && x < win.x + win.w - 74;
+    ResizeEdge {
+        left,
+        right,
+        top,
+        bottom,
     }
 }
 
@@ -144,6 +233,7 @@ pub struct Desktop {
     pub mouse_y: i32,
     pub mouse_down: bool,
     pub dragging: Option<(AppId, i32, i32)>,
+    pub resizing: Option<ResizeDrag>,
     pub windows: Vec<Window>,
     pub tick: u64,
     pub status: String,
@@ -154,6 +244,7 @@ pub struct Desktop {
     pub last_cpu: Option<CpuSample>,
     pub mem: MemInfo,
     pub uptime: String,
+    pub clock_str: String,
     pub loadavg: String,
     pub kernel: String,
     pub procs: Vec<ProcInfo>,
@@ -197,6 +288,7 @@ impl Desktop {
             mouse_y: height / 2,
             mouse_down: false,
             dragging: None,
+            resizing: None,
             windows: vec![
                 Window::new(AppId::Files, 150, 70, 400, 300, false),
                 Window::new(AppId::PizGet, 190, 90, 440, 310, false),
@@ -217,6 +309,7 @@ impl Desktop {
             last_cpu: read_cpu_sample(),
             mem: read_meminfo(),
             uptime: read_uptime_str(),
+            clock_str: read_local_clock_str(),
             loadavg: read_loadavg(),
             kernel: read_kernel_version(),
             procs: list_processes(),
@@ -303,8 +396,39 @@ impl Desktop {
 
         self.mem = read_meminfo();
         self.uptime = read_uptime_str();
+        self.clock_str = read_local_clock_str();
         self.loadavg = read_loadavg();
         self.procs = list_processes();
+    }
+
+    pub fn on_viewport_resize(&mut self, canvas_w: i32, canvas_h: i32) {
+        let top_bar = if self.settings.taskbar_top { 36 } else { 0 };
+        for win in &mut self.windows {
+            if win.maximized {
+                win.x = 0;
+                win.y = top_bar;
+                win.w = canvas_w.max(200);
+                win.h = (canvas_h - 36).max(160);
+            } else {
+                win.x = win.x.clamp(0, (canvas_w - 80).max(0));
+                win.y = win.y.clamp(top_bar, (canvas_h - 60).max(top_bar));
+            }
+        }
+    }
+
+    pub fn on_escape(&mut self) -> bool {
+        if self.ctx_menu.take().is_some() {
+            return true;
+        }
+        if self.start_menu_open {
+            self.start_menu_open = false;
+            return true;
+        }
+        if self.settings.editing_device {
+            self.settings.on_key(KeyEvent::Escape);
+            return true;
+        }
+        false
     }
 
     pub fn on_tick(&mut self) {
@@ -390,6 +514,9 @@ impl Desktop {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if key == KeyEvent::Escape && self.on_escape() {
+            return;
+        }
         let Some(top) = self.windows.iter().rev().find(|w| w.open && !w.minimized) else {
             return;
         };
@@ -398,6 +525,7 @@ impl Desktop {
             AppId::Snake => self.snake.on_key(key),
             AppId::Notepad => self.notepad.on_key(key),
             AppId::Calc => self.calc.on_key(key),
+            AppId::Settings => self.settings.on_key(key),
             _ => {}
         }
     }
@@ -405,6 +533,41 @@ impl Desktop {
     pub fn on_mouse_move(&mut self, x: i32, y: i32, canvas_w: i32, canvas_h: i32) {
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+
+        if let Some(rz) = self.resizing
+            && let Some(win) = self.windows.iter_mut().find(|w| w.id == rz.id)
+        {
+            if !win.maximized {
+                let (min_w, min_h) = win.id.min_size();
+                let (sx, sy, sw, sh) = rz.start_rect;
+                let dx = self.mouse_x - rz.start_mx;
+                let dy = self.mouse_y - rz.start_my;
+                let top_min = if self.settings.taskbar_top { 36 } else { 0 };
+                let bot_max = if self.settings.taskbar_top {
+                    canvas_h
+                } else {
+                    (canvas_h - 36).max(top_min + min_h)
+                };
+
+                if rz.edge.right {
+                    win.w = (sw + dx).clamp(min_w, (canvas_w - sx).max(min_w));
+                }
+                if rz.edge.bottom {
+                    win.h = (sh + dy).clamp(min_h, (bot_max - sy).max(min_h));
+                }
+                if rz.edge.left {
+                    let nx = (sx + dx).clamp(0, (sx + sw - min_w).max(0));
+                    win.w = (sx + sw - nx).max(min_w);
+                    win.x = nx;
+                }
+                if rz.edge.top {
+                    let ny = (sy + dy).clamp(top_min, (sy + sh - min_h).max(top_min));
+                    win.h = (sy + sh - ny).max(min_h);
+                    win.y = ny;
+                }
+            }
+            return;
+        }
 
         if let Some((id, off_x, off_y)) = self.dragging
             && let Some(win) = self.windows.iter_mut().find(|w| w.id == id)
@@ -513,6 +676,10 @@ impl Desktop {
                 };
                 return;
             }
+            if x > lang_x + 38 {
+                self.settings.show_clock = !self.settings.show_clock;
+                return;
+            }
 
             let open_ids: Vec<AppId> = self
                 .windows
@@ -532,15 +699,16 @@ impl Desktop {
             return;
         }
 
-        // 3. Topmost visible window hit test
+        // 3. Topmost visible window hit test (expanded 4px border zone for effortless edge-resize grabs)
         let mut hit_idx = None;
         for (idx, win) in self.windows.iter().enumerate().rev() {
+            let pad = if win.maximized { 0 } else { 4 };
             if win.open
                 && !win.minimized
-                && x >= win.x
-                && x < win.x + win.w
-                && y >= win.y
-                && y < win.y + win.h
+                && x >= win.x - pad
+                && x < win.x + win.w + pad
+                && y >= win.y - pad
+                && y < win.y + win.h + pad
             {
                 hit_idx = Some(idx);
                 break;
@@ -557,20 +725,35 @@ impl Desktop {
                 if x >= win.x + win.w - 26 && x <= win.x + win.w - 6 {
                     self.windows[top_idx].open = false;
                     self.dragging = None;
+                    self.resizing = None;
                     return;
                 }
                 // Maximize/Restore button [□]
                 if x >= win.x + win.w - 49 && x <= win.x + win.w - 29 {
                     self.toggle_maximize(top_idx, canvas_w, canvas_h);
                     self.dragging = None;
+                    self.resizing = None;
                     return;
                 }
                 // Minimize button [_]
                 if x >= win.x + win.w - 72 && x <= win.x + win.w - 52 {
                     self.windows[top_idx].minimized = true;
                     self.dragging = None;
+                    self.resizing = None;
                     return;
                 }
+            }
+
+            let edge = detect_resize_edge(&win, x, y);
+            if edge.any() {
+                self.resizing = Some(ResizeDrag {
+                    id: win.id,
+                    edge,
+                    start_mx: x,
+                    start_my: y,
+                    start_rect: (win.x, win.y, win.w, win.h),
+                });
+                return;
             }
 
             if y < win.y + 28 {
@@ -596,6 +779,7 @@ impl Desktop {
     pub fn on_mouse_up(&mut self) {
         self.mouse_down = false;
         self.dragging = None;
+        self.resizing = None;
     }
 
     fn handle_window_click(&mut self, win: &Window, lx: i32, ly: i32) {
@@ -650,11 +834,12 @@ impl Desktop {
                     self.matrix.cycle_color();
                 }
             }
-            AppId::Settings => {
-                if self.settings.on_click(lx, ly) {
-                    self.refresh_metrics();
-                }
-            }
+            AppId::Settings => match self.settings.on_click(lx, ly, win.w, win.h) {
+                SettingsAction::None => {}
+                SettingsAction::RefreshMetrics => self.refresh_metrics(),
+                SettingsAction::OpenTerminal => self.focus_or_open(AppId::Terminal),
+                SettingsAction::OpenPizGet => self.focus_or_open(AppId::PizGet),
+            },
             AppId::Terminal => {}
         }
     }
@@ -787,7 +972,12 @@ impl Desktop {
         canvas.draw_rounded_rect_alpha(lang_x, task_y + 6, 36, 24, 6, 0xFFFFFF, 26);
         canvas.draw_text_clipped(lang_x + 10, task_y + 11, 26, lang_lbl, 0xE2E8F0, 1);
         canvas.fill_aa_circle((lang_x + 46) as f32, (task_y + 18) as f32, 2.5, 0x3FB950, 255);
-        canvas.draw_text_clipped(lang_x + 54, task_y + 11, (w - lang_x - 60).max(20), &self.uptime, 0xCBD5E1, 1);
+        let tray_txt = if self.settings.show_clock {
+            &self.clock_str
+        } else {
+            &self.uptime
+        };
+        canvas.draw_text_clipped(lang_x + 54, task_y + 11, (w - lang_x - 60).max(20), tray_txt, 0xCBD5E1, 1);
 
         // 5. Start Menu popup
         if self.start_menu_open {
@@ -799,12 +989,40 @@ impl Desktop {
             self.draw_context_menu(canvas, cx, cy, accent);
         }
 
-        // 7. Mouse cursor
+        // 7. Mouse cursor (morphs to crisp AA resize arrows over edges/corners)
         if self.settings.crosshair_cursor {
             canvas.fill_rect(self.mouse_x - 6, self.mouse_y, 13, 1, 0xFFFFFF);
             canvas.fill_rect(self.mouse_x, self.mouse_y - 6, 1, 13, 0xFFFFFF);
+        } else if let Some(rz) = self.resizing {
+            let (ux, uy) = rz.edge.axis();
+            canvas.draw_resize_cursor(self.mouse_x, self.mouse_y, ux, uy);
         } else {
-            canvas.draw_cursor(self.mouse_x, self.mouse_y);
+            let mut hover_edge = ResizeEdge::none();
+            if self.ctx_menu.is_none()
+                && !self.start_menu_open
+                && (self.mouse_y < task_y || self.mouse_y >= task_y + 36)
+            {
+                for win in self.windows.iter().rev() {
+                    if !win.open || win.minimized {
+                        continue;
+                    }
+                    let pad = if win.maximized { 0 } else { 4 };
+                    if self.mouse_x >= win.x - pad
+                        && self.mouse_x < win.x + win.w + pad
+                        && self.mouse_y >= win.y - pad
+                        && self.mouse_y < win.y + win.h + pad
+                    {
+                        hover_edge = detect_resize_edge(win, self.mouse_x, self.mouse_y);
+                        break;
+                    }
+                }
+            }
+            if hover_edge.any() {
+                let (ux, uy) = hover_edge.axis();
+                canvas.draw_resize_cursor(self.mouse_x, self.mouse_y, ux, uy);
+            } else {
+                canvas.draw_cursor(self.mouse_x, self.mouse_y);
+            }
         }
     }
 
@@ -1087,7 +1305,27 @@ impl Desktop {
                 &self.mem,
                 self.cpu_pct,
                 &self.uptime,
+                if focused { self.mouse_x - win.x } else { -1 },
+                if focused { self.mouse_y - win.y } else { -1 },
             ),
+        }
+
+        // Subtle minimalist resize grip indicator at bottom-right corner
+        if !win.maximized {
+            let grip_hov = focused
+                && self.mouse_x >= win.x + win.w - 16
+                && self.mouse_y >= win.y + win.h - 16
+                && self.mouse_x <= win.x + win.w + 4
+                && self.mouse_y <= win.y + win.h + 4;
+            let ga = if grip_hov || self.resizing.is_some_and(|r| r.id == win.id) {
+                195
+            } else {
+                65
+            };
+            let gx = (win.x + win.w - 4) as f32;
+            let gy = (win.y + win.h - 4) as f32;
+            canvas.draw_aa_line(gx - 7.0, gy, gx, gy - 7.0, 1.1, 0xCBD5E1, ga);
+            canvas.draw_aa_line(gx - 3.5, gy, gx, gy - 3.5, 1.1, 0xCBD5E1, ga);
         }
     }
 

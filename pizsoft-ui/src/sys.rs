@@ -117,6 +117,48 @@ pub fn read_uptime_str() -> String {
     String::from("0h 04m 20s")
 }
 
+#[cfg(windows)]
+pub fn read_local_clock_str() -> String {
+    #[repr(C)]
+    struct SystemTime {
+        _w_year: u16,
+        _w_month: u16,
+        _w_day_of_week: u16,
+        _w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        _w_second: u16,
+        _w_milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(lp_system_time: *mut SystemTime);
+    }
+    let mut st = SystemTime {
+        _w_year: 0,
+        _w_month: 0,
+        _w_day_of_week: 0,
+        _w_day: 0,
+        w_hour: 0,
+        w_minute: 0,
+        _w_second: 0,
+        _w_milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut st) };
+    format!("{:02}:{:02}", st.w_hour, st.w_minute)
+}
+
+#[cfg(not(windows))]
+pub fn read_local_clock_str() -> String {
+    if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let secs = dur.as_secs() % 86400;
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        return format!("{h:02}:{m:02}");
+    }
+    String::from("12:00")
+}
+
 pub fn read_loadavg() -> String {
     if let Ok(text) = fs::read_to_string("/proc/loadavg") {
         let parts: Vec<&str> = text.split_whitespace().take(3).collect();
