@@ -1090,6 +1090,7 @@ pub struct SettingsState {
     pub ui_scale_pct: u16,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
+    pub persistent_island: bool,
     pub snake_tick_div: u64,
     pub device_name: String,
     pub editing_device: bool,
@@ -1098,7 +1099,7 @@ pub struct SettingsState {
     pub tab_pill_y: f32,
     pub tab_pill_vel: f32,
     pub tab_fade: f32,
-    pub toggle_anim: [f32; 8],
+    pub toggle_anim: [f32; 9],
     pub display_picker: Option<DisplayPicker>,
     pub picker_anim: f32,
     pub last_picker: Option<DisplayPicker>,
@@ -1122,6 +1123,7 @@ impl SettingsState {
             ui_scale_pct: 100,
             crosshair_cursor: false,
             show_clock: true,
+            persistent_island: false,
             snake_tick_div: 10,
             device_name: String::from("pizdOS PC"),
             editing_device: false,
@@ -1130,7 +1132,7 @@ impl SettingsState {
             tab_pill_y: 90.0,
             tab_pill_vel: 0.0,
             tab_fade: 1.0,
-            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+            toggle_anim: [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
             display_picker: None,
             picker_anim: 0.0,
             last_picker: None,
@@ -1195,6 +1197,7 @@ impl SettingsState {
             self.crosshair_cursor,
             self.show_clock,
             self.genie_minimize,
+            self.persistent_island,
         ];
         let p_tgt = if self.display_picker.is_some() { 1.0 } else { 0.0 };
         if !self.animations {
@@ -1454,6 +1457,8 @@ impl SettingsState {
                     self.show_clock = !self.show_clock;
                 } else if (230..264).contains(&ly) {
                     self.genie_minimize = !self.genie_minimize;
+                } else if (264..298).contains(&ly) {
+                    self.persistent_island = !self.persistent_island;
                 }
             }
             SettingsPage::System => {
@@ -1847,7 +1852,7 @@ impl SettingsState {
                 );
 
                 let c_y = wy + 60;
-                Self::draw_card_frame(canvas, x, c_y, iw, 204, 12);
+                Self::draw_card_frame(canvas, x, c_y, iw, 238, 12);
                 Self::draw_toggle_row(
                     canvas,
                     x,
@@ -1926,9 +1931,22 @@ impl SettingsState {
                     in_content && (230..264).contains(&hover_ly),
                     true,
                 );
+                Self::draw_toggle_row(
+                    canvas,
+                    x,
+                    c_y + 204,
+                    iw,
+                    34,
+                    0x10B981,
+                    tr(lang, "Dynamic Island всегда", "Always-On Dynamic Island"),
+                    self.toggle_anim[8],
+                    accent,
+                    in_content && (264..298).contains(&hover_ly),
+                    true,
+                );
 
-                let tip_y = wy + 272;
-                if tip_y + 42 <= wy + wh - 6 {
+                let tip_y = wy + 306;
+                if tip_y + 38 <= wy + wh - 6 {
                     Self::draw_card_frame(canvas, x, tip_y, iw, 42, 12);
                     canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 6.0, accent, 36);
                     canvas.fill_aa_circle((x + 19) as f32, (tip_y + 21) as f32, 2.5, accent, 240);
@@ -2461,6 +2479,7 @@ pub struct CalcState {
     pub acc: Option<i64>,
     pub op: Option<char>,
     pub clear_next: bool,
+    pub never_settle: bool,
     pub flash: Option<(usize, f32)>,
 }
 
@@ -2478,6 +2497,7 @@ impl CalcState {
             acc: None,
             op: None,
             clear_next: false,
+            never_settle: false,
             flash: None,
         }
     }
@@ -2503,20 +2523,29 @@ impl CalcState {
                 self.acc = None;
                 self.op = None;
                 self.clear_next = false;
+                self.never_settle = false;
             }
             "+" | "-" | "*" | "/" => {
+                self.never_settle = false;
                 self.eval_pending();
                 self.acc = Some(self.display.parse::<i64>().unwrap_or(0));
                 self.op = token.chars().next();
                 self.clear_next = true;
             }
             "=" => {
-                self.eval_pending();
+                if self.acc == Some(1) && self.op == Some('+') && self.clear_next {
+                    self.display = String::from("Never Settle");
+                    self.never_settle = true;
+                } else {
+                    self.never_settle = false;
+                    self.eval_pending();
+                }
                 self.op = None;
                 self.acc = None;
                 self.clear_next = true;
             }
             digit => {
+                self.never_settle = false;
                 if self.clear_next || self.display == "0" || self.display == "ERR" {
                     self.display = digit.to_string();
                     self.clear_next = false;
@@ -2558,7 +2587,11 @@ impl CalcState {
             KeyEvent::Char('=') | KeyEvent::Enter => self.press("="),
             KeyEvent::Char('c') | KeyEvent::Char('C') => self.press("C"),
             KeyEvent::Backspace => {
-                if self.display.len() > 1 {
+                if self.never_settle {
+                    self.never_settle = false;
+                    self.clear_next = false;
+                    self.display = String::from("0");
+                } else if self.display.len() > 1 {
                     self.display.pop();
                 } else {
                     self.display = String::from("0");
@@ -2573,7 +2606,7 @@ impl CalcState {
         let gy = 82;
         let gw = ww - 24;
         let gh = wh - 94;
-        if lx < gx || ly < gy || lx >= gx + gw || ly >= gy + gh {
+        if gw < 4 || gh < 4 || lx < gx || ly < gy || lx >= gx + gw || ly >= gy + gh {
             return;
         }
         let col_w = gw / 4;
@@ -2590,12 +2623,26 @@ impl CalcState {
         let x = wx + 12;
         let y = wy + 34;
         let iw = ww - 24;
-        canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x090D14);
-        canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xFFFFFF, 26);
-        if let (Some(a), Some(op)) = (self.acc, self.op) {
-            canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
+        if self.never_settle {
+            canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x22080E);
+            canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xEF4444, 185);
+            canvas.blend_rect(x + 12, y + 1, (iw - 24).max(0), 1, 0xF87171, 80);
+            canvas.draw_text_clipped(x + 12, y + 3, iw - 24, "OnePlus · OxygenOS", 0xFCA5A5, 1);
+            let scale = if canvas.measure_text(&self.display, 2) <= iw - 24 {
+                2
+            } else {
+                1
+            };
+            let ty = if scale == 2 { y + 15 } else { y + 20 };
+            canvas.draw_text_clipped(x + 12, ty, iw - 24, &self.display, 0xEF4444, scale);
+        } else {
+            canvas.fill_rounded_rect(x, y, iw, 42, 10, 0x090D14);
+            canvas.draw_rounded_rect_alpha(x, y, iw, 42, 10, 0xFFFFFF, 26);
+            if let (Some(a), Some(op)) = (self.acc, self.op) {
+                canvas.draw_text_clipped(x + 12, y + 3, iw - 24, &format!("{a} {op}"), 0x79C0FF, 1);
+            }
+            canvas.draw_text_clipped(x + 12, y + 15, iw - 24, &self.display, 0xFFFFFF, 2);
         }
-        canvas.draw_text_clipped(x + 12, y + 15, iw - 24, &self.display, 0xFFFFFF, 2);
 
         let gy = wy + 82;
         let gh = wh - 94;

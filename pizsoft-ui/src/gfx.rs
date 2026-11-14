@@ -137,13 +137,18 @@ impl Canvas {
     }
 
     fn fill_rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
-        if w <= 0 || h <= 0 {
+        if w <= 0 || h <= 0 || self.width == 0 || self.height == 0 {
             return;
         }
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = (x + w).min(self.width as i32).max(0) as usize;
-        let y1 = (y + h).min(self.height as i32).max(0) as usize;
+        let max_x = self.width as i32;
+        let max_y = self.height as i32;
+        let x0 = x.clamp(0, max_x) as usize;
+        let y0 = y.clamp(0, max_y) as usize;
+        let x1 = x.saturating_add(w).clamp(0, max_x) as usize;
+        let y1 = y.saturating_add(h).clamp(0, max_y) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         for py in y0..y1 {
             let row = py * self.width;
             self.pixels[row + x0..row + x1].fill(color);
@@ -214,17 +219,22 @@ impl Canvas {
     }
 
     fn blend_rect_phys(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u8) {
-        if w <= 0 || h <= 0 || alpha == 0 {
+        if w <= 0 || h <= 0 || alpha == 0 || self.width == 0 || self.height == 0 {
             return;
         }
         if alpha == 255 {
             self.fill_rect_phys(x, y, w, h, color);
             return;
         }
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = (x + w).min(self.width as i32).max(0) as usize;
-        let y1 = (y + h).min(self.height as i32).max(0) as usize;
+        let max_x = self.width as i32;
+        let max_y = self.height as i32;
+        let x0 = x.clamp(0, max_x) as usize;
+        let y0 = y.clamp(0, max_y) as usize;
+        let x1 = x.saturating_add(w).clamp(0, max_x) as usize;
+        let y1 = y.saturating_add(h).clamp(0, max_y) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         let a = alpha as u32;
         let inv = 255 - a;
         let s_rb_a = (color & 0x00FF_00FF) * a + 0x0080_0080;

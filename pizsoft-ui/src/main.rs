@@ -495,8 +495,8 @@ mod tests {
         }
         desktop.render(&mut canvas);
         assert!(desktop.cc_anim > 0.3);
-        // Click UI Scale 125% inside Control Center (idx 1 -> px = 1160 - 276 - 8 = 876, sx = 876 + 10 + 65 = 951, py = 720 - 36 - 236 - 6 = 442, scale_y = 442 + 170 = 612)
-        desktop.on_mouse_down(965, 624, 1160, 720);
+        // Click UI Scale 125% inside Control Center (idx 1 -> px = 1160 - 276 - 8 = 876, sx = 876 + 10 + 65 = 951, py = 720 - 36 - 266 - 6 = 412, scale_y = 412 + 170 = 582)
+        desktop.on_mouse_down(965, 594, 1160, 720);
         assert_eq!(desktop.settings.ui_scale_pct, 125);
     }
 
@@ -549,5 +549,113 @@ mod tests {
         assert_eq!(desktop.snake.body[0].0, 19);
         desktop.snake.step_interp(8, true);
         assert!(desktop.snake.move_t > 0.0);
+    }
+
+    #[test]
+    fn test_calc_oxygenos_never_settle_easter_egg() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+        desktop.focus_or_open(crate::desktop::AppId::Calc);
+
+        // Keyboard sequence: 1 + = -> Never Settle
+        desktop.on_key(apps::KeyEvent::Char('1'));
+        desktop.on_key(apps::KeyEvent::Char('+'));
+        desktop.on_key(apps::KeyEvent::Char('='));
+        assert_eq!(desktop.calc.display, "Never Settle");
+        assert!(desktop.calc.never_settle);
+        desktop.render(&mut canvas);
+
+        // Backspace clears easter egg state cleanly back to "0"
+        desktop.on_key(apps::KeyEvent::Backspace);
+        assert_eq!(desktop.calc.display, "0");
+        assert!(!desktop.calc.never_settle);
+
+        // Normal arithmetic 1 + 1 = 2 must not trigger easter egg
+        desktop.calc.press("1");
+        desktop.calc.press("+");
+        desktop.calc.press("1");
+        desktop.calc.press("=");
+        assert_eq!(desktop.calc.display, "2");
+        assert!(!desktop.calc.never_settle);
+
+        // Button press sequence 1 + = triggers Never Settle, and "C" clears it
+        desktop.calc.press("1");
+        desktop.calc.press("+");
+        desktop.calc.press("=");
+        assert_eq!(desktop.calc.display, "Never Settle");
+        assert!(desktop.calc.never_settle);
+        desktop.calc.press("C");
+        assert_eq!(desktop.calc.display, "0");
+        assert!(!desktop.calc.never_settle);
+    }
+
+    #[test]
+    fn test_always_on_dynamic_island_persistent_mode() {
+        let mut desktop = Desktop::new(1160, 720);
+        let mut canvas = gfx::Canvas::new(1160, 720);
+        assert!(!desktop.settings.persistent_island);
+        assert!(desktop.toast.is_none());
+
+        // Enable Always-On Dynamic Island in Settings -> Taskbar tab (row 264..298)
+        let sw = desktop.windows.last().unwrap().clone();
+        desktop.on_mouse_down(sw.x + 40, sw.y + 75, 1160, 720);
+        assert_eq!(desktop.settings.page, apps::SettingsPage::Taskbar);
+        desktop.on_mouse_down(sw.x + 220, sw.y + 278, 1160, 720);
+        assert!(desktop.settings.persistent_island);
+
+        for _ in 0..32 {
+            desktop.on_tick();
+        }
+        assert_eq!(desktop.island_anim, 1.0);
+        assert!((desktop.settings.toggle_anim[8] - 1.0).abs() < 0.02);
+        desktop.render(&mut canvas);
+
+        // Clicking the persistent Dynamic Island pill at top-center toggles Control Center
+        desktop.on_mouse_down(580, 22, 1160, 720);
+        assert!(desktop.cc_open);
+
+        // Toggle Always-On Dynamic Island back off inside Control Center (py = 412, island_y = 614..640)
+        desktop.on_mouse_down(960, 624, 1160, 720);
+        assert!(!desktop.settings.persistent_island);
+    }
+
+    #[test]
+    fn test_offscreen_canvas_clipping_and_drag_no_panic() {
+        for pct in apps::UI_SCALES {
+            let mut canvas = Canvas::new(800, 600);
+            canvas.set_ui_scale(pct as f32 / 100.0);
+            let lw = canvas.logical_width();
+            let lh = canvas.logical_height();
+
+            for &(x, y, w, h) in &[
+                (lw, 20, 120, 80),
+                (lw + 200, lh / 2, 160, 90),
+                (40, lh, 180, 60),
+                (40, lh + 150, 180, 60),
+                (-300, -200, 120, 80),
+                (0, 0, 0, 0),
+                (lw - 2, lh - 2, 1, 1),
+            ] {
+                canvas.fill_rounded_rect(x, y, w, h, 10, 0x336699);
+                canvas.blend_rounded_rect(x, y, w, h, 10, 0x99CCFF, 120);
+                canvas.draw_rounded_rect_alpha(x, y, w, h, 10, 0xFFFFFF, 90);
+                canvas.fill_luminous_card(x, y, w, h, 10, 0x112233, 0x223344, 0x38BDF8, 0xA855F7);
+                canvas.draw_soft_shadow(x, y, w, h, 10);
+                canvas.draw_button(x, y, w, h, "OK", 0x1E293B, 0xFFFFFF, 0x64748B);
+            }
+            canvas.fill_aa_circle((lw + 40) as f32, 30.0, 25.0, 0xFF0000, 200);
+            canvas.draw_aa_line((lw + 5) as f32, -10.0, (lw + 90) as f32, (lh + 40) as f32, 3.0, 0xFFFFFF, 255);
+            canvas.fill_aa_triangle((lw + 2) as f32, 0.0, (lw + 50) as f32, 40.0, (lw - 10) as f32, 50.0, 0x00FF00, 180);
+
+            // Drag desktop window off the far right/bottom edges and render without panics
+            let mut desktop = Desktop::new(lw, lh);
+            desktop.settings.ui_scale_pct = pct;
+            let sw = desktop.windows.last().unwrap().clone();
+            desktop.on_mouse_down(sw.x + 80, sw.y + 12, lw, lh);
+            desktop.on_mouse_move(lw + 400, lh + 300, lw, lh);
+            desktop.on_tick();
+            desktop.render(&mut canvas);
+            desktop.on_mouse_up();
+        }
     }
 }

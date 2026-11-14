@@ -174,6 +174,7 @@ mod win32 {
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
     const WM_RBUTTONDOWN: u32 = 0x0204;
+    const WM_CAPTURECHANGED: u32 = 0x0215;
     const VK_BACK: usize = 0x08;
     const VK_RETURN: usize = 0x0D;
     const VK_CONTROL: i32 = 0x11;
@@ -292,6 +293,8 @@ mod win32 {
         fn GetDC(hwnd: Hwnd) -> Hdc;
         fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
         fn GetClientRect(hwnd: Hwnd, lp_rect: *mut Rect) -> i32;
+        fn SetCapture(hwnd: Hwnd) -> Hwnd;
+        fn ReleaseCapture() -> i32;
         fn ValidateRect(hwnd: Hwnd, lp_rect: *const Rect) -> i32;
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> isize;
         fn SetProcessDPIAware() -> i32;
@@ -349,6 +352,12 @@ mod win32 {
     }
 
     pub fn run_win32_gui() -> io::Result<()> {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let log_path = std::env::temp_dir().join("pizsoft_panic.log");
+            let _ = std::fs::write(&log_path, format!("{info}\n"));
+            prev_hook(info);
+        }));
         // Disable automatic Windows DPI bitmap stretching so every pixel matches native screen DPI 1:1.
         unsafe { SetProcessDPIAware() };
         let scr_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -462,8 +471,17 @@ mod win32 {
                 let mut swallow = false;
                 match msg.message {
                     WM_MOUSEMOVE => desktop.on_mouse_move(lx, ly, log_w, log_h),
-                    WM_LBUTTONDOWN => desktop.on_mouse_down(lx, ly, log_w, log_h),
-                    WM_LBUTTONUP => desktop.on_mouse_up(),
+                    WM_LBUTTONDOWN => {
+                        unsafe { SetCapture(hwnd) };
+                        desktop.on_mouse_down(lx, ly, log_w, log_h);
+                    }
+                    WM_LBUTTONUP => {
+                        unsafe { ReleaseCapture() };
+                        desktop.on_mouse_up();
+                    }
+                    WM_CAPTURECHANGED => {
+                        desktop.on_mouse_up();
+                    }
                     WM_RBUTTONDOWN => desktop.on_right_click(lx, ly, log_w, log_h),
                     WM_SYSKEYDOWN => {
                         let alt_down =
@@ -540,9 +558,17 @@ mod win32 {
             }
 
             let mut rect = Rect::default();
-            unsafe { GetClientRect(hwnd, &mut rect) };
-            let cw = (rect.right - rect.left).max(320) as usize;
-            let ch = (rect.bottom - rect.top).max(240) as usize;
+            if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+                break;
+            }
+            let cw_raw = rect.right - rect.left;
+            let ch_raw = rect.bottom - rect.top;
+            if cw_raw <= 0 || ch_raw <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(24));
+                continue;
+            }
+            let cw = cw_raw.max(320) as usize;
+            let ch = ch_raw.max(240) as usize;
             let cur_scale = desktop.settings.ui_scale();
             if cw != canvas.width || ch != canvas.height || (cur_scale - prev_scale).abs() > 0.001
             {

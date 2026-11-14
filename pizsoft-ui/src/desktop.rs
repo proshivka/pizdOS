@@ -286,6 +286,8 @@ pub struct Desktop {
     pub last_snap: Option<SnapZone>,
     pub snap_anim: f32,
     pub toast: Option<Toast>,
+    pub island_anim: f32,
+    pub island_vel: f32,
     pub ripples: Vec<ClickRipple>,
     pub dock_float_anim: f32,
     pub dock_float_vel: f32,
@@ -470,6 +472,8 @@ impl Desktop {
             last_snap: None,
             snap_anim: 0.0,
             toast: None,
+            island_anim: 0.0,
+            island_vel: 0.0,
             ripples: Vec::with_capacity(8),
             dock_float_anim: 0.0,
             dock_float_vel: 0.0,
@@ -731,6 +735,7 @@ impl Desktop {
                 self.calc.acc = None;
                 self.calc.op = None;
                 self.calc.clear_next = true;
+                self.calc.never_settle = false;
                 self.launcher_open = false;
                 self.push_toast(format!("= {s}"), 0x38BDF8);
             }
@@ -890,6 +895,7 @@ impl Desktop {
         let launch_tgt = if self.launcher_open { 1.0 } else { 0.0 };
         let dock_tgt = if self.settings.floating_dock { 1.0 } else { 0.0 };
         let snap_tgt = if self.snap_zone.is_some() { 1.0 } else { 0.0 };
+        let island_tgt = if self.settings.persistent_island { 1.0 } else { 0.0 };
         let genie_step = if self.settings.genie_minimize { 0.070 } else { 0.095 };
 
         if !self.settings.animations {
@@ -902,6 +908,8 @@ impl Desktop {
             self.launcher_vel = 0.0;
             self.dock_float_anim = dock_tgt;
             self.dock_float_vel = 0.0;
+            self.island_anim = island_tgt;
+            self.island_vel = 0.0;
             self.snap_anim = snap_tgt;
             if self.ctx_menu.is_none() {
                 self.last_ctx_menu = None;
@@ -954,6 +962,14 @@ impl Desktop {
                 dock_tgt,
                 0.34,
                 0.52,
+                0.008,
+            );
+            Canvas::step_spring(
+                &mut self.island_anim,
+                &mut self.island_vel,
+                island_tgt,
+                0.36,
+                0.54,
                 0.008,
             );
 
@@ -1169,7 +1185,7 @@ impl Desktop {
     fn cc_rect(&self, canvas_w: i32, canvas_h: i32) -> (i32, i32, i32, i32) {
         let (dock_x, task_y, dock_w, dock_h, _) = self.taskbar_rect(canvas_w, canvas_h);
         let pw = 276;
-        let ph = 236;
+        let ph = 266;
         let px = (dock_x + dock_w - pw - 8).max(8);
         let py = if self.settings.taskbar_top {
             task_y + dock_h + 6
@@ -1177,6 +1193,24 @@ impl Desktop {
             task_y - ph - 6
         };
         (px, py, pw, ph)
+    }
+
+    fn idle_island_text(&self) -> String {
+        let clock_or_up = if self.settings.show_clock {
+            &self.clock_str
+        } else {
+            &self.uptime
+        };
+        format!("pizdOS  ·  CPU {}%  ·  {}", self.cpu_pct, clock_or_up)
+    }
+
+    fn idle_island_rect(&self, canvas_w: i32, canvas_h: i32, txt: &str) -> (i32, i32, i32, i32) {
+        let text_w = crate::font::measure_text_scaled(txt, 1, 1.0);
+        let tw = (text_w + 48).clamp(164, (canvas_w - 32).max(164));
+        let th = 26;
+        let tx = (canvas_w - tw) / 2;
+        let ty = if self.settings.taskbar_top { canvas_h - 40 } else { 10 };
+        (tx, ty, tw, th)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -1480,7 +1514,12 @@ impl Desktop {
                         }
                     }
                 }
-                let foot_y = py + 204;
+                let island_y = py + 202;
+                if y >= island_y && y <= island_y + 26 && x >= px + 10 && x <= px + pw - 10 {
+                    self.settings.persistent_island = !self.settings.persistent_island;
+                    return;
+                }
+                let foot_y = py + 234;
                 if y >= foot_y && y <= foot_y + 24 {
                     self.refresh_metrics();
                     self.push_toast(tr(lang, "Метрики обновлены", "Metrics refreshed"), 0x3FB950);
@@ -1568,6 +1607,16 @@ impl Desktop {
                 bx += pill_w + 4;
             }
             return;
+        }
+
+        // 2b. Always-On Dynamic Island pill click (toggles Control Center)
+        if self.settings.persistent_island && self.toast.is_none() {
+            let txt = self.idle_island_text();
+            let (ix, iy, iw, ih) = self.idle_island_rect(canvas_w, canvas_h, &txt);
+            if x >= ix && x <= ix + iw && y >= iy && y <= iy + ih {
+                self.toggle_control_center();
+                return;
+            }
         }
 
         // 3. Topmost visible window hit test (expanded 4px border zone for effortless edge-resize grabs)
@@ -2158,6 +2207,9 @@ impl Desktop {
         if let Some((cx, cy)) = self.ctx_menu.or(anim_ctx) {
             self.draw_context_menu(canvas, cx, cy, accent);
         }
+        if self.settings.persistent_island || (anim && self.island_anim > 0.03) {
+            self.draw_idle_island(canvas, w, h, accent);
+        }
         if let Some(toast) = self.toast.as_ref() {
             self.draw_toast(canvas, w, h, toast);
         }
@@ -2376,7 +2428,40 @@ impl Desktop {
             canvas.draw_text_clipped(sx + 10, scale_y + 7, 45, &txt, if sel { 0xFFFFFF } else { 0xCBD5E1 }, 1);
         }
 
-        let foot_y = py + 204;
+        let island_y = py + 202;
+        let island_on = self.settings.persistent_island;
+        let island_hov = self.cc_open
+            && self.mouse_x >= px + 10
+            && self.mouse_x <= px + pw - 10
+            && self.mouse_y >= island_y
+            && self.mouse_y <= island_y + 26;
+        if island_on {
+            canvas.blend_rounded_rect(px + 10, island_y, pw - 20, 26, 8, 0x10B981, if island_hov { 68 } else { 52 });
+            canvas.draw_rounded_rect_alpha(px + 10, island_y, pw - 20, 26, 8, 0x10B981, 155);
+        } else {
+            canvas.blend_rounded_rect(px + 10, island_y, pw - 20, 26, 8, 0xFFFFFF, if island_hov { 20 } else { 12 });
+            canvas.draw_rounded_rect_alpha(px + 10, island_y, pw - 20, 26, 8, 0xFFFFFF, 24);
+        }
+        canvas.fill_aa_circle((px + 22) as f32, (island_y + 13) as f32, 3.2, if island_on { 0x34D399 } else { 0x64748B }, 255);
+        canvas.draw_text_clipped(
+            px + 30,
+            island_y + 6,
+            pw - 96,
+            tr(lang, "Dynamic Island всегда", "Always-On Island"),
+            0xF1F5F9,
+            1,
+        );
+        let st_col = if island_on { 0x34D399 } else { 0x94A3B8 };
+        canvas.draw_text_clipped(
+            px + pw - 62,
+            island_y + 6,
+            46,
+            if island_on { tr(lang, "Вкл", "On") } else { tr(lang, "Выкл", "Off") },
+            st_col,
+            1,
+        );
+
+        let foot_y = py + 234;
         canvas.blend_rounded_rect(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 11);
         canvas.draw_rounded_rect_alpha(px + 10, foot_y, pw - 20, 24, 8, 0xFFFFFF, 22);
         canvas.fill_aa_circle((px + 22) as f32, (foot_y + 12) as f32, 3.0, 0x3FB950, 255);
@@ -2493,6 +2578,58 @@ impl Desktop {
             0x7D8590,
             1,
         );
+    }
+
+    fn draw_idle_island(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+        let t = if self.settings.animations {
+            self.island_anim.clamp(0.0, 1.0)
+        } else if self.settings.persistent_island {
+            1.0
+        } else {
+            0.0
+        };
+        if t <= 0.02 {
+            return;
+        }
+        let txt = self.idle_island_text();
+        let (tx, base_y, tw, th) = self.idle_island_rect(w, h, &txt);
+        let slide = ((1.0 - t) * 26.0).round() as i32;
+        let ty = if self.settings.taskbar_top {
+            base_y + slide
+        } else {
+            base_y - slide
+        };
+        let hov = self.settings.persistent_island
+            && self.toast.is_none()
+            && self.mouse_x >= tx
+            && self.mouse_x <= tx + tw
+            && self.mouse_y >= ty
+            && self.mouse_y <= ty + th;
+
+        if t > 0.5 {
+            canvas.draw_soft_shadow(tx, ty, tw, th, 13);
+        }
+        canvas.blend_rounded_rect(tx, ty, tw, th, 13, 0x090D16, (236.0 * t) as u8);
+        let border_col = if hov { accent } else { 0xFFFFFF };
+        let border_a = if hov {
+            (165.0 * t) as u8
+        } else {
+            (48.0 * t) as u8
+        };
+        canvas.draw_rounded_rect_alpha(tx, ty, tw, th, 13, border_col, border_a);
+        canvas.blend_rect(tx + 16, ty + 1, (tw - 32).max(0), 1, 0xFFFFFF, (30.0 * t) as u8);
+
+        let pulse = if self.settings.animations {
+            (205.0 + 50.0 * ((self.tick as f32) * 0.08).sin()).clamp(150.0, 255.0)
+        } else {
+            255.0
+        };
+        canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, 0x3FB950, (55.0 * t) as u8);
+        canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, 0x3FB950, (pulse * t) as u8);
+        if t > 0.35 {
+            canvas.draw_text_clipped(tx + 25, ty + 6, tw - 48, &txt, 0xE2E8F0, 1);
+            canvas.fill_aa_circle((tx + tw - 12) as f32, (ty + 13) as f32, 2.4, accent, (220.0 * t) as u8);
+        }
     }
 
     fn draw_toast(&self, canvas: &mut Canvas, w: i32, h: i32, toast: &Toast) {
