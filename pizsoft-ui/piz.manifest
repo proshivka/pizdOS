@@ -1,0 +1,5 @@
+name=pizsoft-ui
+version=0.1.0
+arch=x86_64
+desc=Pizsoft UI — zero-dependency TUI desktop for pizdOS 2.0
+depends=
