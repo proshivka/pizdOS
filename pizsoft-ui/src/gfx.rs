@@ -285,6 +285,95 @@ impl Canvas {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn fill_luminous_card(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        r: i32,
+        tl_col: u32,
+        br_col: u32,
+        glow_a: u32,
+        glow_b: u32,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let r = r.min(w / 2).min(h / 2).max(0);
+        let split = |c: u32| -> (f32, f32, f32) {
+            (((c >> 16) & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, (c & 0xFF) as f32)
+        };
+        let (tl_r, tl_g, tl_b) = split(tl_col);
+        let (br_r, br_g, br_b) = split(br_col);
+        let (ar, ag, ab) = split(glow_a);
+        let (gr2, gg2, gb2) = split(glow_b);
+
+        let wf = (w - 1).max(1) as f32;
+        let hf = (h - 1).max(1) as f32;
+
+        for dy in 0..h {
+            let ny = dy as f32 / hf;
+            for dx in 0..w {
+                let cov = if dx < r && dy < r {
+                    Self::corner_cov(r - 1 - dx, r - 1 - dy, r)
+                } else if dx >= w - r && dy < r {
+                    Self::corner_cov(dx - (w - r), r - 1 - dy, r)
+                } else if dx < r && dy >= h - r {
+                    Self::corner_cov(r - 1 - dx, dy - (h - r), r)
+                } else if dx >= w - r && dy >= h - r {
+                    Self::corner_cov(dx - (w - r), dy - (h - r), r)
+                } else {
+                    255
+                };
+                if cov == 0 {
+                    continue;
+                }
+
+                let nx = dx as f32 / wf;
+                let diag = (nx * 0.65 + ny * 0.55).clamp(0.0, 1.0);
+                let mut cr = tl_r + (br_r - tl_r) * diag;
+                let mut cg = tl_g + (br_g - tl_g) * diag;
+                let mut cb = tl_b + (br_b - tl_b) * diag;
+
+                let d1 = ((nx - 0.78) * 1.4).powi(2) + ((ny - 0.25) * 1.5).powi(2);
+                if d1 < 1.0 {
+                    let k = 1.0 - d1;
+                    let w1 = k * k * k * 0.34;
+                    cr += (ar - cr) * w1;
+                    cg += (ag - cg) * w1;
+                    cb += (ab - cb) * w1;
+                }
+
+                let d2 = ((nx - 0.28) * 1.35).powi(2) + ((ny - 0.85) * 1.5).powi(2);
+                if d2 < 1.0 {
+                    let k = 1.0 - d2;
+                    let w2 = k * k * k * 0.26;
+                    cr += (gr2 - cr) * w2;
+                    cg += (gg2 - cg) * w2;
+                    cb += (gb2 - cb) * w2;
+                }
+
+                // Subtle Liquid Glass top-edge specular sheen
+                if dy == 1 {
+                    cr += (255.0 - cr) * 0.14;
+                    cg += (255.0 - cg) * 0.14;
+                    cb += (255.0 - cb) * 0.14;
+                }
+
+                let col = ((cr.clamp(0.0, 255.0) as u32) << 16)
+                    | ((cg.clamp(0.0, 255.0) as u32) << 8)
+                    | (cb.clamp(0.0, 255.0) as u32);
+                if cov == 255 {
+                    self.set_pixel(x + dx, y + dy, col);
+                } else {
+                    self.blend_pixel(x + dx, y + dy, col, cov);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_rounded_rect_alpha(
         &mut self,
         x: i32,

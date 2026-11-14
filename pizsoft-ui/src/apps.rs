@@ -567,12 +567,9 @@ impl ThemePreset {
         }
     }
 
-    pub fn render_wallpaper(self, buf: &mut [u32], w: usize, h: usize, show_grid: bool) {
-        if w == 0 || h == 0 {
-            return;
-        }
+    pub fn mesh_palette(self) -> (u32, u32, u32, u32, u32, u32) {
         // Minimalist silk mesh gradient palettes: base_tl, base_br, blob_a, blob_b, blob_c, ribbon
-        let (base_tl, base_br, blob_a, blob_b, blob_c, ribbon) = match self {
+        match self {
             ThemePreset::AuroraPeaks => (
                 0x07090F, 0x0C1220, 0x1E3A8A, 0x0F766E, 0x4338CA, 0x38BDF8,
             ),
@@ -585,7 +582,14 @@ impl ThemePreset {
             ThemePreset::OceanGlass => (
                 0x050B12, 0x0A1A26, 0x0369A1, 0x0D9488, 0x1D4ED8, 0x2DD4BF,
             ),
-        };
+        }
+    }
+
+    pub fn render_wallpaper(self, buf: &mut [u32], w: usize, h: usize, show_grid: bool) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let (base_tl, base_br, blob_a, blob_b, blob_c, ribbon) = self.mesh_palette();
 
         let split_rgb = |c: u32| -> (f32, f32, f32) {
             (((c >> 16) & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, (c & 0xFF) as f32)
@@ -948,175 +952,179 @@ impl SettingsState {
                 );
             }
             SettingsPage::About => {
-                // 1. ColorOS-style Hero OS Banner Card
-                let card_right = lerp_rgb(0x161B28, accent, 46, 255);
-                canvas.fill_hgradient_rounded_rect(x, y, iw, 84, 12, 0x121621, card_right);
-                canvas.draw_rounded_rect_alpha(x, y, iw, 84, 12, 0xFFFFFF, 26);
+                let (wp_tl, wp_br, wp_a, wp_b, _, wp_rib) = self.theme.mesh_palette();
 
-                // Iconic layered ColorOS orbital ring emblem inside Hero Banner
-                let hx = (x + 39) as f32;
-                let hy = (y + 42) as f32;
-                canvas.fill_aa_circle(hx, hy, 25.0, accent, 32);
-                canvas.fill_aa_circle(hx, hy, 21.0, 0x0E121B, 220);
-                canvas.fill_aa_circle(hx - 4.0, hy - 3.5, 9.5, accent, 205);
-                canvas.fill_aa_circle(hx + 4.5, hy + 3.5, 8.8, 0x2DD4BF, 195);
-                canvas.fill_aa_circle(hx, hy, 6.2, 0x121621, 235);
-                canvas.fill_aa_circle(hx, hy, 2.5, 0xF8FAFC, 245);
+                // 1. ColorOS 15/16/17 Luminous Liquid-Glass Hero Poster
+                canvas.fill_luminous_card(
+                    x,
+                    y,
+                    iw,
+                    90,
+                    14,
+                    0x101521,
+                    lerp_rgb(0x161E30, accent, 52, 255),
+                    accent,
+                    wp_rib,
+                );
+                canvas.draw_rounded_rect_alpha(x, y, iw, 90, 14, 0xFFFFFF, 34);
 
-                // OS Title + version pill + subtitles
-                let tx_hero = x + 76;
-                canvas.draw_text_clipped(tx_hero, y + 11, iw - 172, "pizdOS", 0xF8FAFC, 2);
+                // Wordmark + Floating Liquid-Glass Version Pill
+                canvas.draw_text_clipped(x + 18, y + 13, iw - 126, "pizdOS", 0xFFFFFF, 2);
                 let title_w = crate::font::measure_text("pizdOS", 2);
-                let pill_x = tx_hero + title_w + 8;
-                if pill_x + 38 < x + iw - 96 {
-                    canvas.blend_rounded_rect(pill_x, y + 14, 34, 18, 9, accent, 55);
-                    canvas.draw_rounded_rect_alpha(pill_x, y + 14, 34, 18, 9, accent, 120);
-                    canvas.draw_text_clipped(pill_x + 8, y + 16, 24, "2.0", 0xF8FAFC, 1);
+                let pill_x = x + 18 + title_w + 8;
+                if pill_x + 42 < x + iw - 96 {
+                    canvas.blend_rounded_rect(pill_x, y + 16, 36, 19, 9, 0xFFFFFF, 28);
+                    canvas.draw_rounded_rect_alpha(pill_x, y + 16, 36, 19, 9, 0xFFFFFF, 82);
+                    canvas.draw_text_clipped(pill_x + 9, y + 18, 24, "2.0", 0xFFFFFF, 1);
                 }
 
                 canvas.draw_text_clipped(
-                    tx_hero,
-                    y + 40,
-                    iw - 88,
-                    "Bratukha Edition • Color-style UI",
-                    0x94A3B8,
+                    x + 18,
+                    y + 43,
+                    iw - 108,
+                    tr(lang, "Bratukha Edition • Официальная сборка", "Bratukha Edition • Official Build"),
+                    0xCBD5E1,
                     1,
                 );
                 canvas.draw_text_clipped(
-                    tx_hero,
-                    y + 58,
-                    iw - 88,
+                    x + 18,
+                    y + 62,
+                    iw - 108,
                     "by prosh1vka, Lowyk, KiryxaTipa",
                     0x6EE7B7,
                     1,
                 );
 
-                // Top-right Official "NO GNU" status capsule
-                if iw > 270 {
+                // Top-right Official Status Capsule + Bottom-right Luminous Orbital Emblem
+                if iw > 265 {
                     let bx = x + iw - 92;
                     let by = y + 13;
-                    canvas.blend_rounded_rect(bx, by, 80, 24, 12, 0x0A0D14, 205);
-                    canvas.draw_rounded_rect_alpha(bx, by, 80, 24, 12, 0xFFFFFF, 34);
-                    canvas.fill_aa_circle((bx + 13) as f32, (by + 12) as f32, 3.2, 0x3FB950, 255);
-                    canvas.draw_text_clipped(bx + 22, by + 5, 54, "NO GNU", 0xF1F5F9, 1);
+                    canvas.blend_rounded_rect(bx, by, 80, 23, 11, 0x090D14, 195);
+                    canvas.draw_rounded_rect_alpha(bx, by, 80, 23, 11, 0xFFFFFF, 46);
+                    canvas.fill_aa_circle((bx + 13) as f32, (by + 11) as f32 + 0.5, 3.0, 0x3FB950, 255);
+                    canvas.draw_text_clipped(bx + 22, by + 5, 54, "NO GNU", 0xF8FAFC, 1);
+
+                    let ex = (x + iw - 42) as f32;
+                    let ey = (y + 62) as f32;
+                    canvas.fill_aa_circle(ex, ey, 19.0, 0xFFFFFF, 18);
+                    canvas.fill_aa_circle(ex - 5.0, ey - 2.0, 10.5, accent, 165);
+                    canvas.fill_aa_circle(ex + 5.0, ey + 2.0, 9.5, wp_rib, 155);
+                    canvas.fill_aa_circle(ex, ey, 5.2, 0x0F1522, 225);
+                    canvas.fill_aa_circle(ex, ey, 2.2, 0xFFFFFF, 240);
                 }
 
-                // 2. ColorOS Bento Spec Row (RAM Usage Card + Core Stack Card)
-                let bento_y = y + 92;
+                // 2. ColorOS 15/16 Asymmetric Bento Duo: Live Device Preview + Multi-Segment RAM Card
+                let bento_y = y + 98;
                 let bento_h = 74;
-                let col_w = (iw - 8) / 2;
+                let w1 = ((iw - 8) * 45) / 100;
+                let w2 = iw - 8 - w1;
 
-                // Left Bento Card: RAM with ColorOS rounded storage/memory usage bar
-                canvas.fill_rounded_rect(x, bento_y, col_w, bento_h, 11, 0x171C27);
-                canvas.draw_rounded_rect_alpha(x, bento_y, col_w, bento_h, 11, 0xFFFFFF, 20);
-                let r_cx = (x + 21) as f32;
-                let r_cy = (bento_y + 22) as f32;
-                canvas.fill_aa_circle(r_cx, r_cy, 11.5, 0x38BDF8, 34);
-                canvas.draw_rounded_rect_alpha(x + 16, bento_y + 17, 10, 10, 2, 0x38BDF8, 235);
-                canvas.fill_rounded_rect(x + 19, bento_y + 20, 4, 4, 1, 0x7DD3FC);
+                // Left Card: Device Name + Miniature Live-Wallpaper Screen Frame
+                canvas.fill_rounded_rect(x, bento_y, w1, bento_h, 12, 0x161B26);
+                canvas.draw_rounded_rect_alpha(x, bento_y, w1, bento_h, 12, 0xFFFFFF, 22);
+                canvas.blend_rect(x + 12, bento_y + 1, w1 - 24, 1, 0xFFFFFF, 18);
 
                 canvas.draw_text_clipped(
-                    x + 39,
-                    bento_y + 9,
-                    col_w - 72,
-                    tr(lang, "Память", "Memory"),
+                    x + 13,
+                    bento_y + 11,
+                    w1 - 56,
+                    tr(lang, "Устройство", "Device"),
+                    0x8B949E,
+                    1,
+                );
+                canvas.draw_text_clipped(x + 13, bento_y + 28, w1 - 56, "pizdOS PC", 0xF8FAFC, 1);
+                canvas.blend_rounded_rect(x + 13, bento_y + 47, 50, 17, 8, accent, 38);
+                canvas.draw_text_clipped(x + 18, bento_y + 49, 44, "x86_64", 0xCBD5E1, 1);
+
+                // Miniature ColorOS Screen Thumbnail displaying live ThemePreset wallpaper
+                let scr_x = x + w1 - 44;
+                let scr_y = bento_y + 11;
+                canvas.fill_luminous_card(scr_x, scr_y, 32, 52, 6, wp_tl, wp_br, wp_a, wp_b);
+                canvas.draw_rounded_rect_alpha(scr_x, scr_y, 32, 52, 6, 0xFFFFFF, 95);
+                canvas.fill_rounded_rect(scr_x + 11, scr_y + 4, 10, 2, 1, 0x0A0E16);
+
+                // Right Card: RAM + Signature ColorOS 15/16 Multi-Segment Pill Bar
+                let rx = x + w1 + 8;
+                canvas.fill_rounded_rect(rx, bento_y, w2, bento_h, 12, 0x161B26);
+                canvas.draw_rounded_rect_alpha(rx, bento_y, w2, bento_h, 12, 0xFFFFFF, 22);
+                canvas.blend_rect(rx + 12, bento_y + 1, w2 - 24, 1, 0xFFFFFF, 18);
+
+                canvas.draw_text_clipped(
+                    rx + 13,
+                    bento_y + 11,
+                    w2 - 58,
+                    tr(lang, "Память (RAM)", "Memory"),
                     0x8B949E,
                     1,
                 );
                 canvas.draw_text_clipped(
-                    x + col_w - 34,
-                    bento_y + 9,
-                    26,
+                    rx + w2 - 38,
+                    bento_y + 11,
+                    28,
                     &format!("{}%", mem.percent),
                     0x38BDF8,
                     1,
                 );
                 canvas.draw_text_clipped(
-                    x + 39,
-                    bento_y + 25,
-                    col_w - 46,
+                    rx + 13,
+                    bento_y + 28,
+                    w2 - 26,
                     &format!("{} / {} MB", mem.used_mb, mem.total_mb),
                     0xF8FAFC,
                     1,
                 );
 
-                // Signature ColorOS rounded pill bar
-                let bar_x = x + 12;
-                let bar_y = bento_y + 53;
-                let bar_w = (col_w - 24).max(20);
-                canvas.fill_rounded_rect(bar_x, bar_y, bar_w, 7, 3, 0x0C1018);
-                let fill_w = ((bar_w * (mem.percent as i32)) / 100).clamp(10, bar_w);
-                canvas.fill_hgradient_rounded_rect(bar_x, bar_y, fill_w, 7, 3, 0x38BDF8, accent);
+                // ColorOS 15/16 Multi-Category Segmented Memory Pill Bar
+                let bar_x = rx + 13;
+                let bar_y = bento_y + 51;
+                let bar_w = (w2 - 26).max(24);
+                canvas.fill_rounded_rect(bar_x, bar_y, bar_w, 8, 4, 0x0B0E16);
+                let total_fill = ((bar_w * (mem.percent as i32)) / 100).clamp(18, bar_w);
+                let seg1 = (total_fill * 52) / 100;
+                let seg2 = (total_fill * 30) / 100;
+                let seg3 = (total_fill - seg1 - seg2).max(4);
+                canvas.fill_rounded_rect(bar_x, bar_y, seg1.max(6), 8, 4, accent);
+                if bar_x + seg1 + 2 < bar_x + bar_w {
+                    canvas.fill_rounded_rect(bar_x + seg1 + 1, bar_y, seg2.max(4), 8, 3, 0x2DD4BF);
+                }
+                if bar_x + seg1 + seg2 + 3 < bar_x + bar_w {
+                    canvas.fill_rounded_rect(bar_x + seg1 + seg2 + 2, bar_y, seg3, 8, 3, 0xA855F7);
+                }
 
-                // Right Bento Card: Core Stack & Badges
-                let rx = x + col_w + 8;
-                canvas.fill_rounded_rect(rx, bento_y, col_w, bento_h, 11, 0x171C27);
-                canvas.draw_rounded_rect_alpha(rx, bento_y, col_w, bento_h, 11, 0xFFFFFF, 20);
-                let s_cx = (rx + 21) as f32;
-                let s_cy = (bento_y + 22) as f32;
-                canvas.fill_aa_circle(s_cx, s_cy, 11.5, 0x3FB950, 34);
-                canvas.draw_aa_line(s_cx - 5.0, s_cy - 3.5, s_cx + 5.0, s_cy - 3.5, 1.5, 0x4ADE80, 240);
-                canvas.draw_aa_line(s_cx - 5.0, s_cy, s_cx + 5.0, s_cy, 1.5, 0x86EFAC, 220);
-                canvas.draw_aa_line(s_cx - 5.0, s_cy + 3.5, s_cx + 5.0, s_cy + 3.5, 1.5, 0x4ADE80, 190);
-
-                canvas.draw_text_clipped(
-                    rx + 39,
-                    bento_y + 9,
-                    col_w - 46,
-                    tr(lang, "Базовый стек", "Core Stack"),
-                    0x8B949E,
-                    1,
-                );
-                canvas.draw_text_clipped(
-                    rx + 39,
-                    bento_y + 25,
-                    col_w - 46,
-                    "musl + BusyBox",
-                    0xF8FAFC,
-                    1,
-                );
-                canvas.blend_rounded_rect(rx + 12, bento_y + 46, 56, 18, 9, 0x3FB950, 30);
-                canvas.draw_text_clipped(rx + 18, bento_y + 48, 46, "0% GNU", 0x6EE7B7, 1);
-                canvas.blend_rounded_rect(rx + 74, bento_y + 46, 56, 18, 9, 0xFFFFFF, 16);
-                canvas.draw_text_clipped(rx + 80, bento_y + 48, 46, "0 Deps", 0xCBD5E1, 1);
-
-                // 3. Bottom Unified ColorOS Grouped 2x2 Spec Panel with hairline dividers & chevrons
-                let grp_y = y + 174;
-                let grp_h = (wy + wh - 12 - grp_y).clamp(96, 118);
+                // 3. ColorOS 15/16 Grouped Spec List Card (Left Label <-> Right Value + '>')
+                let grp_y = y + 180;
+                let grp_h = (wy + wh - 12 - grp_y).clamp(96, 114);
                 if grp_y + 84 <= wy + wh - 6 {
-                    canvas.fill_rounded_rect(x, grp_y, iw, grp_h, 11, 0x171C27);
-                    canvas.draw_rounded_rect_alpha(x, grp_y, iw, grp_h, 11, 0xFFFFFF, 20);
+                    canvas.fill_rounded_rect(x, grp_y, iw, grp_h, 13, 0x161B26);
+                    canvas.draw_rounded_rect_alpha(x, grp_y, iw, grp_h, 13, 0xFFFFFF, 22);
+                    canvas.blend_rect(x + 14, grp_y + 1, iw - 28, 1, 0xFFFFFF, 16);
 
-                    let half_w = iw / 2;
-                    let half_h = grp_h / 2;
-                    canvas.blend_rect(x + 12, grp_y + half_h, iw - 24, 1, 0xFFFFFF, 14);
-                    canvas.blend_rect(x + half_w, grp_y + 10, 1, grp_h - 20, 0xFFFFFF, 14);
-
-                    let specs = [
+                    let rows = [
                         (tr(lang, "Ядро", "Kernel"), kernel, 0xA855F7),
-                        (tr(lang, "Лицензия", "License"), "MIT (GNU Nahuy)", 0xF59E0B),
-                        (tr(lang, "Пакеты", "Packages"), "piz-get 0.1.0", 0xF43F5E),
-                        (tr(lang, "Устройство", "Device"), "pizdOS x86_64 PC", accent),
+                        (tr(lang, "Базовый стек", "Core Stack"), "musl + BusyBox", 0x38BDF8),
+                        (tr(lang, "Пакетный менеджер", "Packages"), "piz-get 0.1.0", 0xF43F5E),
+                        (tr(lang, "Лицензия", "License"), "MIT • NO GNU (0 Deps)", 0x3FB950),
                     ];
-                    for (idx, (lbl, val, ic_col)) in specs.iter().enumerate() {
-                        let col = (idx % 2) as i32;
-                        let row = (idx / 2) as i32;
-                        let cx_cell = x + col * half_w;
-                        let cy_cell = grp_y + row * half_h;
+                    let row_h = grp_h / 4;
+                    for (idx, (lbl, val, dot_col)) in rows.iter().enumerate() {
+                        let ry = grp_y + (idx as i32) * row_h;
+                        if idx > 0 {
+                            canvas.blend_rect(x + 14, ry, iw - 28, 1, 0xFFFFFF, 12);
+                        }
+                        let mid_y = ry + row_h / 2;
+                        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, *dot_col, 32);
+                        canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, *dot_col, 240);
+                        canvas.draw_text_clipped(x + 32, mid_y - 7, 130, lbl, 0xE2E8F0, 1);
 
-                        // Soft circular tinted badge + label + ColorOS '>' chevron
-                        let ic_x = (cx_cell + 19) as f32;
-                        let ic_y = (cy_cell + 15) as f32;
-                        canvas.fill_aa_circle(ic_x, ic_y, 7.5, *ic_col, 38);
-                        canvas.fill_aa_circle(ic_x, ic_y, 2.8, *ic_col, 245);
-                        canvas.draw_text_clipped(cx_cell + 32, cy_cell + 8, half_w - 50, lbl, 0x8B949E, 1);
+                        let max_vw = (iw - 180).max(50);
+                        let vw = crate::font::measure_text(val, 1).min(max_vw);
+                        let vx = x + iw - 24 - vw;
+                        canvas.draw_text_clipped(vx, mid_y - 7, max_vw, val, 0x94A3B8, 1);
 
-                        let chev_x = (cx_cell + half_w - 14) as f32;
-                        let chev_y = (cy_cell + 15) as f32;
-                        canvas.draw_aa_line(chev_x - 2.0, chev_y - 3.0, chev_x + 1.5, chev_y, 1.2, 0x64748B, 175);
-                        canvas.draw_aa_line(chev_x + 1.5, chev_y, chev_x - 2.0, chev_y + 3.0, 1.2, 0x64748B, 175);
-
-                        canvas.draw_text_clipped(cx_cell + 12, cy_cell + 29, half_w - 20, val, 0xF1F5F9, 1);
+                        let ch_x = (x + iw - 14) as f32;
+                        let ch_y = mid_y as f32;
+                        canvas.draw_aa_line(ch_x - 2.0, ch_y - 3.0, ch_x + 1.5, ch_y, 1.2, 0x64748B, 175);
+                        canvas.draw_aa_line(ch_x + 1.5, ch_y, ch_x - 2.0, ch_y + 3.0, 1.2, 0x64748B, 175);
                     }
                 }
             }
