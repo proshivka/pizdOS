@@ -24,7 +24,7 @@ fn print_help() {
            pizsoft [OPTIONS]\n\
          \n\
          OPTIONS:\n\
-           --dump-bmp <FILE>   Render 960x600 desktop screenshot to BMP and exit\n\
+           --dump-bmp <FILE>   Render 800x600 desktop screenshot to BMP and exit\n\
            -h, --help          Show this help\n\
            -V, --version       Show version"
     );
@@ -59,14 +59,17 @@ fn main() {
     }
 
     if let Some(path) = dump_bmp {
-        let mut canvas = Canvas::new(960, 600);
-        let desktop = Desktop::new(960, 600);
+        let mut canvas = Canvas::new(800, 600);
+        let mut desktop = Desktop::new(800, 600);
+        desktop.settings.ui_scale_pct = 100;
+        canvas.set_ui_scale(1.0);
+        desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
         desktop.render(&mut canvas);
         if let Err(e) = canvas.write_bmp(&path) {
             eprintln!("Failed to write {}: {e}", path.display());
             process::exit(1);
         }
-        println!("Saved {} (960x600 BMP)", path.display());
+        println!("Saved {} (800x600 BMP)", path.display());
         return;
     }
 
@@ -1089,5 +1092,232 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(seen_delete, "expected WM_DELETE_WINDOW ClientMessage");
+    }
+
+    #[test]
+    fn test_screen_resolution_default_800x600_switch_and_persist() {
+        let mut d = Desktop::new(800, 600);
+        assert_eq!(d.settings.resolution(), (800, 600));
+        assert_eq!(d.settings.res_idx, 0);
+
+        // Settings window should fit cleanly within 800x600 width
+        let sw = d
+            .windows
+            .iter()
+            .find(|w| w.id == desktop::AppId::Settings)
+            .expect("settings win");
+        assert!(sw.x + sw.w <= 800);
+
+        // Switch to Display page (sidebar idx 0) then click 1024x768 pill
+        let _ = d.settings.on_click(40, 42, sw.w, sw.h);
+        let _ = d.settings.on_click(sw.w - 170, 324, sw.w, sw.h);
+        assert_eq!(d.settings.resolution(), (1024, 768));
+
+        // Terminal `res 1280x800` command
+        let act = d.terminal.on_key(apps::KeyEvent::Char('r'), &d.kernel, &d.mem);
+        assert_eq!(act, apps::TermAction::None);
+        d.terminal.input = String::from("res 1280x800");
+        let act = d.terminal.on_key(apps::KeyEvent::Enter, &d.kernel, &d.mem);
+        assert_eq!(act, apps::TermAction::SetResolution(2));
+        d.settings.res_idx = 2;
+        assert_eq!(d.settings.resolution(), (1280, 800));
+
+        // Config save + reload preserves resolution index
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|x| x.as_nanos())
+            .unwrap_or(1);
+        let tmp = std::env::temp_dir().join(format!("pizsoft_res_{nanos}.conf"));
+        config::save_config_to(&tmp, &d.settings, 7, "note");
+        let mut loaded = apps::SettingsState::new();
+        assert_eq!(loaded.resolution(), (800, 600));
+        let _ = config::load_config_from(&tmp, &mut loaded);
+        assert_eq!(loaded.resolution(), (1280, 800));
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_x11_child_widgets_drawing_and_xinput2() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut desktop = Desktop::new(800, 600);
+        desktop.display_srv = display_srv::DisplayServer::new_tcp_test(0).expect("tcp test listener");
+        desktop.display_srv.set_screen_size(800, 600);
+        let port = desktop.display_srv.tcp_port.expect("ephemeral port");
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect x11");
+        stream.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+
+        // Setup handshake -> check 800x600 root screen geometry
+        let mut setup = [0u8; 12];
+        setup[0] = b'l';
+        setup[2..4].copy_from_slice(&11u16.to_le_bytes());
+        stream.write_all(&setup).unwrap();
+        desktop.poll_display_server();
+        let mut reply = [0u8; 256];
+        let n = stream.read(&mut reply).unwrap();
+        assert!(n >= 140 && reply[0] == 1);
+        assert_eq!(u16::from_le_bytes([reply[88], reply[89]]), 800);
+        assert_eq!(u16::from_le_bytes([reply[90], reply[91]]), 600);
+
+        // QueryExtension("XInputExtension")
+        let ext = b"XInputExtension";
+        let words = 2 + ext.len().div_ceil(4);
+        let mut qe = vec![0u8; words * 4];
+        qe[0] = 98;
+        qe[2..4].copy_from_slice(&(words as u16).to_le_bytes());
+        qe[4..6].copy_from_slice(&(ext.len() as u16).to_le_bytes());
+        qe[8..8 + ext.len()].copy_from_slice(ext);
+        stream.write_all(&qe).unwrap();
+        desktop.poll_display_server();
+        let mut r32b = [0u8; 32];
+        stream.read_exact(&mut r32b).unwrap();
+        assert_eq!(r32b[8], 1, "XInputExtension must be present");
+        let xi_op = r32b[9];
+        assert_eq!(xi_op, 131);
+
+        // XIQueryVersion 2.3
+        let mut xiqv = [0u8; 8];
+        xiqv[0] = xi_op;
+        xiqv[1] = 47;
+        xiqv[2..4].copy_from_slice(&2u16.to_le_bytes());
+        xiqv[4..6].copy_from_slice(&2u16.to_le_bytes());
+        xiqv[6..8].copy_from_slice(&3u16.to_le_bytes());
+        stream.write_all(&xiqv).unwrap();
+        desktop.poll_display_server();
+        stream.read_exact(&mut r32b).unwrap();
+        assert_eq!(u16::from_le_bytes([r32b[8], r32b[9]]), 2);
+
+        // XIQueryDevice (0 = all)
+        let mut xiqd = [0u8; 8];
+        xiqd[0] = xi_op;
+        xiqd[1] = 48;
+        xiqd[2..4].copy_from_slice(&2u16.to_le_bytes());
+        stream.write_all(&xiqd).unwrap();
+        desktop.poll_display_server();
+        let n = stream.read(&mut reply).unwrap();
+        assert!(n > 32 && reply[0] == 1);
+        assert_eq!(u16::from_le_bytes([reply[8], reply[9]]), 2);
+
+        // Create top window (200x160, white bg) + child button (20,20, 44x28, gray bg)
+        let top_wid = 0x0040_0010u32;
+        let child_wid = 0x0040_0011u32;
+        let gc = 0x0040_0012u32;
+        let mut cw = [0u8; 36];
+        cw[0] = 1;
+        cw[1] = 24;
+        cw[2..4].copy_from_slice(&9u16.to_le_bytes());
+        cw[4..8].copy_from_slice(&top_wid.to_le_bytes());
+        cw[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+        cw[16..18].copy_from_slice(&200u16.to_le_bytes());
+        cw[18..20].copy_from_slice(&160u16.to_le_bytes());
+        cw[24..26].copy_from_slice(&1u16.to_le_bytes());
+        cw[28..32].copy_from_slice(&0x02u32.to_le_bytes()); // CWBackPixel
+        cw[32..36].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        stream.write_all(&cw).unwrap();
+
+        let mut cwc = [0u8; 40];
+        cwc[0] = 1;
+        cwc[1] = 24;
+        cwc[2..4].copy_from_slice(&10u16.to_le_bytes());
+        cwc[4..8].copy_from_slice(&child_wid.to_le_bytes());
+        cwc[8..12].copy_from_slice(&top_wid.to_le_bytes());
+        cwc[12..14].copy_from_slice(&20u16.to_le_bytes());
+        cwc[14..16].copy_from_slice(&20u16.to_le_bytes());
+        cwc[16..18].copy_from_slice(&44u16.to_le_bytes());
+        cwc[18..20].copy_from_slice(&28u16.to_le_bytes());
+        cwc[20..22].copy_from_slice(&1u16.to_le_bytes()); // border_width=1
+        cwc[24..26].copy_from_slice(&1u16.to_le_bytes());
+        cwc[28..32].copy_from_slice(&0x0Au32.to_le_bytes()); // BackPixel | BorderPixel
+        cwc[32..36].copy_from_slice(&0x00C0_C0C0u32.to_le_bytes());
+        cwc[36..40].copy_from_slice(&0x0010_2030u32.to_le_bytes());
+        stream.write_all(&cwc).unwrap();
+
+        // CreateGC (fg = 0x0011_2233)
+        let mut cg = [0u8; 20];
+        cg[0] = 55;
+        cg[2..4].copy_from_slice(&5u16.to_le_bytes());
+        cg[4..8].copy_from_slice(&gc.to_le_bytes());
+        cg[8..12].copy_from_slice(&top_wid.to_le_bytes());
+        cg[12..16].copy_from_slice(&4u32.to_le_bytes());
+        cg[16..20].copy_from_slice(&0x0011_2233u32.to_le_bytes());
+        stream.write_all(&cg).unwrap();
+
+        // MapWindow(top_wid) + MapSubwindows(top_wid)
+        for &(op, id) in &[(8u8, top_wid), (9u8, top_wid)] {
+            let mut mw = [0u8; 8];
+            mw[0] = op;
+            mw[2..4].copy_from_slice(&2u16.to_le_bytes());
+            mw[4..8].copy_from_slice(&id.to_le_bytes());
+            stream.write_all(&mw).unwrap();
+        }
+
+        // PolyFillArc on top_wid (80, 30, 40x40 full circle) + PolyText8 on child_wid ("7")
+        let mut pfa = [0u8; 24];
+        pfa[0] = 71;
+        pfa[2..4].copy_from_slice(&6u16.to_le_bytes());
+        pfa[4..8].copy_from_slice(&top_wid.to_le_bytes());
+        pfa[8..12].copy_from_slice(&gc.to_le_bytes());
+        pfa[12..14].copy_from_slice(&80u16.to_le_bytes());
+        pfa[14..16].copy_from_slice(&30u16.to_le_bytes());
+        pfa[16..18].copy_from_slice(&40u16.to_le_bytes());
+        pfa[18..20].copy_from_slice(&40u16.to_le_bytes());
+        pfa[22..24].copy_from_slice(&(360i16 * 64).to_le_bytes());
+        stream.write_all(&pfa).unwrap();
+
+        let mut pt8 = [0u8; 20];
+        pt8[0] = 74;
+        pt8[2..4].copy_from_slice(&5u16.to_le_bytes());
+        pt8[4..8].copy_from_slice(&child_wid.to_le_bytes());
+        pt8[8..12].copy_from_slice(&gc.to_le_bytes());
+        pt8[12..14].copy_from_slice(&14u16.to_le_bytes());
+        pt8[14..16].copy_from_slice(&20u16.to_le_bytes());
+        pt8[16] = 1; // len
+        pt8[17] = 0; // delta
+        pt8[18] = b'7';
+        stream.write_all(&pt8).unwrap();
+
+        for _ in 0..20 {
+            desktop.poll_display_server();
+            if desktop.windows.iter().any(|w| matches!(w.id, desktop::AppId::Guest(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let gid = desktop
+            .windows
+            .iter()
+            .find_map(|w| if let desktop::AppId::Guest(g) = w.id { Some(g) } else { None })
+            .expect("mapped guest window");
+        let surf = desktop.display_srv.window(gid).unwrap();
+        // Child button interior pixel (25, 25) should be gray 0x00C0C0C0, not white 0x00FFFFFF
+        assert_eq!(surf.pixels[25 * 200 + 25], 0x00C0_C0C0);
+        // Filled arc center (100, 50) should be GC foreground 0x00112233
+        assert_eq!(surf.pixels[50 * 200 + 100], 0x0011_2233);
+
+        // Both Expose (top + child) must be received
+        let n = stream.read(&mut reply).unwrap();
+        let exposes: Vec<u32> = reply[..n]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .filter(|e| e[0] == 12)
+            .map(|e| u32::from_le_bytes([e[4], e[5], e[6], e[7]]))
+            .collect();
+        assert!(exposes.contains(&top_wid) && exposes.contains(&child_wid));
+
+        // Clicking inside child button delivers ButtonPress targeting child_wid
+        desktop.display_srv.send_pointer(gid, 30, 30, Some((1, true)));
+        let n = stream.read(&mut reply).unwrap();
+        let pressed_win = reply[..n]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .find(|e| e[0] == 4)
+            .map(|e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]));
+        assert_eq!(pressed_win, Some(child_wid));
     }
 }

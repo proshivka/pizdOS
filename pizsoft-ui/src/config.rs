@@ -83,6 +83,11 @@ pub fn load_config_from(path: &std::path::Path, settings: &mut SettingsState) ->
                     settings.ui_scale_pct = s;
                 }
             }
+            "res_idx" => {
+                if let Ok(r) = v.parse::<usize>() {
+                    settings.res_idx = r.min(crate::apps::SCREEN_RES_PRESETS.len() - 1);
+                }
+            }
             "show_clock" => settings.show_clock = v != "0",
             "best_snake" => {
                 if let Ok(b) = v.parse::<u32>() {
@@ -141,6 +146,7 @@ pub fn save_config_to(
          macos_buttons={}\n\
          glass_level={}\n\
          ui_scale_pct={}\n\
+         res_idx={}\n\
          show_clock={}\n\
          best_snake={best_snake}\n\
          sticky_note={escaped_note}\n",
@@ -159,6 +165,7 @@ pub fn save_config_to(
         b(settings.macos_buttons),
         settings.glass_level,
         settings.ui_scale_pct,
+        settings.res_idx,
         b(settings.show_clock),
     );
     let _ = fs::write(path, out);

@@ -30,6 +30,10 @@ pub struct GuestSurface {
 const ROOT_WIN: u32 = 0x0000_0100;
 const DEF_COLORMAP: u32 = 0x0000_0101;
 const ROOT_VISUAL: u32 = 0x0000_0020;
+const XGE_EXT_OPCODE: u8 = 130;
+const XINPUT_EXT_OPCODE: u8 = 131;
+const XINPUT_FIRST_EVENT: u8 = 66;
+const XINPUT_FIRST_ERROR: u8 = 129;
 
 #[inline]
 fn pad4(n: usize) -> usize {
@@ -159,6 +163,178 @@ fn draw_text_buf(buf: &mut [u32], (bw, bh): (i32, i32), x: i32, y: i32, text: &s
             }
         }
         cx += g.advance;
+    }
+}
+
+fn measure_text_advance(text: &str) -> i32 {
+    text.chars()
+        .map(|ch| font::rasterize_scaled_cached(ch, 1, 1.0).advance)
+        .sum()
+}
+
+fn stroke_rect_buf(
+    buf: &mut [u32],
+    (bw, bh): (i32, i32),
+    (x, y, w, h): (i32, i32, i32, i32),
+    lw: i32,
+    col: u32,
+) {
+    if w < 0 || h < 0 {
+        return;
+    }
+    let lw = lw.clamp(1, 8);
+    let rw = (w + 1).max(1);
+    let rh = (h + 1).max(1);
+    fill_rect_buf(buf, (bw, bh), x, y, rw, lw.min(rh), col);
+    fill_rect_buf(buf, (bw, bh), x, y + rh - lw.min(rh), rw, lw.min(rh), col);
+    fill_rect_buf(buf, (bw, bh), x, y, lw.min(rw), rh, col);
+    fill_rect_buf(buf, (bw, bh), x + rw - lw.min(rw), y, lw.min(rw), rh, col);
+}
+
+fn fill_poly_buf(buf: &mut [u32], (bw, bh): (i32, i32), pts: &[(i32, i32)], col: u32) {
+    if pts.len() < 3 || bw <= 0 || bh <= 0 {
+        return;
+    }
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    for &(_, py) in pts {
+        min_y = min_y.min(py);
+        max_y = max_y.max(py);
+    }
+    let y0 = min_y.max(0);
+    let y1 = max_y.min(bh - 1);
+    let c = col & 0x00FF_FFFF;
+    let mut xs = Vec::with_capacity(pts.len());
+    for sy in y0..=y1 {
+        xs.clear();
+        for i in 0..pts.len() {
+            let (x0, y_a) = pts[i];
+            let (x1, y_b) = pts[(i + 1) % pts.len()];
+            if (y_a <= sy && y_b > sy) || (y_b <= sy && y_a > sy) {
+                let t_num = (sy - y_a) as f32 / (y_b - y_a) as f32;
+                xs.push((x0 as f32 + t_num * (x1 - x0) as f32).round() as i32);
+            }
+        }
+        xs.sort_unstable();
+        for pair in xs.as_chunks::<2>().0 {
+            let sx0 = pair[0].max(0);
+            let sx1 = pair[1].min(bw - 1);
+            let row = (sy * bw) as usize;
+            for sx in sx0..=sx1 {
+                buf[row + sx as usize] = c;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_arc_buf(
+    buf: &mut [u32],
+    (bw, bh): (i32, i32),
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    a1_64: i16,
+    a2_64: i16,
+    lw: i32,
+    col: u32,
+    filled: bool,
+) {
+    if w <= 0 || h <= 0 || a2_64 == 0 {
+        return;
+    }
+    let rx = (w as f32) * 0.5;
+    let ry = (h as f32) * 0.5;
+    let cx = x as f32 + rx;
+    let cy = y as f32 + ry;
+    if filled && a2_64.unsigned_abs() >= 23000 {
+        let y0 = y.max(0);
+        let y1 = (y + h).min(bh - 1);
+        let c = col & 0x00FF_FFFF;
+        for py in y0..=y1 {
+            let dy = (py as f32 + 0.5) - cy;
+            let norm = dy / ry.max(0.5);
+            if norm.abs() <= 1.0 {
+                let dx = rx * (1.0 - norm * norm).max(0.0).sqrt();
+                let sx0 = (cx - dx).ceil().max(0.0) as i32;
+                let sx1 = (cx + dx).floor().min((bw - 1) as f32) as i32;
+                if sx0 <= sx1 {
+                    let row = (py * bw) as usize;
+                    for px in sx0..=sx1 {
+                        buf[row + px as usize] = c;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let steps = ((w + h) / 2).clamp(20, 96) as usize;
+    let start_rad = (a1_64 as f32 / 64.0).to_radians();
+    let sweep_rad = (a2_64 as f32 / 64.0).to_radians();
+    let mut pts = Vec::with_capacity(steps + 3);
+    if filled {
+        pts.push((cx.round() as i32, cy.round() as i32));
+    }
+    for i in 0..=steps {
+        let ang = start_rad + sweep_rad * (i as f32 / steps as f32);
+        let px = (cx + rx * ang.cos()).round() as i32;
+        let py = (cy - ry * ang.sin()).round() as i32;
+        pts.push((px, py));
+    }
+    if filled {
+        fill_poly_buf(buf, (bw, bh), &pts, col);
+    } else {
+        for i in 0..steps {
+            draw_line_buf(buf, (bw, bh), pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1, col);
+            if lw > 1 {
+                draw_line_buf(buf, (bw, bh), pts[i].0 + 1, pts[i].1, pts[i + 1].0 + 1, pts[i + 1].1, col);
+                draw_line_buf(buf, (bw, bh), pts[i].0, pts[i].1 + 1, pts[i + 1].0, pts[i + 1].1 + 1, col);
+            }
+        }
+    }
+}
+
+fn x11_keysym(kc: u8, shifted: bool) -> u32 {
+    match kc {
+        9 => 0xFF1B,  // Escape
+        22 => 0xFF08, // BackSpace
+        23 => 0xFF09, // Tab
+        36 => 0xFF0D, // Return
+        37 => 0xFFE3, // Control_L
+        50 => 0xFFE1, // Shift_L
+        64 => 0xFFE9, // Alt_L
+        65 => 0x0020, // space
+        66 => 0xFFE5, // Caps_Lock
+        67..=160 => {
+            let ch = (kc - 67) + 0x21;
+            if shifted && ch.is_ascii_lowercase() {
+                (ch - 32) as u32
+            } else {
+                ch as u32
+            }
+        }
+        161 => 0xFF51, // Left
+        162 => 0xFF52, // Up
+        163 => 0xFF53, // Right
+        164 => 0xFF54, // Down
+        165 => 0xFFFF, // Delete
+        166 => 0xFF50, // Home
+        167 => 0xFF57, // End
+        _ => 0,
+    }
+}
+
+fn char_to_x11_keycode(ch: Option<char>) -> u8 {
+    match ch {
+        None => 36,
+        Some('\n' | '\r') => 36,
+        Some('\x08') => 22,
+        Some('\t') => 23,
+        Some('\x1b') => 9,
+        Some(' ') => 65,
+        Some(c) if (0x21..=0x7E).contains(&(c as u32)) => ((c as u32 - 0x21) + 67) as u8,
+        Some(_) => 65,
     }
 }
 
@@ -469,7 +645,13 @@ struct XWin {
     y: i32,
     w: i32,
     h: i32,
+    border_width: i32,
     bg_pixel: u32,
+    border_pixel: u32,
+    has_bg: bool,
+    has_border: bool,
+    event_mask: u32,
+    z: u32,
     mapped: bool,
 }
 
@@ -510,7 +692,11 @@ struct X11Client {
     gcs: HashMap<u32, XGc>,
     atoms: HashMap<u32, String>,
     atom_names: HashMap<String, u32>,
+    props: HashMap<(u32, u32), (u32, u8, Vec<u8>)>,
     next_atom: u32,
+    next_z: u32,
+    xi_selected: bool,
+    xi_raw_motion: bool,
     dead: bool,
 }
 
@@ -530,6 +716,8 @@ impl X11Client {
             (69, "WM_DELETE_WINDOW"),
             (70, "UTF8_STRING"),
             (71, "_NET_WM_NAME"),
+            (72, "Abs X"),
+            (73, "Abs Y"),
         ];
         for (aid, name) in preset {
             atoms.insert(aid, String::from(name));
@@ -548,7 +736,11 @@ impl X11Client {
             gcs: HashMap::new(),
             atoms,
             atom_names,
+            props: HashMap::new(),
             next_atom: 100,
+            next_z: 1,
+            xi_selected: false,
+            xi_raw_motion: false,
             dead: false,
         }
     }
@@ -562,7 +754,7 @@ impl X11Client {
         }
     }
 
-    fn send_setup_reply(&mut self, rid_base: u32) {
+    fn send_setup_reply(&mut self, rid_base: u32, sw: u16, sh: u16) {
         let mut reply = [0u8; 8 + 132];
         reply[0] = 1; // Success
         w16(&mut reply[2..4], 11, self.msb);
@@ -600,10 +792,10 @@ impl X11Client {
         w32(&mut b[68..72], 0x00FF_FFFF, self.msb);
         w32(&mut b[72..76], 0x0000_0000, self.msb);
         w32(&mut b[76..80], 0, self.msb);
-        w16(&mut b[80..82], 1280, self.msb);
-        w16(&mut b[82..84], 800, self.msb);
-        w16(&mut b[84..86], 338, self.msb);
-        w16(&mut b[86..88], 211, self.msb);
+        w16(&mut b[80..82], sw.max(320), self.msb);
+        w16(&mut b[82..84], sh.max(240), self.msb);
+        w16(&mut b[84..86], (sw.max(320) as u32 * 254 / 960) as u16, self.msb);
+        w16(&mut b[86..88], (sh.max(240) as u32 * 254 / 960) as u16, self.msb);
         w16(&mut b[88..90], 1, self.msb);
         w16(&mut b[90..92], 1, self.msb);
         w32(&mut b[92..96], ROOT_VISUAL, self.msb);
@@ -654,7 +846,25 @@ impl X11Client {
         self.push_event(ev);
     }
 
-    fn send_pointer_ev(&mut self, wid: u32, x: i32, y: i32, btn: Option<(u8, bool)>) {
+    fn send_map_notify(&mut self, event_wid: u32, wid: u32) {
+        let mut ev = [0u8; 32];
+        ev[0] = 19; // MapNotify
+        w32(&mut ev[4..8], event_wid, self.msb);
+        w32(&mut ev[8..12], wid, self.msb);
+        self.push_event(ev);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_pointer_ev(
+        &mut self,
+        event_wid: u32,
+        child_wid: u32,
+        rx: i32,
+        ry: i32,
+        ex: i32,
+        ey: i32,
+        btn: Option<(u8, bool)>,
+    ) {
         let mut ev = [0u8; 32];
         match btn {
             Some((b, true)) => {
@@ -672,13 +882,56 @@ impl X11Client {
         }
         w32(&mut ev[4..8], 1, self.msb); // time
         w32(&mut ev[8..12], ROOT_WIN, self.msb);
-        w32(&mut ev[12..16], wid, self.msb);
-        w16(&mut ev[20..22], x as i16 as u16, self.msb);
-        w16(&mut ev[22..24], y as i16 as u16, self.msb);
-        w16(&mut ev[24..26], x as i16 as u16, self.msb);
-        w16(&mut ev[26..28], y as i16 as u16, self.msb);
+        w32(&mut ev[12..16], event_wid, self.msb);
+        w32(&mut ev[16..20], child_wid, self.msb);
+        w16(&mut ev[20..22], rx as i16 as u16, self.msb);
+        w16(&mut ev[22..24], ry as i16 as u16, self.msb);
+        w16(&mut ev[24..26], ex as i16 as u16, self.msb);
+        w16(&mut ev[26..28], ey as i16 as u16, self.msb);
         ev[30] = 1; // same-screen
         self.push_event(ev);
+    }
+
+    fn send_xi_raw_motion(&mut self, rx: i32, ry: i32) {
+        // GenericEvent (35): XI_RawMotion (evtype 17), 32-byte header + 4-byte mask + 32-byte FP3232 axes = 68 bytes (len = 9)
+        let mut ev = [0u8; 68];
+        ev[0] = 35;
+        ev[1] = XINPUT_EXT_OPCODE;
+        w16(&mut ev[2..4], self.seq, self.msb);
+        w32(&mut ev[4..8], 9, self.msb);
+        w16(&mut ev[8..10], 17, self.msb); // XI_RawMotion
+        w16(&mut ev[10..12], 2, self.msb); // deviceid = 2
+        w32(&mut ev[12..16], 1, self.msb); // time
+        w16(&mut ev[18..20], 2, self.msb); // sourceid = 2
+        w16(&mut ev[20..22], 1, self.msb); // valuators_len = 1 (4 bytes)
+        w32(&mut ev[32..36], 0x03, self.msb); // axis 0 & 1 mask
+        // FP3232: integral (i32) + frac (u32) -> axes[0]=rx, axes[1]=ry, unaccel[0]=rx, unaccel[1]=ry
+        w32(&mut ev[36..40], rx as u32, self.msb);
+        w32(&mut ev[44..48], ry as u32, self.msb);
+        w32(&mut ev[52..56], rx as u32, self.msb);
+        w32(&mut ev[60..64], ry as u32, self.msb);
+        self.tx.extend_from_slice(&ev);
+    }
+
+    fn send_xi_device_motion(&mut self, event_wid: u32, child_wid: u32, rx: i32, ry: i32, ex: i32, ey: i32) {
+        // GenericEvent (35): XI_Motion (evtype 6), 80 bytes total -> length = 12
+        let mut ev = [0u8; 80];
+        ev[0] = 35;
+        ev[1] = XINPUT_EXT_OPCODE;
+        w16(&mut ev[2..4], self.seq, self.msb);
+        w32(&mut ev[4..8], 12, self.msb);
+        w16(&mut ev[8..10], 6, self.msb); // XI_Motion
+        w16(&mut ev[10..12], 2, self.msb); // deviceid = 2
+        w32(&mut ev[12..16], 1, self.msb); // time
+        w16(&mut ev[18..20], 2, self.msb); // sourceid = 2
+        w32(&mut ev[20..24], ROOT_WIN, self.msb);
+        w32(&mut ev[24..28], event_wid, self.msb);
+        w32(&mut ev[28..32], child_wid, self.msb);
+        w32(&mut ev[32..36], (rx << 16) as u32, self.msb);
+        w32(&mut ev[36..40], (ry << 16) as u32, self.msb);
+        w32(&mut ev[40..44], (ex << 16) as u32, self.msb);
+        w32(&mut ev[44..48], (ey << 16) as u32, self.msb);
+        self.tx.extend_from_slice(&ev);
     }
 
     fn send_key_ev(&mut self, wid: u32, keycode: u8, pressed: bool) {
@@ -706,19 +959,131 @@ impl X11Client {
     fn find_root_gid(&self, mut wid: u32) -> Option<(u32, i32, i32)> {
         let mut ox = 0i32;
         let mut oy = 0i32;
-        for _ in 0..8 {
+        for _ in 0..16 {
             let win = self.windows.get(&wid)?;
             if let Some(gid) = win.gid {
                 return Some((gid, ox, oy));
             }
-            ox += win.x;
-            oy += win.y;
+            ox += win.x + win.border_width;
+            oy += win.y + win.border_width;
             if win.parent == ROOT_WIN {
                 return None;
             }
             wid = win.parent;
         }
         None
+    }
+
+    fn sorted_children(&self, parent: u32) -> Vec<u32> {
+        let mut children: Vec<(u32, u32)> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.parent == parent)
+            .map(|(&id, w)| (w.z, id))
+            .collect();
+        children.sort_unstable_by_key(|&(z, id)| (z, id));
+        children.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn find_hit_window(&self, top_wid: u32, x: i32, y: i32) -> (u32, i32, i32) {
+        let mut cur = top_wid;
+        let mut lx = x;
+        let mut ly = y;
+        for _ in 0..12 {
+            let mut next_hit = None;
+            for cid in self.sorted_children(cur).into_iter().rev() {
+                if let Some(cw) = self.windows.get(&cid)
+                    && cw.mapped
+                    && lx >= cw.x
+                    && lx < cw.x + cw.w + cw.border_width * 2
+                    && ly >= cw.y
+                    && ly < cw.y + cw.h + cw.border_width * 2
+                {
+                    next_hit = Some((
+                        cid,
+                        lx - (cw.x + cw.border_width),
+                        ly - (cw.y + cw.border_width),
+                    ));
+                    break;
+                }
+            }
+            if let Some((nid, nx, ny)) = next_hit {
+                cur = nid;
+                lx = nx;
+                ly = ny;
+            } else {
+                break;
+            }
+        }
+        (cur, lx, ly)
+    }
+
+    fn paint_win_on_surface(&self, surfaces: &mut HashMap<u32, GuestSurface>, wid: u32) {
+        let Some(win) = self.windows.get(&wid) else {
+            return;
+        };
+        let Some((gid, ox, oy)) = self.find_root_gid(wid) else {
+            return;
+        };
+        let Some(surf) = surfaces.get_mut(&gid) else {
+            return;
+        };
+        let bw = win.border_width;
+        if win.has_border && bw > 0 && win.gid.is_none() {
+            stroke_rect_buf(
+                &mut surf.pixels,
+                (surf.w, surf.h),
+                (ox - bw, oy - bw, win.w + bw * 2 - 1, win.h + bw * 2 - 1),
+                bw,
+                win.border_pixel,
+            );
+        }
+        if win.has_bg {
+            fill_rect_buf(
+                &mut surf.pixels,
+                (surf.w, surf.h),
+                ox,
+                oy,
+                win.w,
+                win.h,
+                win.bg_pixel,
+            );
+        }
+    }
+
+    fn map_and_expose_tree(
+        &mut self,
+        surfaces: &mut HashMap<u32, GuestSurface>,
+        wid: u32,
+        include_children: bool,
+    ) {
+        let mut queue = Vec::new();
+        if include_children {
+            for cid in self.sorted_children(wid) {
+                queue.push(cid);
+            }
+        } else {
+            queue.push(wid);
+        }
+        let mut idx = 0;
+        while idx < queue.len() {
+            let cur = queue[idx];
+            idx += 1;
+            let (parent, w, h) = if let Some(cw) = self.windows.get_mut(&cur) {
+                cw.mapped = true;
+                (cw.parent, cw.w, cw.h)
+            } else {
+                continue;
+            };
+            self.paint_win_on_surface(surfaces, cur);
+            self.send_map_notify(parent, cur);
+            self.send_expose(cur, w, h);
+            for gc in self.sorted_children(cur) {
+                if self.windows.get(&gc).is_some_and(|w| w.mapped) {
+                    queue.push(gc);
+                }
+            }
+        }
     }
 }
 
@@ -833,6 +1198,12 @@ pub struct DisplayServer {
     #[cfg(target_os = "linux")]
     wl_clients: Vec<WaylandClient>,
     pub surfaces: HashMap<u32, GuestSurface>,
+    surf_origins: HashMap<u32, (i32, i32)>,
+    selections: HashMap<u32, u32>,
+    screen_w: u16,
+    screen_h: u16,
+    ptr_x: i32,
+    ptr_y: i32,
     next_gid: u32,
     next_cid: u32,
 }
@@ -852,6 +1223,12 @@ impl DisplayServer {
             #[cfg(target_os = "linux")]
             wl_clients: Vec::new(),
             surfaces: HashMap::new(),
+            surf_origins: HashMap::new(),
+            selections: HashMap::new(),
+            screen_w: 800,
+            screen_h: 600,
+            ptr_x: 400,
+            ptr_y: 300,
             next_gid: 1,
             next_cid: 1,
         }
@@ -875,6 +1252,12 @@ impl DisplayServer {
             #[cfg(target_os = "linux")]
             wl_clients: Vec::new(),
             surfaces: HashMap::new(),
+            surf_origins: HashMap::new(),
+            selections: HashMap::new(),
+            screen_w: 800,
+            screen_h: 600,
+            ptr_x: 400,
+            ptr_y: 300,
             next_gid: 1,
             next_cid: 1,
         })
@@ -917,8 +1300,46 @@ impl DisplayServer {
             #[cfg(target_os = "linux")]
             wl_clients: Vec::new(),
             surfaces: HashMap::new(),
+            surf_origins: HashMap::new(),
+            selections: HashMap::new(),
+            screen_w: 800,
+            screen_h: 600,
+            ptr_x: 400,
+            ptr_y: 300,
             next_gid: 1,
             next_cid: 1,
+        }
+    }
+
+    pub fn set_screen_size(&mut self, w: i32, h: i32) {
+        self.screen_w = w.clamp(320, 4096) as u16;
+        self.screen_h = h.clamp(240, 4096) as u16;
+    }
+
+    pub fn set_surface_origin(&mut self, gid: u32, sx: i32, sy: i32) {
+        self.surf_origins.insert(gid, (sx, sy));
+    }
+
+    pub fn set_global_pointer(&mut self, x: i32, y: i32) {
+        if self.ptr_x == x && self.ptr_y == y {
+            return;
+        }
+        self.ptr_x = x;
+        self.ptr_y = y;
+        for c in &mut self.x11_clients {
+            if c.xi_selected {
+                if c.xi_raw_motion {
+                    c.send_xi_raw_motion(x, y);
+                }
+                if let Some((&top_wid, tw)) = c.windows.iter().find(|(_, w)| w.gid.is_some() && w.mapped) {
+                    let (sox, soy) = tw
+                        .gid
+                        .and_then(|g| self.surf_origins.get(&g).copied())
+                        .unwrap_or((0, 0));
+                    c.send_xi_device_motion(top_wid, 0, x, y, x - sox, y - soy);
+                }
+                c.flush_tx();
+            }
         }
     }
 
@@ -1055,7 +1476,7 @@ impl DisplayServer {
             c.rx.drain(0..total);
             c.authed = true;
             let base = (c.id & 0xFF) << 21 | 0x0040_0000;
-            c.send_setup_reply(base);
+            c.send_setup_reply(base, self.screen_w, self.screen_h);
         }
 
         while c.rx.len() >= 4 {
@@ -1094,13 +1515,34 @@ impl DisplayServer {
                 let parent = r32(&pkt[8..12], msb);
                 let x = r16(&pkt[12..14], msb) as i16 as i32;
                 let y = r16(&pkt[14..16], msb) as i16 as i32;
-                let w = (r16(&pkt[16..18], msb) as i32).clamp(64, 1600);
-                let h = (r16(&pkt[18..20], msb) as i32).clamp(48, 1000);
+                let raw_w = (r16(&pkt[16..18], msb) as i32).max(1);
+                let raw_h = (r16(&pkt[18..20], msb) as i32).max(1);
+                let (w, h) = if parent == ROOT_WIN {
+                    (raw_w.clamp(64, 1600), raw_h.clamp(48, 1200))
+                } else {
+                    (raw_w.min(1600), raw_h.min(1200))
+                };
+                let border_width = (r16(&pkt[20..22], msb) as i32).clamp(0, 16);
                 let mask = r32(&pkt[28..32], msb);
-                let mut bg = 0x000D_1117u32;
-                if (mask & 0x02) != 0 && (mask & 0x01) == 0 && pkt.len() >= 36 {
-                    bg = r32(&pkt[32..36], msb);
-                }
+                let z = c.next_z;
+                c.next_z += 1;
+                let mut xwin = XWin {
+                    parent,
+                    gid: None,
+                    x,
+                    y,
+                    w,
+                    h,
+                    border_width,
+                    bg_pixel: if parent == ROOT_WIN { 0x000D_1117 } else { 0x00F0_F0F0 },
+                    border_pixel: 0x0000_0000,
+                    has_bg: parent == ROOT_WIN,
+                    has_border: false,
+                    event_mask: 0,
+                    z,
+                    mapped: false,
+                };
+                parse_win_attrs(&mut xwin, mask, &pkt[32..], msb);
                 let gid = if parent == ROOT_WIN {
                     let g = self.next_gid;
                     self.next_gid += 1;
@@ -1112,7 +1554,7 @@ impl DisplayServer {
                             title: format!("X11 App #{g}"),
                             w,
                             h,
-                            pixels: vec![bg & 0x00FF_FFFF; (w * h) as usize],
+                            pixels: vec![xwin.bg_pixel & 0x00FF_FFFF; (w * h) as usize],
                             mapped: false,
                             client_id: c.id,
                             proto_obj_id: wid,
@@ -1122,24 +1564,32 @@ impl DisplayServer {
                 } else {
                     None
                 };
-                c.windows.insert(
-                    wid,
-                    XWin {
-                        parent,
-                        gid,
-                        x,
-                        y,
-                        w,
-                        h,
-                        bg_pixel: bg,
-                        mapped: false,
-                    },
-                );
+                xwin.gid = gid;
+                c.windows.insert(wid, xwin);
+            }
+            2 if pkt.len() >= 12 => {
+                // ChangeWindowAttributes
+                let wid = r32(&pkt[4..8], msb);
+                let mask = r32(&pkt[8..12], msb);
+                let mut repaint = false;
+                if let Some(win) = c.windows.get_mut(&wid) {
+                    let old_bg = win.bg_pixel;
+                    let old_has = win.has_bg;
+                    parse_win_attrs(win, mask, &pkt[12..], msb);
+                    repaint = (win.bg_pixel != old_bg || win.has_bg != old_has) && win.has_bg;
+                }
+                if repaint {
+                    c.paint_win_on_surface(&mut self.surfaces, wid);
+                }
             }
             3 if pkt.len() >= 8 => {
                 // GetWindowAttributes
                 let wid = r32(&pkt[4..8], msb);
-                let mapped = c.windows.get(&wid).is_some_and(|w| w.mapped);
+                let (mapped, ev_mask) = c
+                    .windows
+                    .get(&wid)
+                    .map(|w| (w.mapped, w.event_mask))
+                    .unwrap_or((wid == ROOT_WIN, 0));
                 let mut rep = [0u8; 44];
                 rep[0] = 1;
                 rep[1] = 2; // BackingStore NotUseful
@@ -1149,6 +1599,8 @@ impl DisplayServer {
                 w16(&mut rep[12..14], 1, msb); // InputOutput
                 rep[26] = if mapped { 2 } else { 0 };
                 w32(&mut rep[28..32], DEF_COLORMAP, msb);
+                w32(&mut rep[36..40], ev_mask, msb);
+                w32(&mut rep[40..44], ev_mask, msb);
                 c.tx.extend_from_slice(&rep);
             }
             4 if pkt.len() >= 8 => {
@@ -1161,15 +1613,26 @@ impl DisplayServer {
                     unmapped.push(gid);
                 }
             }
+            7 if pkt.len() >= 16 => {
+                // ReparentWindow
+                let wid = r32(&pkt[4..8], msb);
+                let new_parent = r32(&pkt[8..12], msb);
+                let nx = r16(&pkt[12..14], msb) as i16 as i32;
+                let ny = r16(&pkt[14..16], msb) as i16 as i32;
+                if let Some(w) = c.windows.get_mut(&wid) {
+                    w.parent = new_parent;
+                    w.x = nx;
+                    w.y = ny;
+                }
+            }
             8 if pkt.len() >= 8 => {
                 // MapWindow
                 let wid = r32(&pkt[4..8], msb);
-                let mut dims = None;
-                if let Some(win) = c.windows.get_mut(&wid) {
+                let info = c.windows.get_mut(&wid).map(|win| {
                     win.mapped = true;
-                    dims = Some((win.gid, win.w, win.h));
-                }
-                if let Some((gid_opt, w, h)) = dims {
+                    (win.gid, win.parent, win.w, win.h)
+                });
+                if let Some((gid_opt, parent, w, h)) = info {
                     if let Some(gid) = gid_opt
                         && let Some(surf) = self.surfaces.get_mut(&gid)
                         && !surf.mapped
@@ -1177,8 +1640,30 @@ impl DisplayServer {
                         surf.mapped = true;
                         newly_mapped.push(gid);
                     }
+                    c.paint_win_on_surface(&mut self.surfaces, wid);
+                    c.send_map_notify(parent, wid);
                     c.send_expose(wid, w, h);
+                    // Expose any already-mapped children (e.g., created & mapped before parent)
+                    let mut child_queue = c.sorted_children(wid);
+                    let mut ci = 0;
+                    while ci < child_queue.len() {
+                        let cid = child_queue[ci];
+                        ci += 1;
+                        if let Some(cw) = c.windows.get(&cid)
+                            && cw.mapped
+                        {
+                            let (cw_w, cw_h) = (cw.w, cw.h);
+                            c.paint_win_on_surface(&mut self.surfaces, cid);
+                            c.send_expose(cid, cw_w, cw_h);
+                            child_queue.extend(c.sorted_children(cid));
+                        }
+                    }
                 }
+            }
+            9 if pkt.len() >= 8 => {
+                // MapSubwindows
+                let parent = r32(&pkt[4..8], msb);
+                c.map_and_expose_tree(&mut self.surfaces, parent, true);
             }
             10 if pkt.len() >= 8 => {
                 // UnmapWindow
@@ -1194,17 +1679,103 @@ impl DisplayServer {
                     }
                 }
             }
+            11 if pkt.len() >= 8 => {
+                // UnmapSubwindows
+                let parent = r32(&pkt[4..8], msb);
+                for cid in c.sorted_children(parent) {
+                    if let Some(cw) = c.windows.get_mut(&cid) {
+                        cw.mapped = false;
+                    }
+                }
+            }
+            12 if pkt.len() >= 12 => {
+                // ConfigureWindow
+                let wid = r32(&pkt[4..8], msb);
+                let mask = r16(&pkt[8..10], msb);
+                let vals = &pkt[12..];
+                let mut off = 0usize;
+                let mut cfg = c.windows.get(&wid).map(|w| (w.x, w.y, w.w, w.h, w.border_width, w.gid, w.parent, w.bg_pixel));
+                if let Some((mut nx, mut ny, mut nw, mut nh, mut nbw, gid_opt, parent, bg)) = cfg {
+                    let mut stack_mode = None;
+                    for bit in 0..7u16 {
+                        if (mask & (1 << bit)) != 0 {
+                            if off + 4 > vals.len() {
+                                break;
+                            }
+                            let v = r32(&vals[off..off + 4], msb);
+                            match bit {
+                                0 => nx = v as i16 as i32,
+                                1 => ny = v as i16 as i32,
+                                2 => {
+                                    nw = (v as i32).max(1);
+                                    if parent == ROOT_WIN {
+                                        nw = nw.clamp(64, 1600);
+                                    } else {
+                                        nw = nw.min(1600);
+                                    }
+                                }
+                                3 => {
+                                    nh = (v as i32).max(1);
+                                    if parent == ROOT_WIN {
+                                        nh = nh.clamp(48, 1200);
+                                    } else {
+                                        nh = nh.min(1200);
+                                    }
+                                }
+                                4 => nbw = (v as i32).clamp(0, 16),
+                                6 => stack_mode = Some(v),
+                                _ => {}
+                            }
+                            off += 4;
+                        }
+                    }
+                    let new_z = if let Some(sm) = stack_mode {
+                        if sm == 0 {
+                            let z = c.next_z;
+                            c.next_z += 1;
+                            Some(z)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(win) = c.windows.get_mut(&wid) {
+                        let size_changed = win.w != nw || win.h != nh;
+                        win.x = nx;
+                        win.y = ny;
+                        win.w = nw;
+                        win.h = nh;
+                        win.border_width = nbw;
+                        if let Some(z) = new_z {
+                            win.z = z;
+                        }
+                        if size_changed
+                            && let Some(gid) = gid_opt
+                            && let Some(surf) = self.surfaces.get_mut(&gid)
+                        {
+                            surf.w = nw;
+                            surf.h = nh;
+                            surf.pixels.resize((nw * nh) as usize, bg & 0x00FF_FFFF);
+                        }
+                        cfg = Some((nx, ny, nw, nh, nbw, gid_opt, parent, bg));
+                    }
+                    if let Some((nx, ny, nw, nh, _, _, _, _)) = cfg {
+                        c.send_configure_notify(wid, nx, ny, nw, nh);
+                    }
+                }
+            }
             14 if pkt.len() >= 8 => {
                 // GetGeometry
                 let did = r32(&pkt[4..8], msb);
-                let (x, y, w, h) = if did == ROOT_WIN {
-                    (0, 0, 1280, 800)
+                let (x, y, w, h, bw) = if did == ROOT_WIN {
+                    (0, 0, self.screen_w as i32, self.screen_h as i32, 0)
                 } else if let Some(win) = c.windows.get(&did) {
-                    (win.x, win.y, win.w, win.h)
+                    (win.x, win.y, win.w, win.h, win.border_width)
                 } else if let Some(pm) = c.pixmaps.get(&did) {
-                    (0, 0, pm.w, pm.h)
+                    (0, 0, pm.w, pm.h, 0)
                 } else {
-                    (0, 0, 320, 240)
+                    (0, 0, 320, 240, 0)
                 };
                 let mut rep = [0u8; 32];
                 rep[0] = 1;
@@ -1215,15 +1786,28 @@ impl DisplayServer {
                 w16(&mut rep[14..16], y as i16 as u16, msb);
                 w16(&mut rep[16..18], w as u16, msb);
                 w16(&mut rep[18..20], h as u16, msb);
+                w16(&mut rep[20..22], bw as u16, msb);
                 c.tx.extend_from_slice(&rep);
             }
             15 if pkt.len() >= 8 => {
                 // QueryTree
-                let mut rep = [0u8; 32];
+                let wid = r32(&pkt[4..8], msb);
+                let parent = if wid == ROOT_WIN {
+                    0
+                } else {
+                    c.windows.get(&wid).map(|w| w.parent).unwrap_or(ROOT_WIN)
+                };
+                let children = c.sorted_children(wid);
+                let mut rep = vec![0u8; 32 + children.len() * 4];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], children.len() as u32, msb);
                 w32(&mut rep[8..12], ROOT_WIN, msb);
-                w32(&mut rep[12..16], ROOT_WIN, msb);
+                w32(&mut rep[12..16], parent, msb);
+                w16(&mut rep[16..18], children.len() as u16, msb);
+                for (i, cid) in children.iter().enumerate() {
+                    w32(&mut rep[32 + i * 4..36 + i * 4], *cid, msb);
+                }
                 c.tx.extend_from_slice(&rep);
             }
             16 if pkt.len() >= 8 => {
@@ -1267,29 +1851,188 @@ impl DisplayServer {
                 c.tx.extend_from_slice(&rep);
             }
             18 if pkt.len() >= 24 => {
-                // ChangeProperty (WM_NAME / _NET_WM_NAME updates title)
+                // ChangeProperty
+                let mode = detail; // 0=Replace, 1=Prepend, 2=Append
                 let wid = r32(&pkt[4..8], msb);
                 let prop = r32(&pkt[8..12], msb);
+                let typ = r32(&pkt[12..16], msb);
                 let format = pkt[16];
                 let dlen = r32(&pkt[20..24], msb) as usize;
-                let is_title = matches!(c.atoms.get(&prop).map(|s| s.as_str()), Some("WM_NAME" | "_NET_WM_NAME"));
-                if is_title && format == 8 && 24 + dlen <= pkt.len() {
-                    let title = String::from_utf8_lossy(&pkt[24..24 + dlen])
-                        .trim_matches('\0')
-                        .to_string();
-                    if !title.is_empty()
-                        && let Some((gid, _, _)) = c.find_root_gid(wid)
-                        && let Some(surf) = self.surfaces.get_mut(&gid)
+                let unit_bytes = match format {
+                    16 => 2usize,
+                    32 => 4usize,
+                    _ => 1usize,
+                };
+                let byte_len = dlen.saturating_mul(unit_bytes);
+                if 24 + byte_len <= pkt.len() {
+                    let data = pkt[24..24 + byte_len].to_vec();
+                    let entry = c.props.entry((wid, prop)).or_insert((typ, format, Vec::new()));
+                    match mode {
+                        1 => {
+                            let mut merged = data;
+                            merged.extend_from_slice(&entry.2);
+                            *entry = (typ, format, merged);
+                        }
+                        2 => {
+                            entry.0 = typ;
+                            entry.1 = format;
+                            entry.2.extend_from_slice(&data);
+                        }
+                        _ => {
+                            *entry = (typ, format, data);
+                        }
+                    }
+                    let is_title = matches!(c.atoms.get(&prop).map(|s| s.as_str()), Some("WM_NAME" | "_NET_WM_NAME"));
+                    if is_title
+                        && format == 8
+                        && let Some((_, _, raw)) = c.props.get(&(wid, prop))
                     {
-                        surf.title = title;
+                        let title = String::from_utf8_lossy(raw).trim_matches('\0').to_string();
+                        if !title.is_empty()
+                            && let Some((gid, _, _)) = c.find_root_gid(wid)
+                            && let Some(surf) = self.surfaces.get_mut(&gid)
+                        {
+                            surf.title = title;
+                        }
                     }
                 }
             }
-            20 => {
-                // GetProperty -> None
-                let mut rep = [0u8; 32];
+            19 if pkt.len() >= 12 => {
+                // DeleteProperty
+                let wid = r32(&pkt[4..8], msb);
+                let prop = r32(&pkt[8..12], msb);
+                c.props.remove(&(wid, prop));
+            }
+            20 if pkt.len() >= 24 => {
+                // GetProperty
+                let del = detail != 0;
+                let wid = r32(&pkt[4..8], msb);
+                let prop = r32(&pkt[8..12], msb);
+                let off_bytes = (r32(&pkt[16..20], msb) as usize).saturating_mul(4);
+                let max_bytes = (r32(&pkt[20..24], msb) as usize).saturating_mul(4);
+                if let Some((typ, format, data)) = c.props.get(&(wid, prop)).cloned() {
+                    let start = off_bytes.min(data.len());
+                    let take = (data.len() - start).min(max_bytes);
+                    let slice = &data[start..start + take];
+                    let bytes_after = (data.len() - start - take) as u32;
+                    let words = pad4(slice.len()) / 4;
+                    let unit_div = match format {
+                        16 => 2,
+                        32 => 4,
+                        _ => 1,
+                    };
+                    let mut rep = vec![0u8; 32 + words * 4];
+                    rep[0] = 1;
+                    rep[1] = format;
+                    w16(&mut rep[2..4], c.seq, msb);
+                    w32(&mut rep[4..8], words as u32, msb);
+                    w32(&mut rep[8..12], typ, msb);
+                    w32(&mut rep[12..16], bytes_after, msb);
+                    w32(&mut rep[16..20], (slice.len() / unit_div) as u32, msb);
+                    rep[32..32 + slice.len()].copy_from_slice(slice);
+                    c.tx.extend_from_slice(&rep);
+                    if del && bytes_after == 0 {
+                        c.props.remove(&(wid, prop));
+                    }
+                } else {
+                    let mut rep = [0u8; 32];
+                    rep[0] = 1;
+                    w16(&mut rep[2..4], c.seq, msb);
+                    c.tx.extend_from_slice(&rep);
+                }
+            }
+            21 if pkt.len() >= 8 => {
+                // ListProperties
+                let wid = r32(&pkt[4..8], msb);
+                let atoms: Vec<u32> = c
+                    .props
+                    .keys()
+                    .filter(|(w, _)| *w == wid)
+                    .map(|(_, a)| *a)
+                    .collect();
+                let mut rep = vec![0u8; 32 + atoms.len() * 4];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], atoms.len() as u32, msb);
+                w16(&mut rep[8..10], atoms.len() as u16, msb);
+                for (i, a) in atoms.iter().enumerate() {
+                    w32(&mut rep[32 + i * 4..36 + i * 4], *a, msb);
+                }
+                c.tx.extend_from_slice(&rep);
+            }
+            22 if pkt.len() >= 16 => {
+                // SetSelectionOwner
+                let owner = r32(&pkt[4..8], msb);
+                let selection = r32(&pkt[8..12], msb);
+                if owner == 0 {
+                    self.selections.remove(&selection);
+                } else {
+                    self.selections.insert(selection, owner);
+                }
+            }
+            24 if pkt.len() >= 24 => {
+                // ConvertSelection -> SelectionNotify
+                let requestor = r32(&pkt[4..8], msb);
+                let selection = r32(&pkt[8..12], msb);
+                let target = r32(&pkt[12..16], msb);
+                let prop = r32(&pkt[16..20], msb);
+                let time = r32(&pkt[20..24], msb);
+                let mut ev = [0u8; 32];
+                ev[0] = 31; // SelectionNotify
+                w32(&mut ev[4..8], time, msb);
+                w32(&mut ev[8..12], requestor, msb);
+                w32(&mut ev[12..16], selection, msb);
+                w32(&mut ev[16..20], target, msb);
+                w32(&mut ev[20..24], prop, msb);
+                c.push_event(ev);
+            }
+            26 | 31 => {
+                // GrabPointer (26) / GrabKeyboard (31) -> Success (0)
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                rep[1] = 0; // Success
+                w16(&mut rep[2..4], c.seq, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            38 if pkt.len() >= 8 => {
+                // QueryPointer
+                let wid = r32(&pkt[4..8], msb);
+                let (wx, wy) = if let Some((gid, ox, oy)) = c.find_root_gid(wid) {
+                    let (sox, soy) = self.surf_origins.get(&gid).copied().unwrap_or((0, 0));
+                    (self.ptr_x - sox - ox, self.ptr_y - soy - oy)
+                } else {
+                    (self.ptr_x, self.ptr_y)
+                };
+                let (child, _, _) = c.find_hit_window(wid, wx, wy);
+                let child = if child == wid { 0 } else { child };
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                rep[1] = 1; // same_screen = true
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[8..12], ROOT_WIN, msb);
+                w32(&mut rep[12..16], child, msb);
+                w16(&mut rep[16..18], self.ptr_x as i16 as u16, msb);
+                w16(&mut rep[18..20], self.ptr_y as i16 as u16, msb);
+                w16(&mut rep[20..22], wx as i16 as u16, msb);
+                w16(&mut rep[22..24], wy as i16 as u16, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            40 if pkt.len() >= 16 => {
+                // TranslateCoordinates
+                let src_wid = r32(&pkt[4..8], msb);
+                let dst_wid = r32(&pkt[8..12], msb);
+                let sx = r16(&pkt[12..14], msb) as i16 as i32;
+                let sy = r16(&pkt[14..16], msb) as i16 as i32;
+                let (sox, soy) = c.find_root_gid(src_wid).map(|(_, ox, oy)| (ox, oy)).unwrap_or((0, 0));
+                let (dox, doy) = c.find_root_gid(dst_wid).map(|(_, ox, oy)| (ox, oy)).unwrap_or((0, 0));
+                let dx = sox + sx - dox;
+                let dy = soy + sy - doy;
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                rep[1] = 1; // same_screen
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[12..14], dx as i16 as u16, msb);
+                w16(&mut rep[14..16], dy as i16 as u16, msb);
                 c.tx.extend_from_slice(&rep);
             }
             43 => {
@@ -1345,17 +2088,24 @@ impl DisplayServer {
                 let y = r16(&pkt[10..12], msb) as i16 as i32;
                 let w = r16(&pkt[12..14], msb) as i32;
                 let h = r16(&pkt[14..16], msb) as i32;
-                let bg = c.windows.get(&wid).map(|win| win.bg_pixel).unwrap_or(0x000D_1117);
+                let (bg, ww, wh) = c
+                    .windows
+                    .get(&wid)
+                    .map(|win| (win.bg_pixel, win.w, win.h))
+                    .unwrap_or((0x000D_1117, 320, 240));
+                let rw = if w == 0 { (ww - x).max(0) } else { w };
+                let rh = if h == 0 { (wh - y).max(0) } else { h };
                 if let Some((gid, ox, oy)) = c.find_root_gid(wid)
                     && let Some(surf) = self.surfaces.get_mut(&gid)
                 {
-                    let rw = if w == 0 { surf.w } else { w };
-                    let rh = if h == 0 { surf.h } else { h };
                     fill_rect_buf(&mut surf.pixels, (surf.w, surf.h), ox + x, oy + y, rw, rh, bg);
+                }
+                if detail != 0 && rw > 0 && rh > 0 {
+                    c.send_expose(wid, rw, rh);
                 }
             }
             62 if pkt.len() >= 28 => {
-                // CopyArea
+                // CopyArea (Window/Pixmap -> Window/Pixmap)
                 let src_id = r32(&pkt[4..8], msb);
                 let dst_id = r32(&pkt[8..12], msb);
                 let sx = r16(&pkt[16..18], msb) as i16 as i32;
@@ -1365,41 +2115,59 @@ impl DisplayServer {
                 let cw = r16(&pkt[24..26], msb) as i32;
                 let ch = r16(&pkt[26..28], msb) as i32;
                 let copied = if let Some(pm) = c.pixmaps.get(&src_id) {
-                    Some((pm.w, pm.h, pm.pixels.clone()))
-                } else if let Some((gid, ox, oy)) = c.find_root_gid(src_id)
+                    Some((pm.w, pm.h, 0, 0, pm.pixels.clone()))
+                } else if let Some((gid, sox, soy)) = c.find_root_gid(src_id)
                     && let Some(surf) = self.surfaces.get(&gid)
                 {
-                    let _ = (ox, oy);
-                    Some((surf.w, surf.h, surf.pixels.clone()))
+                    Some((surf.w, surf.h, sox, soy, surf.pixels.clone()))
                 } else {
                     None
                 };
-                if let Some((sw, sh, spx)) = copied
-                    && let Some((dgid, dox, doy)) = c.find_root_gid(dst_id)
-                    && let Some(dsurf) = self.surfaces.get_mut(&dgid)
-                {
-                    for row in 0..ch {
-                        let syy = sy + row;
-                        let dyy = doy + dy + row;
-                        if syy < 0 || syy >= sh || dyy < 0 || dyy >= dsurf.h {
-                            continue;
-                        }
-                        for col in 0..cw {
-                            let sxx = sx + col;
-                            let dxx = dox + dx + col;
-                            if sxx >= 0 && sxx < sw && dxx >= 0 && dxx < dsurf.w {
-                                dsurf.pixels[(dyy * dsurf.w + dxx) as usize] =
-                                    spx[(syy * sw + sxx) as usize];
+                if let Some((sw, sh, sox, soy, spx)) = copied {
+                    let mut tw = 0;
+                    let mut th = 0;
+                    let mut dox = 0;
+                    let mut doy = 0;
+                    let mut target: Option<&mut [u32]> = None;
+                    if let Some((dgid, gx, gy)) = c.find_root_gid(dst_id)
+                        && let Some(dsurf) = self.surfaces.get_mut(&dgid)
+                    {
+                        tw = dsurf.w;
+                        th = dsurf.h;
+                        dox = gx;
+                        doy = gy;
+                        target = Some(&mut dsurf.pixels);
+                    } else if let Some(dpm) = c.pixmaps.get_mut(&dst_id) {
+                        tw = dpm.w;
+                        th = dpm.h;
+                        target = Some(&mut dpm.pixels);
+                    }
+                    if let Some(dst_px) = target {
+                        for row in 0..ch {
+                            let syy = soy + sy + row;
+                            let dyy = doy + dy + row;
+                            if syy < 0 || syy >= sh || dyy < 0 || dyy >= th {
+                                continue;
+                            }
+                            for col in 0..cw {
+                                let sxx = sox + sx + col;
+                                let dxx = dox + dx + col;
+                                if sxx >= 0 && sxx < sw && dxx >= 0 && dxx < tw {
+                                    dst_px[(dyy * tw + dxx) as usize] =
+                                        spx[(syy * sw + sxx) as usize];
+                                }
                             }
                         }
                     }
                 }
             }
-            65 | 66 | 70 if pkt.len() >= 12 => {
-                // PolyLine(65), PolySegment(66), PolyFillRectangle(70)
+            64..=71 if pkt.len() >= 12 => {
+                // PolyPoint(64), PolyLine(65), PolySegment(66), PolyRectangle(67),
+                // PolyArc(68), FillPoly(69), PolyFillRectangle(70), PolyFillArc(71)
                 let did = r32(&pkt[4..8], msb);
                 let gcid = r32(&pkt[8..12], msb);
-                let fg = c.gcs.get(&gcid).map(|g| g.fg).unwrap_or(0x00FF_FFFF);
+                let gc = c.gcs.get(&gcid).copied().unwrap_or_default();
+                let fg = gc.fg;
                 let data = &pkt[12..];
                 let mut target: Option<&mut [u32]> = None;
                 let mut tw = 0;
@@ -1421,6 +2189,24 @@ impl DisplayServer {
                 }
                 if let Some(buf) = target {
                     match op {
+                        64 => {
+                            let mut prev: Option<(i32, i32)> = None;
+                            for pt in data.as_chunks::<4>().0 {
+                                let px = r16(&pt[0..2], msb) as i16 as i32;
+                                let py = r16(&pt[2..4], msb) as i16 as i32;
+                                let cur = if detail == 1 {
+                                    if let Some((lx, ly)) = prev {
+                                        (lx + px, ly + py)
+                                    } else {
+                                        (ox + px, oy + py)
+                                    }
+                                } else {
+                                    (ox + px, oy + py)
+                                };
+                                put_px(buf, tw, th, cur.0, cur.1, fg);
+                                prev = Some(cur);
+                            }
+                        }
                         70 => {
                             for r in data.as_chunks::<8>().0 {
                                 let rx = r16(&r[0..2], msb) as i16 as i32;
@@ -1429,6 +2215,66 @@ impl DisplayServer {
                                 let rh = r16(&r[6..8], msb) as i32;
                                 fill_rect_buf(buf, (tw, th), ox + rx, oy + ry, rw, rh, fg);
                             }
+                        }
+                        67 => {
+                            for r in data.as_chunks::<8>().0 {
+                                let rx = r16(&r[0..2], msb) as i16 as i32;
+                                let ry = r16(&r[2..4], msb) as i16 as i32;
+                                let rw = r16(&r[4..6], msb) as i32;
+                                let rh = r16(&r[6..8], msb) as i32;
+                                stroke_rect_buf(
+                                    buf,
+                                    (tw, th),
+                                    (ox + rx, oy + ry, rw, rh),
+                                    gc.line_width,
+                                    fg,
+                                );
+                            }
+                        }
+                        68 | 71 => {
+                            let filled = op == 71;
+                            for a in data.as_chunks::<12>().0 {
+                                let ax = r16(&a[0..2], msb) as i16 as i32;
+                                let ay = r16(&a[2..4], msb) as i16 as i32;
+                                let aw = r16(&a[4..6], msb) as i32;
+                                let ah = r16(&a[6..8], msb) as i32;
+                                let a1 = r16(&a[8..10], msb) as i16;
+                                let a2 = r16(&a[10..12], msb) as i16;
+                                draw_arc_buf(
+                                    buf,
+                                    (tw, th),
+                                    ox + ax,
+                                    oy + ay,
+                                    aw,
+                                    ah,
+                                    a1,
+                                    a2,
+                                    gc.line_width,
+                                    fg,
+                                    filled,
+                                );
+                            }
+                        }
+                        69 if data.len() >= 4 => {
+                            let coord_mode = data[1];
+                            let mut pts = Vec::new();
+                            let mut prev: Option<(i32, i32)> = None;
+                            for pt in data[4..].as_chunks::<4>().0 {
+                                let px = r16(&pt[0..2], msb) as i16 as i32;
+                                let py = r16(&pt[2..4], msb) as i16 as i32;
+                                let cur = if coord_mode == 1 {
+                                    if let Some((lx, ly)) = prev {
+                                        (lx + px, ly + py)
+                                    } else {
+                                        (ox + px, oy + py)
+                                    }
+                                } else {
+                                    (ox + px, oy + py)
+                                };
+                                pts.push(cur);
+                                prev = Some(cur);
+                            }
+                            fill_poly_buf(buf, (tw, th), &pts, fg);
                         }
                         66 => {
                             for s in data.as_chunks::<8>().0 {
@@ -1456,6 +2302,8 @@ impl DisplayServer {
                                 };
                                 if let Some((lx, ly)) = prev {
                                     draw_line_buf(buf, (tw, th), lx, ly, cur.0, cur.1, fg);
+                                } else {
+                                    put_px(buf, tw, th, cur.0, cur.1, fg);
                                 }
                                 prev = Some(cur);
                             }
@@ -1533,15 +2381,124 @@ impl DisplayServer {
                     }
                 }
             }
-            76 if pkt.len() >= 16 => {
-                // ImageText8
+            73 if pkt.len() >= 20 => {
+                // GetImage -> ZPixmap 32bpp
+                let did = r32(&pkt[4..8], msb);
+                let x = r16(&pkt[8..10], msb) as i16 as i32;
+                let y = r16(&pkt[10..12], msb) as i16 as i32;
+                let gw = (r16(&pkt[12..14], msb) as i32).clamp(1, 1600);
+                let gh = (r16(&pkt[14..16], msb) as i32).clamp(1, 1200);
+                let nbytes = (gw * gh * 4) as usize;
+                let mut rep = vec![0u8; 32 + nbytes];
+                rep[0] = 1;
+                rep[1] = 24;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], (nbytes / 4) as u32, msb);
+                w32(&mut rep[8..12], ROOT_VISUAL, msb);
+                let (src_w, src_h, sox, soy, src_px) = if let Some((gid, ox, oy)) = c.find_root_gid(did)
+                    && let Some(surf) = self.surfaces.get(&gid)
+                {
+                    (surf.w, surf.h, ox, oy, Some(&surf.pixels))
+                } else if let Some(pm) = c.pixmaps.get(&did) {
+                    (pm.w, pm.h, 0, 0, Some(&pm.pixels))
+                } else {
+                    (0, 0, 0, 0, None)
+                };
+                if let Some(pxs) = src_px {
+                    for row in 0..gh {
+                        let syy = soy + y + row;
+                        if syy < 0 || syy >= src_h {
+                            continue;
+                        }
+                        for col in 0..gw {
+                            let sxx = sox + x + col;
+                            if sxx >= 0 && sxx < src_w {
+                                let v = pxs[(syy * src_w + sxx) as usize];
+                                let off = 32 + ((row * gw + col) as usize) * 4;
+                                w32(&mut rep[off..off + 4], v, msb);
+                            }
+                        }
+                    }
+                }
+                c.tx.extend_from_slice(&rep);
+            }
+            74 | 75 if pkt.len() >= 16 => {
+                // PolyText8 (74) / PolyText16 (75)
+                let is16 = op == 75;
+                let did = r32(&pkt[4..8], msb);
+                let gcid = r32(&pkt[8..12], msb);
+                let mut tx = r16(&pkt[12..14], msb) as i16 as i32;
+                let ty = r16(&pkt[14..16], msb) as i16 as i32;
+                let gc = c.gcs.get(&gcid).copied().unwrap_or_default();
+                let mut chunks: Vec<(i32, String)> = Vec::new();
+                let mut i = 16usize;
+                while i < pkt.len() {
+                    let len = pkt[i] as usize;
+                    if len == 255 {
+                        i += 5;
+                        continue;
+                    }
+                    if len == 0 {
+                        break;
+                    }
+                    if i + 2 > pkt.len() {
+                        break;
+                    }
+                    let delta = pkt[i + 1] as i8 as i32;
+                    let byte_len = if is16 { len * 2 } else { len };
+                    if i + 2 + byte_len > pkt.len() {
+                        break;
+                    }
+                    let s = if is16 {
+                        pkt[i + 2..i + 2 + byte_len]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|ch| char::from_u32(u16::from_be_bytes([ch[0], ch[1]]) as u32).unwrap_or('?'))
+                            .collect()
+                    } else {
+                        String::from_utf8_lossy(&pkt[i + 2..i + 2 + byte_len]).into_owned()
+                    };
+                    chunks.push((delta, s));
+                    i += 2 + byte_len;
+                }
+                if !chunks.is_empty() {
+                    if let Some((gid, gx, gy)) = c.find_root_gid(did)
+                        && let Some(surf) = self.surfaces.get_mut(&gid)
+                    {
+                        for (delta, s) in &chunks {
+                            tx += *delta;
+                            draw_text_buf(&mut surf.pixels, (surf.w, surf.h), gx + tx, gy + ty, s, gc.fg, None);
+                            tx += measure_text_advance(s);
+                        }
+                    } else if let Some(pm) = c.pixmaps.get_mut(&did) {
+                        for (delta, s) in &chunks {
+                            tx += *delta;
+                            draw_text_buf(&mut pm.pixels, (pm.w, pm.h), tx, ty, s, gc.fg, None);
+                            tx += measure_text_advance(s);
+                        }
+                    }
+                }
+            }
+            76 | 77 if pkt.len() >= 16 => {
+                // ImageText8 (76) / ImageText16 (77)
                 let slen = detail as usize;
                 let did = r32(&pkt[4..8], msb);
                 let gcid = r32(&pkt[8..12], msb);
                 let tx = r16(&pkt[12..14], msb) as i16 as i32;
                 let ty = r16(&pkt[14..16], msb) as i16 as i32;
-                if 16 + slen <= pkt.len() {
-                    let s = String::from_utf8_lossy(&pkt[16..16 + slen]).into_owned();
+                let need = if op == 77 { slen * 2 } else { slen };
+                if 16 + need <= pkt.len() {
+                    let s = if op == 77 {
+                        pkt[16..16 + need]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|ch| char::from_u32(u16::from_be_bytes([ch[0], ch[1]]) as u32).unwrap_or('?'))
+                            .collect()
+                    } else {
+                        String::from_utf8_lossy(&pkt[16..16 + need]).into_owned()
+                    };
                     let gc = c.gcs.get(&gcid).copied().unwrap_or_default();
                     if let Some((gid, gx, gy)) = c.find_root_gid(did)
                         && let Some(surf) = self.surfaces.get_mut(&gid)
@@ -1560,6 +2517,43 @@ impl DisplayServer {
                     }
                 }
             }
+            23 if pkt.len() >= 8 => {
+                // GetSelectionOwner
+                let sel = r32(&pkt[4..8], msb);
+                let owner = self.selections.get(&sel).copied().unwrap_or(0);
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[8..12], owner, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            47 => {
+                // QueryFont -> minimal fixed 8x14 font metrics
+                let mut rep = [0u8; 60];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 7, msb); // 7 extra 4-byte words (28 bytes)
+                // min_bounds (8..20) & max_bounds (24..36): character_width=8, ascent=11, descent=3
+                w16(&mut rep[12..14], 8, msb);
+                w16(&mut rep[14..16], 11, msb);
+                w16(&mut rep[16..18], 3, msb);
+                w16(&mut rep[28..30], 8, msb);
+                w16(&mut rep[30..32], 11, msb);
+                w16(&mut rep[32..34], 3, msb);
+                w16(&mut rep[40..42], 32, msb); // min_char_or_byte2
+                w16(&mut rep[42..44], 126, msb); // max_char_or_byte2
+                w16(&mut rep[44..46], 32, msb); // default_char
+                w16(&mut rep[52..54], 11, msb); // font_ascent
+                w16(&mut rep[54..56], 3, msb); // font_descent
+                c.tx.extend_from_slice(&rep);
+            }
+            49 => {
+                // ListFonts -> 0 matching fonts
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                c.tx.extend_from_slice(&rep);
+            }
             84 => {
                 // AllocColor -> pass RGB directly
                 let r = if pkt.len() >= 10 { r16(&pkt[8..10], msb) >> 8 } else { 255 };
@@ -1575,15 +2569,112 @@ impl DisplayServer {
                 w32(&mut rep[16..20], pixel, msb);
                 c.tx.extend_from_slice(&rep);
             }
-            98 => {
-                // QueryExtension -> not present
+            85 | 92 => {
+                // AllocNamedColor (85) / LookupColor (92)
+                let nlen = if pkt.len() >= 10 { r16(&pkt[8..10], msb) as usize } else { 0 };
+                let name = if 12 + nlen <= pkt.len() {
+                    String::from_utf8_lossy(&pkt[12..12 + nlen]).to_ascii_lowercase()
+                } else {
+                    String::new()
+                };
+                let (r, g, b): (u16, u16, u16) = match name.as_str() {
+                    "black" => (0, 0, 0),
+                    "red" => (0xFFFF, 0, 0),
+                    "green" => (0, 0xFFFF, 0),
+                    "blue" => (0, 0, 0xFFFF),
+                    "yellow" => (0xFFFF, 0xFFFF, 0),
+                    "cyan" => (0, 0xFFFF, 0xFFFF),
+                    "magenta" => (0xFFFF, 0, 0xFFFF),
+                    "gray" | "grey" => (0x8000, 0x8000, 0x8000),
+                    _ => (0xFFFF, 0xFFFF, 0xFFFF),
+                };
+                let pixel = (((r >> 8) as u32) << 16) | (((g >> 8) as u32) << 8) | ((b >> 8) as u32);
                 let mut rep = [0u8; 32];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
+                if op == 85 {
+                    w32(&mut rep[8..12], pixel, msb);
+                    w16(&mut rep[12..14], r, msb);
+                    w16(&mut rep[14..16], g, msb);
+                    w16(&mut rep[16..18], b, msb);
+                    w16(&mut rep[18..20], r, msb);
+                    w16(&mut rep[20..22], g, msb);
+                    w16(&mut rep[22..24], b, msb);
+                } else {
+                    w16(&mut rep[8..10], r, msb);
+                    w16(&mut rep[10..12], g, msb);
+                    w16(&mut rep[12..14], b, msb);
+                    w16(&mut rep[14..16], r, msb);
+                    w16(&mut rep[16..18], g, msb);
+                    w16(&mut rep[18..20], b, msb);
+                }
+                c.tx.extend_from_slice(&rep);
+            }
+            91 if pkt.len() >= 8 => {
+                // QueryColors
+                let pixels = &pkt[8..];
+                let n = pixels.len() / 4;
+                let mut rep = vec![0u8; 32 + n * 8];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], (n * 2) as u32, msb);
+                w16(&mut rep[8..10], n as u16, msb);
+                for (i, ch) in pixels.as_chunks::<4>().0.iter().enumerate() {
+                    let p = r32(ch, msb);
+                    let r = (((p >> 16) & 0xFF) as u16) * 257;
+                    let g = (((p >> 8) & 0xFF) as u16) * 257;
+                    let b = ((p & 0xFF) as u16) * 257;
+                    let o = 32 + i * 8;
+                    w16(&mut rep[o..o + 2], r, msb);
+                    w16(&mut rep[o + 2..o + 4], g, msb);
+                    w16(&mut rep[o + 4..o + 6], b, msb);
+                }
+                c.tx.extend_from_slice(&rep);
+            }
+            97 if pkt.len() >= 12 => {
+                // QueryBestSize
+                let rw = r16(&pkt[8..10], msb).max(16);
+                let rh = r16(&pkt[10..12], msb).max(16);
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], rw, msb);
+                w16(&mut rep[10..12], rh, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            98 => {
+                // QueryExtension
+                let nlen = if pkt.len() >= 8 {
+                    r16(&pkt[4..6], msb) as usize
+                } else {
+                    0
+                };
+                let name = if nlen > 0 && 8 + nlen <= pkt.len() {
+                    String::from_utf8_lossy(&pkt[8..8 + nlen]).into_owned()
+                } else {
+                    String::new()
+                };
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                match name.as_str() {
+                    "XInputExtension" => {
+                        rep[8] = 1;
+                        rep[9] = XINPUT_EXT_OPCODE;
+                        rep[10] = XINPUT_FIRST_EVENT;
+                        rep[11] = XINPUT_FIRST_ERROR;
+                    }
+                    "Generic Event Extension" => {
+                        rep[8] = 1;
+                        rep[9] = XGE_EXT_OPCODE;
+                    }
+                    _ => {}
+                }
                 c.tx.extend_from_slice(&rep);
             }
             101 if pkt.len() >= 8 => {
                 // GetKeyboardMapping
+                let first = pkt[4];
                 let count = pkt[5] as usize;
                 let syms_per = 2usize;
                 let extra_words = count * syms_per;
@@ -1592,10 +2683,222 @@ impl DisplayServer {
                 rep[1] = syms_per as u8;
                 w16(&mut rep[2..4], c.seq, msb);
                 w32(&mut rep[4..8], extra_words as u32, msb);
+                for k in 0..count {
+                    let kc = first.saturating_add(k as u8);
+                    let o = 32 + k * syms_per * 4;
+                    w32(&mut rep[o..o + 4], x11_keysym(kc, false), msb);
+                    w32(&mut rep[o + 4..o + 8], x11_keysym(kc, true), msb);
+                }
                 c.tx.extend_from_slice(&rep);
             }
             119 => {
                 // GetModifierMapping
+                let kpm = 1usize;
+                let mut rep = [0u8; 32 + 8];
+                rep[0] = 1;
+                rep[1] = kpm as u8;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], (kpm * 8 / 4) as u32, msb);
+                // Shift=50, Lock=66, Control=37, Mod1=64
+                rep[32] = 50;
+                rep[33] = 66;
+                rep[34] = 37;
+                rep[35] = 64;
+                c.tx.extend_from_slice(&rep);
+            }
+            XGE_EXT_OPCODE => {
+                // Generic Event Extension: GEQueryVersion (minor 0)
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], 1, msb); // major
+                w16(&mut rep[10..12], 0, msb); // minor
+                c.tx.extend_from_slice(&rep);
+            }
+            XINPUT_EXT_OPCODE => {
+                self.handle_xinput_req(c, detail, pkt);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_xinput_req(&self, c: &mut X11Client, minor: u8, pkt: &[u8]) {
+        let msb = c.msb;
+        match minor {
+            1 => {
+                // XI1 GetExtensionVersion
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                rep[1] = 1; // Xi_GetExtensionVersion
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], 2, msb); // major
+                w16(&mut rep[10..12], 3, msb); // minor
+                rep[12] = 1; // present
+                c.tx.extend_from_slice(&rep);
+            }
+            2 => {
+                // XI1 ListInputDevices -> 0 ext devices (VCP/VCK are core)
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                rep[1] = 2;
+                w16(&mut rep[2..4], c.seq, msb);
+                rep[8] = 0;
+                c.tx.extend_from_slice(&rep);
+            }
+            46 if pkt.len() >= 12 => {
+                // XISelectEvents: hdr(8) + win(4) + num_masks(2) + pad(2) -> check pkt[8..10]
+                c.xi_selected = true;
+                let num_masks = r16(&pkt[8..10], msb) as usize;
+                let mut off = 12usize;
+                for _ in 0..num_masks {
+                    if off + 4 > pkt.len() {
+                        break;
+                    }
+                    let mlen = r16(&pkt[off + 2..off + 4], msb) as usize;
+                    let bytes = mlen * 4;
+                    if off + 4 + bytes <= pkt.len() && bytes >= 4 {
+                        let mask0 = r32(&pkt[off + 4..off + 8], msb);
+                        if (mask0 & (1 << 17)) != 0 {
+                            c.xi_raw_motion = true;
+                        }
+                    }
+                    off += 4 + bytes;
+                }
+            }
+            47 => {
+                // XIQueryVersion
+                let cmaj = if pkt.len() >= 6 { r16(&pkt[4..6], msb) } else { 2 };
+                let cmin = if pkt.len() >= 8 { r16(&pkt[6..8], msb) } else { 3 };
+                let maj = cmaj.min(2);
+                let min = if maj >= 2 { cmin.min(3) } else { 0 };
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], maj, msb);
+                w16(&mut rep[10..12], min, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            48 => {
+                // XIQueryDevice
+                let dev_id = if pkt.len() >= 6 { r16(&pkt[4..6], msb) } else { 0 };
+                let mut payload: Vec<u8> = Vec::with_capacity(256);
+                let mut n_devs = 0u16;
+
+                let push_pointer = |buf: &mut Vec<u8>| {
+                    let name = b"Virtual core pointer";
+                    let nlen = pad4(name.len());
+                    let start = buf.len();
+                    buf.resize(start + 12 + nlen, 0);
+                    w16(&mut buf[start..start + 2], 2, msb); // id = 2
+                    w16(&mut buf[start + 2..start + 4], 1, msb); // XIMasterPointer
+                    w16(&mut buf[start + 4..start + 6], 3, msb); // attached = 3
+                    w16(&mut buf[start + 6..start + 8], 3, msb); // 3 classes: Button + ValX + ValY
+                    w16(&mut buf[start + 8..start + 10], name.len() as u16, msb);
+                    buf[start + 10] = 1; // enabled
+                    buf[start + 12..start + 12 + name.len()].copy_from_slice(name);
+
+                    // ButtonClass (24 bytes = 6 words)
+                    let b0 = buf.len();
+                    buf.resize(b0 + 24, 0);
+                    w16(&mut buf[b0..b0 + 2], 1, msb); // XIButtonClass
+                    w16(&mut buf[b0 + 2..b0 + 4], 6, msb);
+                    w16(&mut buf[b0 + 4..b0 + 6], 2, msb);
+                    w16(&mut buf[b0 + 6..b0 + 8], 3, msb); // 3 buttons
+
+                    // 2 ValuatorClass (44 bytes each = 11 words)
+                    for &(axis_num, label_atom, max_val, cur_val) in &[
+                        (0u16, 72u32, self.screen_w as i32, self.ptr_x),
+                        (1u16, 73u32, self.screen_h as i32, self.ptr_y),
+                    ] {
+                        let v0 = buf.len();
+                        buf.resize(v0 + 44, 0);
+                        w16(&mut buf[v0..v0 + 2], 2, msb); // XIValuatorClass
+                        w16(&mut buf[v0 + 2..v0 + 4], 11, msb);
+                        w16(&mut buf[v0 + 4..v0 + 6], 2, msb);
+                        w16(&mut buf[v0 + 6..v0 + 8], axis_num, msb);
+                        w32(&mut buf[v0 + 8..v0 + 12], label_atom, msb);
+                        w32(&mut buf[v0 + 20..v0 + 24], max_val as u32, msb);
+                        w32(&mut buf[v0 + 28..v0 + 32], cur_val as u32, msb);
+                        w32(&mut buf[v0 + 36..v0 + 40], 1000, msb);
+                        buf[v0 + 40] = 1; // Absolute
+                    }
+                };
+
+                let push_keyboard = |buf: &mut Vec<u8>| {
+                    let name = b"Virtual core keyboard";
+                    let nlen = pad4(name.len());
+                    let start = buf.len();
+                    buf.resize(start + 12 + nlen, 0);
+                    w16(&mut buf[start..start + 2], 3, msb); // id = 3
+                    w16(&mut buf[start + 2..start + 4], 2, msb); // XIMasterKeyboard
+                    w16(&mut buf[start + 4..start + 6], 2, msb); // attached = 2
+                    w16(&mut buf[start + 6..start + 8], 1, msb); // 1 KeyClass
+                    w16(&mut buf[start + 8..start + 10], name.len() as u16, msb);
+                    buf[start + 10] = 1; // enabled
+                    buf[start + 12..start + 12 + name.len()].copy_from_slice(name);
+
+                    // KeyClass (16 bytes = 4 words)
+                    let k0 = buf.len();
+                    buf.resize(k0 + 16, 0);
+                    w16(&mut buf[k0..k0 + 2], 0, msb); // XIKeyClass
+                    w16(&mut buf[k0 + 2..k0 + 4], 4, msb);
+                    w16(&mut buf[k0 + 4..k0 + 6], 3, msb);
+                    w16(&mut buf[k0 + 6..k0 + 8], 2, msb);
+                    w32(&mut buf[k0 + 8..k0 + 12], 36, msb);
+                    w32(&mut buf[k0 + 12..k0 + 16], 65, msb);
+                };
+
+                if matches!(dev_id, 0..=2) {
+                    push_pointer(&mut payload);
+                    n_devs += 1;
+                }
+                if matches!(dev_id, 0 | 1 | 3) {
+                    push_keyboard(&mut payload);
+                    n_devs += 1;
+                }
+                let mut rep = vec![0u8; 32 + payload.len()];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], (payload.len() / 4) as u32, msb);
+                w16(&mut rep[8..10], n_devs, msb);
+                rep[32..].copy_from_slice(&payload);
+                c.tx.extend_from_slice(&rep);
+            }
+            51 if pkt.len() >= 8 => {
+                // XIQueryPointer
+                let wid = r32(&pkt[4..8], msb);
+                let (wx, wy) = if let Some((gid, ox, oy)) = c.find_root_gid(wid) {
+                    let (sox, soy) = self.surf_origins.get(&gid).copied().unwrap_or((0, 0));
+                    (self.ptr_x - sox - ox, self.ptr_y - soy - oy)
+                } else {
+                    (self.ptr_x, self.ptr_y)
+                };
+                let (child, _, _) = c.find_hit_window(wid, wx, wy);
+                let child = if child == wid { 0 } else { child };
+                let mut rep = [0u8; 56];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 6, msb);
+                w32(&mut rep[8..12], ROOT_WIN, msb);
+                w32(&mut rep[12..16], child, msb);
+                w32(&mut rep[16..20], (self.ptr_x << 16) as u32, msb);
+                w32(&mut rep[20..24], (self.ptr_y << 16) as u32, msb);
+                w32(&mut rep[24..28], (wx << 16) as u32, msb);
+                w32(&mut rep[28..32], (wy << 16) as u32, msb);
+                rep[32] = 1; // same_screen
+                w16(&mut rep[34..36], 0, msb); // buttons_len = 0
+                c.tx.extend_from_slice(&rep);
+            }
+            52 => {
+                // XIGrabDevice -> GrabSuccess
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                rep[8] = 0; // XIGrabSuccess
+                c.tx.extend_from_slice(&rep);
+            }
+            55 => {
+                // XIGetSelectedEvents
                 let mut rep = [0u8; 32];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
@@ -2002,7 +3305,12 @@ impl DisplayServer {
         match surf.proto {
             GuestProto::X11 => {
                 if let Some(c) = self.x11_clients.iter_mut().find(|c| c.id == cid) {
-                    c.send_pointer_ev(obj, x, y, btn);
+                    let (target_wid, tx, ty) = c.find_hit_window(obj, x, y);
+                    let child = if target_wid == obj { 0 } else { target_wid };
+                    c.send_pointer_ev(target_wid, child, self.ptr_x, self.ptr_y, tx, ty, btn);
+                    if btn.is_none() && c.xi_selected {
+                        c.send_xi_device_motion(target_wid, child, self.ptr_x, self.ptr_y, tx, ty);
+                    }
                     c.flush_tx();
                 }
             }
@@ -2041,7 +3349,7 @@ impl DisplayServer {
         let obj = surf.proto_obj_id;
         match surf.proto {
             GuestProto::X11 => {
-                let code = ch.map(|c| (c as u32 & 0x7F).max(8) as u8).unwrap_or(36);
+                let code = char_to_x11_keycode(ch);
                 if let Some(c) = self.x11_clients.iter_mut().find(|c| c.id == cid) {
                     c.send_key_ev(obj, code, pressed);
                     c.flush_tx();
@@ -2225,6 +3533,33 @@ impl DisplayServer {
             }
         });
         true
+    }
+}
+
+fn parse_win_attrs(win: &mut XWin, mask: u32, vals: &[u8], msb: bool) {
+    let mut off = 0usize;
+    for bit in 0..15u32 {
+        if (mask & (1 << bit)) != 0 {
+            if off + 4 > vals.len() {
+                break;
+            }
+            let v = r32(&vals[off..off + 4], msb);
+            match bit {
+                1 => {
+                    win.bg_pixel = v & 0x00FF_FFFF;
+                    win.has_bg = true;
+                }
+                3 => {
+                    win.border_pixel = v & 0x00FF_FFFF;
+                    win.has_border = true;
+                }
+                11 => {
+                    win.event_mask = v;
+                }
+                _ => {}
+            }
+            off += 4;
+        }
     }
 }
 

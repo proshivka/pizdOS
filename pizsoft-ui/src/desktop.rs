@@ -598,8 +598,8 @@ impl Desktop {
                 Window::new(AppId::Game2048, 340, 80, 276, 336, false),
                 Window::new(AppId::PizView, 220, 86, 360, 300, false),
                 Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
-                Window::new(AppId::System, 190, 26, 330, 268, true),
-                Window::new(AppId::Settings, 370, 90, 520, 344, true),
+                Window::new(AppId::System, (width - 610).clamp(16, 190), 26, 330, 268, true),
+                Window::new(AppId::Settings, (width - 540).clamp(16, 370), 90, 520, 344, true),
             ],
             tick: 0,
             status: String::from("0% GNU | 0 Deps"),
@@ -645,6 +645,7 @@ impl Desktop {
             sys.min_anim = 0.0;
         }
         d.snake.best_score = persisted.best_snake;
+        d.display_srv.set_screen_size(width, height);
         d.terminal.display_env = d.display_srv.runtime_env();
         d.reload_packages();
         d.reload_files();
@@ -684,6 +685,7 @@ impl Desktop {
                     GuestProto::Wayland => "Wayland",
                 };
                 let title = surf.title.clone();
+                self.display_srv.set_surface_origin(gid, wx + 4, wy + 32);
                 self.windows.push(win);
                 self.push_toast(format!("{proto}: {title}"), AppId::Guest(gid).color());
             }
@@ -1098,6 +1100,7 @@ impl Desktop {
 
     pub fn on_viewport_resize(&mut self, canvas_w: i32, canvas_h: i32) {
         self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
+        self.display_srv.set_screen_size(canvas_w, canvas_h);
         let reserve = self.dock_reserve();
         let top_bar = if self.settings.taskbar_top { reserve } else { 0 };
         for win in &mut self.windows {
@@ -1107,7 +1110,8 @@ impl Desktop {
                 win.w = canvas_w.max(200);
                 win.h = (canvas_h - reserve).max(160);
             } else {
-                win.x = win.x.clamp(0, (canvas_w - 80).max(0));
+                win.w = win.w.min((canvas_w - 12).max(200));
+                win.x = win.x.clamp(0, (canvas_w - win.w).max(0));
                 win.y = win.y.clamp(top_bar, (canvas_h - 60).max(top_bar));
             }
             win.sync_vis_rect();
@@ -1810,6 +1814,16 @@ impl Desktop {
                     self.rescale_viewport(old_scale, cw, ch);
                     crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
                 }
+                TermAction::SetResolution(idx) => {
+                    self.settings.res_idx = idx.min(crate::apps::SCREEN_RES_PRESETS.len() - 1);
+                    let (rw, rh) = self.settings.resolution();
+                    self.display_srv.set_screen_size(rw, rh);
+                    crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+                    self.push_toast(
+                        format!("{rw}x{rh}"),
+                        self.settings.active_accent(),
+                    );
+                }
                 TermAction::LaunchX11Demo => {
                     if !self.display_srv.spawn_x11_demo() {
                         self.terminal.push_line(String::from("X11 TCP socket unavailable (disabled in test/occupied port)"));
@@ -1850,6 +1864,12 @@ impl Desktop {
         self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+        for w in &self.windows {
+            if let AppId::Guest(gid) = w.id {
+                self.display_srv.set_surface_origin(gid, w.x + 4, w.y + 32);
+            }
+        }
+        self.display_srv.set_global_pointer(self.mouse_x, self.mouse_y);
 
         if let Some(rz) = self.resizing {
             let reserve = self.dock_reserve();
@@ -1945,6 +1965,12 @@ impl Desktop {
         self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+        for w in &self.windows {
+            if let AppId::Guest(gid) = w.id {
+                self.display_srv.set_surface_origin(gid, w.x + 4, w.y + 32);
+            }
+        }
+        self.display_srv.set_global_pointer(self.mouse_x, self.mouse_y);
         let ws = self.active_workspace;
         if let Some(win) = self
             .windows
@@ -1971,6 +1997,12 @@ impl Desktop {
         self.last_canvas_size = (canvas_w.max(320), canvas_h.max(240));
         self.mouse_x = x.clamp(0, canvas_w.saturating_sub(1));
         self.mouse_y = y.clamp(0, canvas_h.saturating_sub(1));
+        for w in &self.windows {
+            if let AppId::Guest(gid) = w.id {
+                self.display_srv.set_surface_origin(gid, w.x + 4, w.y + 32);
+            }
+        }
+        self.display_srv.set_global_pointer(self.mouse_x, self.mouse_y);
         self.mouse_down = true;
         if self.settings.animations && self.ripples.len() < 6 {
             self.ripples.push(ClickRipple {
@@ -2702,6 +2734,7 @@ impl Desktop {
                 let old_scale = self.settings.ui_scale();
                 let prev_dock = self.settings.floating_dock;
                 let prev_taps = self.settings.update_taps;
+                let prev_res = self.settings.res_idx;
                 let action = self.settings.on_click(lx, ly, win.w, win.h);
                 if self.settings.update_taps >= 5 && prev_taps < 5 {
                     self.force_toast(
@@ -2722,6 +2755,11 @@ impl Desktop {
                         ),
                         self.settings.active_accent(),
                     );
+                }
+                if self.settings.res_idx != prev_res {
+                    let (rw, rh) = self.settings.resolution();
+                    self.display_srv.set_screen_size(rw, rh);
+                    self.push_toast(format!("{rw}x{rh}"), self.settings.active_accent());
                 }
                 crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
                 match action {

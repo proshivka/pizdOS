@@ -91,6 +91,7 @@ mod linux_fb {
     use std::time::Duration;
 
     const FBIOGET_VSCREENINFO: usize = 0x4600;
+    const FBIOPUT_VSCREENINFO: usize = 0x4601;
     const FBIOGET_FSCREENINFO: usize = 0x4602;
     const EVIOCGABS_X: usize = 0x8018_4540;
     const EVIOCGABS_Y: usize = 0x8018_4541;
@@ -400,31 +401,82 @@ mod linux_fb {
         }
     }
 
-    pub fn run_linux_fb() -> io::Result<()> {
-        let fb_path = std::env::var("PIZSOFT_FB").unwrap_or_else(|_| String::from("/dev/fb0"));
-        let mut fb = OpenOptions::new().read(true).write(true).open(&fb_path)?;
+    fn query_fb_mode(
+        fb: &File,
+        req: Option<(i32, i32)>,
+    ) -> io::Result<(FbVarScreenInfo, usize, usize, usize, usize)> {
         let mut vinfo = FbVarScreenInfo::default();
+        if let Some((rw, rh)) = req
+            && unsafe { ioctl(fb.as_raw_fd(), FBIOGET_VSCREENINFO, &mut vinfo) } >= 0
+        {
+            vinfo.xres = rw.max(320) as u32;
+            vinfo.yres = rh.max(240) as u32;
+            vinfo.xres_virtual = vinfo.xres;
+            vinfo.yres_virtual = vinfo.yres;
+            let _ = unsafe { ioctl(fb.as_raw_fd(), FBIOPUT_VSCREENINFO, &vinfo) };
+        }
+        vinfo = FbVarScreenInfo::default();
         let rc = unsafe { ioctl(fb.as_raw_fd(), FBIOGET_VSCREENINFO, &mut vinfo) };
         if rc < 0 || vinfo.xres == 0 || vinfo.yres == 0 {
-            return Err(io::Error::other(format!("FBIOGET_VSCREENINFO failed on {fb_path}")));
+            return Err(io::Error::other("FBIOGET_VSCREENINFO failed"));
         }
         let mut finfo = FbFixScreenInfo::default();
         let frc = unsafe { ioctl(fb.as_raw_fd(), FBIOGET_FSCREENINFO, &mut finfo) };
-
-        let _tty = RawTtyGuard::enter();
-        let w = vinfo.xres as usize;
-        let h = vinfo.yres as usize;
+        let phys_w = vinfo.xres as usize;
+        let phys_h = vinfo.yres as usize;
         let bpp = vinfo.bits_per_pixel.max(32) as usize;
         let bytes_pp = (bpp / 8).clamp(2, 4);
-        let stride = if frc == 0 && finfo.line_length >= (w * bytes_pp) as u32 {
+        let stride = if frc == 0 && finfo.line_length >= (phys_w * bytes_pp) as u32 {
             finfo.line_length as usize
         } else {
-            w * bytes_pp
+            phys_w * bytes_pp
         };
+        Ok((vinfo, phys_w, phys_h, bytes_pp, stride))
+    }
 
-        let mut canvas = Canvas::new(w, h);
-        let mut desktop = Desktop::new(w as i32, h as i32);
+    fn scale_nearest(
+        src: &[u32],
+        sw: usize,
+        sh: usize,
+        dst: &mut [u32],
+        dw: usize,
+        dh: usize,
+    ) {
+        if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+            return;
+        }
+        for y in 0..dh {
+            let sy = (y * sh) / dh;
+            let srow = sy * sw;
+            let drow = y * dw;
+            for x in 0..dw {
+                let sx = (x * sw) / dw;
+                dst[drow + x] = src[srow + sx];
+            }
+        }
+    }
+
+    pub fn run_linux_fb() -> io::Result<()> {
+        let fb_path = std::env::var("PIZSOFT_FB").unwrap_or_else(|_| String::from("/dev/fb0"));
+        let mut fb = OpenOptions::new().read(true).write(true).open(&fb_path)?;
+        let (mut vinfo, mut phys_w, mut phys_h, mut bytes_pp, mut stride) =
+            query_fb_mode(&fb, Some((800, 600)))?;
+
+        let _tty = RawTtyGuard::enter();
+        let mut desktop = Desktop::new(800, 600);
+        let (init_rw, init_rh) = desktop.settings.resolution();
+        if (init_rw, init_rh) != (800, 600)
+            && let Ok((vi, pw, ph, bpp, st)) = query_fb_mode(&fb, Some((init_rw, init_rh)))
+        {
+            vinfo = vi;
+            phys_w = pw;
+            phys_h = ph;
+            bytes_pp = bpp;
+            stride = st;
+        }
+        let mut canvas = Canvas::new(init_rw.max(320) as usize, init_rh.max(240) as usize);
         let mut prev_scale = desktop.settings.ui_scale();
+        let mut prev_res_idx = desktop.settings.res_idx;
         canvas.set_ui_scale(prev_scale);
         desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
 
@@ -435,7 +487,9 @@ mod linux_fb {
         }
 
         let mut stdin = io::stdin();
-        let mut frame_buf = vec![0u8; stride * h];
+        let mut frame_buf = vec![0u8; stride * phys_h];
+        let mut scaled_buf = vec![0u32; phys_w * phys_h];
+        let mut prev_pixels: Vec<u32> = Vec::new();
         let mut prev_right = false;
         let mut mods = Modifiers::new();
         let mut abs_norm_x: i32 = desktop.mouse_x;
@@ -443,6 +497,22 @@ mod linux_fb {
         let ev_size = mem::size_of::<InputEvent>();
 
         while desktop.running {
+            if desktop.settings.res_idx != prev_res_idx {
+                prev_res_idx = desktop.settings.res_idx;
+                let (rw, rh) = desktop.settings.resolution();
+                if let Ok((vi, pw, ph, bpp, st)) = query_fb_mode(&fb, Some((rw, rh))) {
+                    vinfo = vi;
+                    phys_w = pw;
+                    phys_h = ph;
+                    bytes_pp = bpp;
+                    stride = st;
+                    frame_buf.resize(stride * phys_h, 0);
+                    scaled_buf.resize(phys_w * phys_h, 0);
+                    prev_pixels.clear();
+                }
+                canvas.resize(rw.max(320) as usize, rh.max(240) as usize);
+                desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
+            }
             let cur_scale = desktop.settings.ui_scale();
             if (cur_scale - prev_scale).abs() > 0.001 {
                 canvas.set_ui_scale(cur_scale);
@@ -610,21 +680,51 @@ mod linux_fb {
             desktop.on_tick();
             desktop.render(&mut canvas);
 
-            // Pack framebuffer supporting 32bpp, 24bpp, and 16bpp RGB565 + line_length stride
-            for y in 0..h {
+            // Pack and flush only dirty horizontal spans to /dev/fb0 for high FPS in QEMU/fbdev
+            let active_px: &[u32] = if canvas.width == phys_w && canvas.height == phys_h {
+                &canvas.pixels
+            } else {
+                scale_nearest(
+                    &canvas.pixels,
+                    canvas.width,
+                    canvas.height,
+                    &mut scaled_buf,
+                    phys_w,
+                    phys_h,
+                );
+                &scaled_buf
+            };
+            let first_frame = prev_pixels.len() != active_px.len();
+            let rgb_order = vinfo.red.offset == 0;
+            let mut dirty_start: Option<usize> = None;
+            let mut any_dirty = false;
+
+            for y in 0..phys_h {
+                let src_row = &active_px[y * phys_w..(y + 1) * phys_w];
+                let row_dirty = first_frame || src_row != &prev_pixels[y * phys_w..(y + 1) * phys_w];
+                if !row_dirty {
+                    if let Some(ys) = dirty_start.take() {
+                        fb.seek(SeekFrom::Start((ys * stride) as u64))?;
+                        fb.write_all(&frame_buf[ys * stride..y * stride])?;
+                    }
+                    continue;
+                }
+                if dirty_start.is_none() {
+                    dirty_start = Some(y);
+                }
+                any_dirty = true;
                 let row_off = y * stride;
-                let src_row = &canvas.pixels[y * w..(y + 1) * w];
                 match bytes_pp {
                     4 => {
-                        let rgb_order = vinfo.red.offset == 0;
-                        for (x, &px) in src_row.iter().enumerate() {
-                            let o = row_off + x * 4;
-                            let bytes = if rgb_order {
-                                [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF]
-                            } else {
-                                px.to_le_bytes()
-                            };
-                            frame_buf[o..o + 4].copy_from_slice(&bytes);
+                        let dst_cells = frame_buf[row_off..row_off + phys_w * 4].as_chunks_mut::<4>().0;
+                        if rgb_order {
+                            for (dst, &px) in dst_cells.iter_mut().zip(src_row.iter()) {
+                                *dst = [(px >> 16) as u8, (px >> 8) as u8, px as u8, 0xFF];
+                            }
+                        } else {
+                            for (dst, &px) in dst_cells.iter_mut().zip(src_row.iter()) {
+                                *dst = px.to_le_bytes();
+                            }
                         }
                     }
                     3 => {
@@ -647,9 +747,18 @@ mod linux_fb {
                     }
                 }
             }
-            fb.seek(SeekFrom::Start(0))?;
-            fb.write_all(&frame_buf)?;
-            fb.flush()?;
+            if let Some(ys) = dirty_start {
+                fb.seek(SeekFrom::Start((ys * stride) as u64))?;
+                fb.write_all(&frame_buf[ys * stride..phys_h * stride])?;
+            }
+            if any_dirty {
+                fb.flush()?;
+                if first_frame {
+                    prev_pixels = active_px.to_vec();
+                } else {
+                    prev_pixels.copy_from_slice(active_px);
+                }
+            }
 
             thread::sleep(Duration::from_millis(16));
         }
@@ -812,6 +921,16 @@ mod win32 {
         fn GetDC(hwnd: Hwnd) -> Hdc;
         fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
         fn GetClientRect(hwnd: Hwnd, lp_rect: *mut Rect) -> i32;
+        fn AdjustWindowRectEx(lp_rect: *mut Rect, dw_style: u32, b_menu: i32, dw_ex_style: u32) -> i32;
+        fn SetWindowPos(
+            hwnd: Hwnd,
+            h_wnd_insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            u_flags: u32,
+        ) -> i32;
         fn SetCapture(hwnd: Hwnd) -> Hwnd;
         fn ReleaseCapture() -> i32;
         fn ValidateRect(hwnd: Hwnd, lp_rect: *const Rect) -> i32;
@@ -948,23 +1067,30 @@ mod win32 {
         } else {
             96
         };
-        let init_scale_pct: u16 = if dpi_x >= 144 {
+        let mut desktop = Desktop::new(800, 600);
+        let init_scale_pct: u16 = if desktop.settings.ui_scale_pct == 100 && dpi_x >= 144 {
             150
-        } else if dpi_x >= 120 || scr_w >= 1900 {
-            125
         } else {
-            100
+            desktop.settings.ui_scale_pct
         };
-        let init_w = if scr_w > 0 {
-            (scr_w * 78 / 100).clamp(1160, 1480)
-        } else {
-            1240
+        desktop.settings.ui_scale_pct = init_scale_pct;
+        let (base_w, base_h) = desktop.settings.resolution();
+        let scale_f = desktop.settings.ui_scale();
+        let target_cw = ((base_w as f32 * scale_f).round() as i32)
+            .min(if scr_w > 0 { scr_w - 40 } else { 1600 })
+            .max(640);
+        let target_ch = ((base_h as f32 * scale_f).round() as i32)
+            .min(if scr_h > 0 { scr_h - 64 } else { 1000 })
+            .max(480);
+        let mut adj = Rect {
+            left: 0,
+            top: 0,
+            right: target_cw,
+            bottom: target_ch,
         };
-        let init_h = if scr_h > 0 {
-            (scr_h * 82 / 100).clamp(720, 920)
-        } else {
-            800
-        };
+        unsafe { AdjustWindowRectEx(&mut adj, WS_OVERLAPPEDWINDOW, 0, 0) };
+        let outer_w = adj.right - adj.left;
+        let outer_h = adj.bottom - adj.top;
 
         let class_name = utf16("PizsoftUIClass");
         let title = utf16("Pizsoft UI — pizdOS 2.0");
@@ -993,8 +1119,8 @@ mod win32 {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                init_w,
-                init_h,
+                outer_w,
+                outer_h,
                 0,
                 0,
                 h_inst,
@@ -1005,10 +1131,9 @@ mod win32 {
             return Err(io::Error::other("CreateWindowExW failed"));
         }
 
-        let mut canvas = Canvas::new(init_w as usize, init_h as usize);
-        let mut desktop = Desktop::new(init_w, init_h);
-        desktop.settings.ui_scale_pct = init_scale_pct;
+        let mut canvas = Canvas::new(target_cw as usize, target_ch as usize);
         let mut prev_scale = desktop.settings.ui_scale();
+        let mut prev_res_idx = desktop.settings.res_idx;
         canvas.set_ui_scale(prev_scale);
         desktop.on_viewport_resize(canvas.logical_width(), canvas.logical_height());
 
@@ -1016,8 +1141,8 @@ mod win32 {
         let mut bmi = BitmapInfo {
             bmi_header: BitmapInfoHeader {
                 bi_size: mem::size_of::<BitmapInfoHeader>() as u32,
-                bi_width: init_w,
-                bi_height: -init_h, // top-down
+                bi_width: target_cw,
+                bi_height: -target_ch, // top-down
                 bi_planes: 1,
                 bi_bit_count: 32,
                 bi_compression: 0,
@@ -1171,6 +1296,36 @@ mod win32 {
                         TranslateMessage(&msg);
                         DispatchMessageW(&msg);
                     }
+                }
+            }
+
+            if desktop.settings.res_idx != prev_res_idx {
+                prev_res_idx = desktop.settings.res_idx;
+                let (rw, rh) = desktop.settings.resolution();
+                let sc = desktop.settings.ui_scale();
+                let nw = ((rw as f32 * sc).round() as i32)
+                    .min(if scr_w > 0 { scr_w - 40 } else { 1600 })
+                    .max(400);
+                let nh = ((rh as f32 * sc).round() as i32)
+                    .min(if scr_h > 0 { scr_h - 64 } else { 1000 })
+                    .max(300);
+                let mut adj = Rect {
+                    left: 0,
+                    top: 0,
+                    right: nw,
+                    bottom: nh,
+                };
+                unsafe {
+                    AdjustWindowRectEx(&mut adj, WS_OVERLAPPEDWINDOW, 0, 0);
+                    SetWindowPos(
+                        hwnd,
+                        0,
+                        0,
+                        0,
+                        adj.right - adj.left,
+                        adj.bottom - adj.top,
+                        0x0002 | 0x0004 | 0x0010, // SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+                    );
                 }
             }
 

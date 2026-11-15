@@ -53,6 +53,7 @@ pub enum TermAction {
     None,
     SetTheme(u8),
     SetScale(u16),
+    SetResolution(usize),
     LaunchX11Demo,
 }
 
@@ -163,7 +164,7 @@ impl TerminalState {
     fn autocomplete(&mut self) {
         let builtins = [
             "help", "pizfetch", "poyasni", "clear", "nahuy", "whoami", "pwd", "ls", "cd", "cat",
-            "theme", "scale", "x11demo",
+            "theme", "scale", "res", "x11demo",
         ];
         if let Some(space) = self.input.rfind(' ') {
             let prefix = &self.input[space + 1..];
@@ -198,7 +199,7 @@ impl TerminalState {
         match head {
             "help" | "huelp" => {
                 self.push_line(String::from("help, pizfetch, x11demo, clear/nahuy, pwd, ls, cd, cat"));
-                self.push_line(String::from("theme <0-3>, scale <100|125|150|175>, <cmd &>, whoami"));
+                self.push_line(String::from("theme <0-3>, scale <100|125|150|175>, res <800x600|1024x768|1280x800|1440x900>, <cmd &>, whoami"));
             }
             "x11demo" => {
                 self.push_line(String::from("Launching live MIT X11 wire client..."));
@@ -287,6 +288,22 @@ impl TerminalState {
                     return TermAction::SetScale(pct);
                 }
                 self.push_line(String::from("usage: scale <100|125|150|175>"));
+            }
+            "res" => {
+                if let Some((ws, hs)) = rest.split_once('x').or_else(|| rest.split_once('X'))
+                    && let (Ok(w), Ok(h)) = (ws.trim().parse::<i32>(), hs.trim().parse::<i32>())
+                    && let Some(idx) = SCREEN_RES_PRESETS.iter().position(|&(pw, ph)| pw == w && ph == h)
+                {
+                    self.push_line(format!("res -> {w}x{h}"));
+                    return TermAction::SetResolution(idx);
+                }
+                if let Ok(idx) = rest.parse::<usize>()
+                    && let Some(&(w, h)) = SCREEN_RES_PRESETS.get(idx)
+                {
+                    self.push_line(format!("res -> {w}x{h}"));
+                    return TermAction::SetResolution(idx);
+                }
+                self.push_line(String::from("usage: res <800x600|1024x768|1280x800|1440x900>"));
             }
             _ => {
                 let bg = cmd.ends_with('&');
@@ -1632,6 +1649,12 @@ struct HeroCache {
 }
 
 pub const UI_SCALES: [u16; 4] = [100, 125, 150, 175];
+pub const SCREEN_RES_PRESETS: [(i32, i32); 4] = [
+    (800, 600),
+    (1024, 768),
+    (1280, 800),
+    (1440, 900),
+];
 
 pub struct SettingsState {
     pub page: SettingsPage,
@@ -1646,6 +1669,7 @@ pub struct SettingsState {
     pub genie_minimize: bool,
     pub glass_level: u8,
     pub ui_scale_pct: u16,
+    pub res_idx: usize,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub persistent_island: bool,
@@ -1684,6 +1708,7 @@ impl SettingsState {
             genie_minimize: true,
             glass_level: 0,
             ui_scale_pct: 100,
+            res_idx: 0,
             crosshair_cursor: false,
             show_clock: true,
             persistent_island: false,
@@ -1720,6 +1745,14 @@ impl SettingsState {
             .unwrap_or(0) as i32;
         let next = (cur + delta as i32).clamp(0, UI_SCALES.len() as i32 - 1) as usize;
         self.ui_scale_pct = UI_SCALES[next];
+    }
+
+    #[inline]
+    pub fn resolution(&self) -> (i32, i32) {
+        SCREEN_RES_PRESETS
+            .get(self.res_idx)
+            .copied()
+            .unwrap_or((800, 600))
     }
 
     #[inline]
@@ -1989,7 +2022,7 @@ impl SettingsState {
                     } else {
                         self.accent_idx = (self.accent_idx + 1) % 6;
                     }
-                } else if (254..=288).contains(&ly) && iw >= 160 {
+                } else if (254..=277).contains(&ly) && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let rel_x = lx - 146;
                     let idx = (rel_x / (sw_w + 6)) as usize;
@@ -2002,13 +2035,22 @@ impl SettingsState {
                     if let Some(&preset) = presets.get(idx) {
                         self.theme = preset;
                     }
-                } else if (294..=328).contains(&ly) {
+                } else if (280..=308).contains(&ly) {
                     let pill_x0 = (ww - 196).max(146);
                     if lx >= pill_x0 {
                         let idx = (((lx - pill_x0) * 4) / 184).clamp(0, 3) as usize;
                         self.ui_scale_pct = UI_SCALES[idx];
                     } else {
                         self.step_ui_scale(1);
+                    }
+                } else if (311..=341).contains(&ly) {
+                    let seg_w = 248;
+                    let seg_x0 = (ww - 260).max(232);
+                    if lx >= seg_x0 {
+                        let idx = (((lx - seg_x0) * 4) / seg_w).clamp(0, 3) as usize;
+                        self.res_idx = idx;
+                    } else {
+                        self.res_idx = (self.res_idx + 1) % SCREEN_RES_PRESETS.len();
                     }
                 }
             }
@@ -2333,8 +2375,8 @@ impl SettingsState {
 
                 // Interactive ColorOS Luminous Theme Swatches
                 let sw_y = wy + 254;
-                let sw_h = if wy + wh >= sw_y + 78 { 32 } else { (wy + wh - 10 - sw_y).clamp(24, 34) };
-                if sw_y + 24 <= wy + wh - 8 && iw >= 160 {
+                let sw_h = 22;
+                if sw_y + sw_h <= wy + wh - 6 && iw >= 160 {
                     let sw_w = ((iw - 18) / 4).max(20);
                     let presets = [
                         ThemePreset::AuroraPeaks,
@@ -2345,21 +2387,21 @@ impl SettingsState {
                     for (i, preset) in presets.iter().enumerate() {
                         let sx = x + (i as i32) * (sw_w + 6);
                         let (tl, br, ba, _, _, rib) = preset.mesh_palette();
-                        canvas.fill_luminous_card(sx, sw_y, sw_w, sw_h, 10, tl, br, ba, rib);
+                        canvas.fill_luminous_card(sx, sw_y, sw_w, sw_h, 8, tl, br, ba, rib);
                         let selected = *preset == self.theme;
                         canvas.draw_rounded_rect_alpha(
                             sx,
                             sw_y,
                             sw_w,
                             sw_h,
-                            10,
+                            8,
                             0xFFFFFF,
                             if selected { 175 } else { 28 },
                         );
                         if selected {
                             canvas.fill_aa_circle(
                                 (sx + sw_w - 10) as f32,
-                                (sw_y + 10) as f32,
+                                (sw_y + 11) as f32,
                                 3.0,
                                 0xFFFFFF,
                                 240,
@@ -2369,12 +2411,12 @@ impl SettingsState {
                 }
 
                 // Card 4: Segmented UI Scale Switcher (100% / 125% / 150% / 175%)
-                let sc_y = wy + 294;
-                if sc_y + 32 <= wy_base + wh - 4 {
-                    Self::draw_card_frame(canvas, x, sc_y, iw, 34, 12);
-                    let mid_y = sc_y + 17;
-                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 6.0, 0x2DD4BF, 32);
-                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.4, 0x2DD4BF, 240);
+                let sc_y = wy + 280;
+                if sc_y + 28 <= wy_base + wh - 4 {
+                    Self::draw_card_frame(canvas, x, sc_y, iw, 28, 10);
+                    let mid_y = sc_y + 14;
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 5.5, 0x2DD4BF, 32);
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.2, 0x2DD4BF, 240);
                     canvas.draw_text_clipped(
                         x + 32,
                         mid_y - 7,
@@ -2385,28 +2427,74 @@ impl SettingsState {
                     );
                     let seg_x0 = (wx + ww - 196).max(x + 110);
                     let seg_w = 184;
-                    canvas.fill_rounded_rect(seg_x0, sc_y + 5, seg_w, 24, 8, 0x0E121B);
+                    canvas.fill_rounded_rect(seg_x0, sc_y + 3, seg_w, 22, 7, 0x0E121B);
                     let cell_w = seg_w / 4;
                     for (idx, &pct) in UI_SCALES.iter().enumerate() {
                         let px = seg_x0 + (idx as i32) * cell_w + 2;
                         let pw = cell_w - 4;
                         let active = self.ui_scale_pct == pct;
                         if active {
-                            canvas.blend_rounded_rect(px, sc_y + 7, pw, 20, 6, accent, 170);
-                            canvas.draw_rounded_rect_alpha(px, sc_y + 7, pw, 20, 6, 0xFFFFFF, 85);
+                            canvas.blend_rounded_rect(px, sc_y + 5, pw, 18, 5, accent, 170);
+                            canvas.draw_rounded_rect_alpha(px, sc_y + 5, pw, 18, 5, 0xFFFFFF, 85);
                         } else if in_content
-                            && (294..=328).contains(&hover_ly)
+                            && (280..=308).contains(&hover_ly)
                             && hover_lx >= (px - wx)
                             && hover_lx < (px - wx + pw)
                         {
-                            canvas.blend_rounded_rect(px, sc_y + 7, pw, 20, 6, 0xFFFFFF, 18);
+                            canvas.blend_rounded_rect(px, sc_y + 5, pw, 18, 5, 0xFFFFFF, 18);
                         }
                         let lbl = format!("{pct}%");
                         let tw = canvas.measure_text(&lbl, 1);
                         canvas.draw_text_clipped(
                             px + ((pw - tw) / 2).max(2),
-                            sc_y + 10,
+                            sc_y + 7,
                             pw - 4,
+                            &lbl,
+                            if active { 0xFFFFFF } else { 0x94A3B8 },
+                            1,
+                        );
+                    }
+                }
+
+                // Card 5: Screen Resolution Switcher (800x600 default)
+                let res_y = wy + 312;
+                if res_y + 28 <= wy_base + wh - 4 {
+                    Self::draw_card_frame(canvas, x, res_y, iw, 28, 10);
+                    let mid_y = res_y + 14;
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 5.5, 0x38BDF8, 32);
+                    canvas.fill_aa_circle((x + 19) as f32, mid_y as f32, 2.2, 0x38BDF8, 240);
+                    canvas.draw_text_clipped(
+                        x + 32,
+                        mid_y - 7,
+                        56,
+                        tr(lang, "Экран", "Screen"),
+                        0xE2E8F0,
+                        1,
+                    );
+                    let seg_w = 248;
+                    let seg_x0 = (wx + ww - 260).max(x + 86);
+                    canvas.fill_rounded_rect(seg_x0, res_y + 3, seg_w, 22, 7, 0x0E121B);
+                    let cell_w = seg_w / 4;
+                    for (idx, &(rw, rh)) in SCREEN_RES_PRESETS.iter().enumerate() {
+                        let px = seg_x0 + (idx as i32) * cell_w + 2;
+                        let pw = cell_w - 4;
+                        let active = self.res_idx == idx;
+                        if active {
+                            canvas.blend_rounded_rect(px, res_y + 5, pw, 18, 5, accent, 170);
+                            canvas.draw_rounded_rect_alpha(px, res_y + 5, pw, 18, 5, 0xFFFFFF, 85);
+                        } else if in_content
+                            && (311..=341).contains(&hover_ly)
+                            && hover_lx >= (px - wx)
+                            && hover_lx < (px - wx + pw)
+                        {
+                            canvas.blend_rounded_rect(px, res_y + 5, pw, 18, 5, 0xFFFFFF, 18);
+                        }
+                        let lbl = format!("{rw}x{rh}");
+                        let tw = canvas.measure_text(&lbl, 1);
+                        canvas.draw_text_clipped(
+                            px + ((pw - tw) / 2).max(1),
+                            res_y + 7,
+                            pw - 2,
                             &lbl,
                             if active { 0xFFFFFF } else { 0x94A3B8 },
                             1,

@@ -1,4 +1,6 @@
 #!/bin/sh
 # Avtozapusk DHCP na vseh setevuhah cherez udhcpc
+modprobe e1000 2>/dev/null || true
+modprobe virtio_net 2>/dev/null || true
 ifconfig eth0 up 2>/dev/null
 udhcpc -i eth0 -b -s /usr/share/udhcpc/default.script 2>/dev/null &

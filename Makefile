@@ -31,7 +31,7 @@ os2-iso:
 	bash scripts/build_iso.sh
 
 run-os2: $(ISO2)
-	qemu-system-x86_64 -cdrom $(ISO2) -m 512M -vga std -device usb-tablet -net nic -net user -display gtk,zoom-to-fit=on
+	qemu-system-x86_64 -cdrom $(ISO2) -m 512M -vga std -usb -device usb-tablet -net nic -net user -display gtk,zoom-to-fit=on
 
 run-os2-curses: $(ISO2)
 	qemu-system-x86_64 -cdrom $(ISO2) -m 512M -vga std -net nic -net user -display curses

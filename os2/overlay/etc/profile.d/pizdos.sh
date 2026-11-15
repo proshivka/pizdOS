@@ -13,6 +13,18 @@ alias obnovi='piz-get obnovi'
 alias vpizdu='poweroff'
 
 if [ -t 0 ]; then
+    chmod +x /usr/bin/pizsoft /usr/bin/piz-get /usr/bin/pizfetch 2>/dev/null || true
+    if [ ! -d /lib/modules ] && [ -f /media/sda1/boot/modloop-lts ]; then
+        mkdir -p /.modloop
+        mount -o loop /media/sda1/boot/modloop-lts /.modloop 2>/dev/null || true
+        ln -sfn /.modloop/modules /lib/modules 2>/dev/null || true
+    fi
+    for _m in bochs evdev usbhid hid_generic e1000 virtio_net; do
+        modprobe "$_m" 2>/dev/null || true
+    done
+    if [ -x /etc/local.d/network.start ]; then
+        /etc/local.d/network.start >/dev/null 2>&1 &
+    fi
     /usr/bin/pizfetch
     TTY_DEV="$(tty 2>/dev/null || true)"
     if [ "$TTY_DEV" = "/dev/tty1" ] && [ -e /dev/fb0 ] && [ ! -f /tmp/.pizsoft_noauto ] && [ -z "$PIZSOFT_NO_AUTOUI" ]; then
