@@ -97,6 +97,14 @@ pub fn load_config_from(path: &std::path::Path, settings: &mut SettingsState) ->
             "sticky_note" => {
                 persisted.sticky_note = v.replace("\\n", "\n");
             }
+            "ai_api_key" => {
+                settings.ai_api_key = v.to_string();
+            }
+            "ai_model_idx" => {
+                if let Ok(m) = v.parse::<usize>() {
+                    settings.ai_model_idx = m.min(1);
+                }
+            }
             _ => {}
         }
     }
@@ -149,7 +157,9 @@ pub fn save_config_to(
          res_idx={}\n\
          show_clock={}\n\
          best_snake={best_snake}\n\
-         sticky_note={escaped_note}\n",
+         sticky_note={escaped_note}\n\
+         ai_api_key={}\n\
+         ai_model_idx={}\n",
         settings.accent_idx,
         b(settings.show_grid),
         b(settings.show_icons),
@@ -167,6 +177,8 @@ pub fn save_config_to(
         settings.ui_scale_pct,
         settings.res_idx,
         b(settings.show_clock),
+        settings.ai_api_key.replace(['\r', '\n'], ""),
+        settings.ai_model_idx.min(1),
     );
     let _ = fs::write(path, out);
 }

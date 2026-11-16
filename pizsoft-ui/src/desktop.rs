@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    CalcState, Game2048State, KeyEvent, Lang, MatrixState, MinesweeperState, NotepadState,
-    PaintAction, PaintState, PizViewState, SettingsAction, SettingsState, SnakeEvent, SnakeState,
-    TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
+    AiChatState, CalcState, Game2048State, KeyEvent, Lang, MatrixState, MinesweeperState,
+    NotepadState, PaintAction, PaintState, PizViewState, SettingsAction, SettingsState, SnakeEvent,
+    SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
 };
 use crate::display_srv::{DisplayServer, GuestProto};
 use crate::gfx::Canvas;
@@ -31,6 +31,7 @@ pub enum AppId {
     Game2048,
     PizView,
     Minesweeper,
+    Ai,
     Guest(u32),
 }
 
@@ -57,6 +58,7 @@ impl AppId {
             (AppId::Calc, Lang::En) => "Calculator",
             (AppId::Matrix, Lang::Ru) => "Матрица",
             (AppId::Matrix, Lang::En) => "Matrix",
+            (AppId::Ai, _) => "PizAI",
             (AppId::Game2048, _) => "2048",
             (AppId::PizView, Lang::Ru) => "Просмотр",
             (AppId::PizView, Lang::En) => "PizView",
@@ -78,6 +80,7 @@ impl AppId {
             AppId::Settings => 0xF85149,
             AppId::Calc => 0x38BDF8,
             AppId::Matrix => 0x22C55E,
+            AppId::Ai => 0xA855F7,
             AppId::Game2048 => 0xF59E0B,
             AppId::PizView => 0x06B6D4,
             AppId::Minesweeper => 0xF43F5E,
@@ -271,7 +274,7 @@ const START_ITEMS: [Option<AppId>; 14] = [
     None,
 ];
 
-const DESKTOP_ICONS: [(AppId, i32, i32, u32); 12] = [
+const DESKTOP_ICONS: [(AppId, i32, i32, u32); 13] = [
     (AppId::Terminal, 18, 42, 0x3FB950),
     (AppId::PizGet, 18, 114, 0xD29922),
     (AppId::Paint, 18, 186, 0xBC8CFF),
@@ -284,6 +287,7 @@ const DESKTOP_ICONS: [(AppId, i32, i32, u32); 12] = [
     (AppId::PizView, 102, 258, 0x06B6D4),
     (AppId::Minesweeper, 102, 330, 0xF43F5E),
     (AppId::Files, 102, 402, 0x58A6FF),
+    (AppId::Ai, 186, 42, 0xA855F7),
 ];
 
 struct WallpaperCache {
@@ -349,7 +353,8 @@ pub struct Desktop {
     pub dock_float_anim: f32,
     pub dock_float_vel: f32,
     pub last_canvas_size: (i32, i32),
-    pub icon_hover: [f32; 12],
+    pub icon_hover: [f32; 13],
+    pub ai: AiChatState,
     pub display_srv: DisplayServer,
     pub mouse_x: i32,
     pub mouse_y: i32,
@@ -575,7 +580,8 @@ impl Desktop {
             dock_float_anim: 0.0,
             dock_float_vel: 0.0,
             last_canvas_size: (width.max(320), height.max(240)),
-            icon_hover: [0.0; 12],
+            icon_hover: [0.0; 13],
+            ai: AiChatState::new(settings.ai_api_key.clone(), settings.ai_model_idx),
             display_srv: if cfg!(test) {
                 DisplayServer::disabled()
             } else {
@@ -598,6 +604,7 @@ impl Desktop {
                 Window::new(AppId::Game2048, 340, 80, 276, 336, false),
                 Window::new(AppId::PizView, 220, 86, 360, 300, false),
                 Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
+                Window::new(AppId::Ai, 210, 64, 430, 340, false),
                 Window::new(AppId::System, (width - 610).clamp(16, 190), 26, 330, 268, true),
                 Window::new(AppId::Settings, (width - 540).clamp(16, 370), 90, 520, 344, true),
             ],
@@ -829,6 +836,7 @@ impl Desktop {
             (AppId::Notepad, "notepad notes блокнот заметки pizpad"),
             (AppId::Calc, "calc math калькулятор счет"),
             (AppId::Matrix, "matrix rain матрица"),
+            (AppId::Ai, "ai gemini chat нейросеть ии"),
             (AppId::Game2048, "2048 game puzzle игра плитки"),
             (AppId::PizView, "bmp image photo viewer картинка просмотр фото"),
             (AppId::Minesweeper, "minesweeper сапер игра мины"),
@@ -1197,6 +1205,7 @@ impl Desktop {
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.poll_display_server();
+        self.ai.poll();
         self.settings.step_anim();
         self.calc.step_anim();
 
@@ -1848,6 +1857,25 @@ impl Desktop {
                 }
             }
             AppId::Settings => self.settings.on_key(key),
+            AppId::Ai => {
+                match key {
+                    KeyEvent::Char(c) => self.ai.on_char(c),
+                    KeyEvent::Backspace => self.ai.on_backspace(),
+                    KeyEvent::Enter => {
+                        if self.ai.on_enter() {
+                            self.settings.ai_api_key = self.ai.api_key.clone();
+                            self.settings.ai_model_idx = self.ai.model_idx;
+                            crate::config::save_config(
+                                &self.settings,
+                                self.snake.best_score,
+                                &self.sticky_note,
+                            );
+                        }
+                    }
+                    KeyEvent::Paste(s) => self.ai.paste(&s),
+                    _ => {}
+                }
+            }
             AppId::Guest(gid) => {
                 let ch = match key {
                     KeyEvent::Char(c) => Some(c),
@@ -2728,6 +2756,17 @@ impl Desktop {
             AppId::Matrix => {
                 if ly >= win.h - 32 && ly <= win.h - 8 && (12..=142).contains(&lx) {
                     self.matrix.cycle_color();
+                }
+            }
+            AppId::Ai => {
+                if self.ai.on_click(lx, ly, win.w, win.h) {
+                    self.settings.ai_api_key = self.ai.api_key.clone();
+                    self.settings.ai_model_idx = self.ai.model_idx;
+                    crate::config::save_config(
+                        &self.settings,
+                        self.snake.best_score,
+                        &self.sticky_note,
+                    );
                 }
             }
             AppId::Settings => {
@@ -4198,6 +4237,11 @@ impl Desktop {
                 canvas.fill_aa_circle(cx, cy + 8.0, 1.8, 0xF8FAFC, 255);
                 canvas.fill_aa_circle(cx + 6.0, cy + 2.0, 1.6, 0xE2E8F0, 235);
             }
+            AppId::Ai => {
+                canvas.draw_aa_line(cx, cy - 9.0, cx, cy + 9.0, 2.0, 0xC084FC, 255);
+                canvas.draw_aa_line(cx - 9.0, cy, cx + 9.0, cy, 2.0, 0xC084FC, 255);
+                canvas.fill_aa_circle(cx, cy, 3.2, 0xF8FAFC, 255);
+            }
             AppId::Game2048 => {
                 let qx = cx as i32 - 8;
                 let qy = cy as i32 - 8;
@@ -4345,6 +4389,7 @@ impl Desktop {
             AppId::PizView => self.pizview.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Minesweeper => self.minesweeper.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
+            AppId::Ai => self.ai.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Guest(gid) => self.draw_guest_contents(canvas, win, gid, accent),
             AppId::Settings => self.settings.draw(
                 canvas,

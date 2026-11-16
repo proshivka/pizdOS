@@ -911,7 +911,7 @@ mod tests {
 
         let mut canvas = Canvas::new(1160, 720);
         let mut desktop = Desktop::new(1160, 720);
-        assert_eq!(desktop.icon_hover.len(), 12);
+        assert_eq!(desktop.icon_hover.len(), 13);
 
         // Minimize all open windows and test clicking the new desktop "Файлы / Files" icon
         for w in &mut desktop.windows {

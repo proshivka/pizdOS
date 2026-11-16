@@ -352,6 +352,7 @@ impl TerminalState {
         TermAction::None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
         let x = wx + 10;
         let y = wy + 34;
@@ -699,6 +700,7 @@ impl PaintState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         canvas: &mut Canvas,
@@ -1020,6 +1022,7 @@ impl SnakeState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         canvas: &mut Canvas,
@@ -1365,6 +1368,7 @@ impl NotepadState {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, lang: Lang) {
         let x = wx + 12;
         let top_off = if self.search_mode || !self.search_query.is_empty() { 58 } else { 34 };
@@ -1670,6 +1674,8 @@ pub struct SettingsState {
     pub glass_level: u8,
     pub ui_scale_pct: u16,
     pub res_idx: usize,
+    pub ai_api_key: String,
+    pub ai_model_idx: usize,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub persistent_island: bool,
@@ -1709,6 +1715,8 @@ impl SettingsState {
             glass_level: 0,
             ui_scale_pct: 100,
             res_idx: 0,
+            ai_api_key: String::new(),
+            ai_model_idx: 0,
             crosshair_cursor: false,
             show_clock: true,
             persistent_island: false,
@@ -2203,6 +2211,7 @@ impl SettingsState {
         canvas.draw_toggle_anim(x + w - 48, mid_y - 9, anim_t, accent);
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
@@ -3341,6 +3350,7 @@ impl CalcState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
         let x = wx + 12;
         let y = wy + 34;
@@ -3469,6 +3479,7 @@ impl MatrixState {
         self.color_idx = (self.color_idx + 1) % MATRIX_COLORS.len();
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, tick: u64, lang: Lang) {
         let x = wx + 10;
@@ -3720,6 +3731,7 @@ impl Game2048State {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
         let x = wx + 12;
         let y = wy + 34;
@@ -3892,6 +3904,7 @@ impl PizViewState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
         let vx = wx + 12;
@@ -4118,6 +4131,7 @@ impl MinesweeperState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32, lang: Lang) {
         let flags = self.flagged.iter().filter(|&&f| f).count() as i32;
         let mines_left = MS_MINES as i32 - flags;
@@ -4190,6 +4204,376 @@ impl MinesweeperState {
             if self.flag_mode { accent } else { 0x1E293B },
             0xFFFFFF,
             0xF97316,
+        );
+    }
+}
+
+pub const AI_MODELS: [(&str, &str); 2] = [
+    ("Gemini 3.5 Flash-Lite", "gemini-flash-lite-latest"),
+    ("Gemini 4 Hydrogen", "gemini-flash-latest"),
+];
+
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_json_str(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => {}
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(code) = u32::from_str_radix(&hex, 16)
+                        && let Some(uc) = char::from_u32(code)
+                    {
+                        out.push(uc);
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn extract_json_field(json: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let pos = json.find(&pat)?;
+    let rest = &json[pos + pat.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    if !after.starts_with('"') {
+        return None;
+    }
+    let mut end = 1usize;
+    let bytes = after.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'\\' {
+            end += 2;
+            continue;
+        }
+        if bytes[end] == b'"' {
+            return Some(unescape_json_str(&after[1..end]));
+        }
+        end += 1;
+    }
+    None
+}
+
+pub fn extract_gemini_text(json: &str) -> Result<String, String> {
+    if let Some(err_msg) = extract_json_field(json, "message")
+        && json.contains("\"error\"")
+    {
+        return Err(err_msg);
+    }
+    if let Some(txt) = extract_json_field(json, "text") {
+        return Ok(txt);
+    }
+    Err(String::from("Empty or invalid response from Gemini API"))
+}
+
+pub struct AiChatState {
+    pub api_key: String,
+    pub model_idx: usize,
+    pub key_editing: bool,
+    pub input: String,
+    pub messages: Vec<(bool, String)>,
+    pub busy: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+}
+
+impl AiChatState {
+    pub fn new(api_key: String, model_idx: usize) -> Self {
+        Self {
+            api_key,
+            model_idx: model_idx.min(AI_MODELS.len() - 1),
+            key_editing: false,
+            input: String::new(),
+            messages: vec![(
+                false,
+                String::from("Привет! Я PizAI на базе Gemini API. Вставь свой ключ (кнопка Key) и пиши!"),
+            )],
+            busy: false,
+            rx: None,
+        }
+    }
+
+    pub fn poll(&mut self) -> bool {
+        let Some(ref rx) = self.rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.busy = false;
+                self.rx = None;
+                match res {
+                    Ok(reply) => self.messages.push((false, reply)),
+                    Err(err) => self.messages.push((false, format!("[ERR] {err}"))),
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.busy = false;
+                self.rx = None;
+                self.messages.push((false, String::from("[ERR] Worker disconnected")));
+                true
+            }
+        }
+    }
+
+    pub fn send_prompt(&mut self) {
+        let prompt = self.input.trim().to_string();
+        if prompt.is_empty() || self.busy {
+            return;
+        }
+        if self.api_key.trim().is_empty() {
+            self.messages.push((
+                false,
+                String::from("Сначала введи Gemini API Key (нажми кнопку Key вверху)."),
+            ));
+            self.key_editing = true;
+            return;
+        }
+        self.input.clear();
+        self.messages.push((true, prompt.clone()));
+        self.busy = true;
+
+        let key = self.api_key.trim().to_string();
+        let (_, model_id) = AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)];
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
+        );
+        let body = format!(
+            "{{\"contents\":[{{\"parts\":[{{\"text\":\"{}\"}}]}}]}}",
+            json_escape(&prompt)
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let out = Command::new("curl")
+                .args([
+                    "-sS",
+                    "--max-time",
+                    "30",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    &body,
+                    &url,
+                ])
+                .output();
+            let res = match out {
+                Ok(o) if o.status.success() => {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    extract_gemini_text(&s)
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    Err(if err.is_empty() {
+                        format!("curl exit {}", o.status)
+                    } else {
+                        err
+                    })
+                }
+                Err(e) => Err(format!("curl not found ({e}). Install: piz-get install curl")),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn on_char(&mut self, ch: char) {
+        if self.key_editing {
+            if !ch.is_control() && self.api_key.len() < 128 {
+                self.api_key.push(ch);
+            }
+        } else if !ch.is_control() && self.input.len() < 512 {
+            self.input.push(ch);
+        }
+    }
+
+    pub fn on_backspace(&mut self) {
+        if self.key_editing {
+            self.api_key.pop();
+        } else {
+            self.input.pop();
+        }
+    }
+
+    pub fn on_enter(&mut self) -> bool {
+        if self.key_editing {
+            self.key_editing = false;
+            return true;
+        }
+        self.send_prompt();
+        false
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if self.key_editing {
+            self.api_key.push_str(&clean);
+        } else {
+            self.input.push_str(&clean);
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) -> bool {
+        let mut changed = false;
+        // Model toggle pill at top-left (10..210, 34..56)
+        if (10..=210).contains(&lx) && (34..=56).contains(&ly) {
+            self.model_idx = (self.model_idx + 1) % AI_MODELS.len();
+            changed = true;
+        }
+        // Key toggle button (ww - 72 .. ww - 10, 34..56)
+        if lx >= ww - 72 && lx <= ww - 10 && (34..=56).contains(&ly) {
+            self.key_editing = !self.key_editing;
+            changed = true;
+        }
+        // Send button at bottom-right
+        if lx >= ww - 68 && lx <= ww - 10 && ly >= wh - 34 && ly <= wh - 10 {
+            if self.key_editing {
+                self.key_editing = false;
+                changed = true;
+            } else {
+                self.send_prompt();
+            }
+        }
+        changed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        wx: i32,
+        wy: i32,
+        ww: i32,
+        wh: i32,
+        accent: u32,
+        lang: Lang,
+    ) {
+        let (model_label, _) = AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)];
+        // Header controls
+        canvas.draw_button(wx + 10, wy + 34, 200, 22, model_label, 0x1E293B, 0xE2E8F0, accent);
+        let key_lbl = if self.key_editing {
+            tr(lang, "Готово", "Done")
+        } else if self.api_key.is_empty() {
+            "Key (!)"
+        } else {
+            "Key"
+        };
+        canvas.draw_button(
+            wx + ww - 72,
+            wy + 34,
+            62,
+            22,
+            key_lbl,
+            if self.key_editing { accent } else { 0x1E293B },
+            0xFFFFFF,
+            accent,
+        );
+
+        // Chat area
+        let cx = wx + 10;
+        let cy = wy + 62;
+        let cw = (ww - 20).max(80);
+        let ch = (wh - 102).max(60);
+        canvas.fill_rounded_rect(cx, cy, cw, ch, 8, 0x0B101B);
+        canvas.draw_rounded_rect_alpha(cx, cy, cw, ch, 8, 0xFFFFFF, 20);
+
+        let mut lines: Vec<(bool, String)> = Vec::new();
+        let max_chars = ((cw - 20) / 7).max(16) as usize;
+        for (is_user, msg) in &self.messages {
+            for raw_line in msg.lines() {
+                let mut cur = String::new();
+                for word in raw_line.split_whitespace() {
+                    if cur.len() + word.len() + 1 > max_chars && !cur.is_empty() {
+                        lines.push((*is_user, cur));
+                        cur = String::new();
+                    }
+                    if !cur.is_empty() {
+                        cur.push(' ');
+                    }
+                    cur.push_str(word);
+                }
+                lines.push((*is_user, cur));
+            }
+        }
+        if self.busy {
+            lines.push((false, String::from(tr(lang, "Думаю...", "Thinking..."))));
+        }
+
+        let max_vis = ((ch - 12) / 16).max(1) as usize;
+        let start = lines.len().saturating_sub(max_vis);
+        for (i, (is_user, line)) in lines[start..].iter().enumerate() {
+            let ly = cy + 8 + (i as i32) * 16;
+            let col = if *is_user { 0x38BDF8 } else { 0xE2E8F0 };
+            let prefix = if *is_user { "> " } else { "" };
+            canvas.draw_text_clipped(cx + 8, ly, cw - 16, &format!("{prefix}{line}"), col, 1);
+        }
+
+        // Input bar
+        let iy = wy + wh - 34;
+        let iw = (ww - 84).max(60);
+        canvas.fill_rounded_rect(wx + 10, iy, iw, 24, 6, 0x0F172A);
+        canvas.draw_rounded_rect_alpha(
+            wx + 10,
+            iy,
+            iw,
+            24,
+            6,
+            if self.key_editing { 0xF59E0B } else { accent },
+            90,
+        );
+        let disp = if self.key_editing {
+            format!("API Key: {}_", self.api_key)
+        } else if self.input.is_empty() {
+            String::from(tr(lang, "Спроси Gemini...", "Ask Gemini..."))
+        } else {
+            format!("{}_", self.input)
+        };
+        let dcol = if !self.key_editing && self.input.is_empty() {
+            0x64748B
+        } else {
+            0xF8FAFC
+        };
+        canvas.draw_text_clipped(wx + 16, iy + 5, iw - 12, &disp, dcol, 1);
+        canvas.draw_button(
+            wx + ww - 68,
+            iy,
+            58,
+            24,
+            if self.key_editing { "OK" } else { ">" },
+            accent,
+            0xFFFFFF,
+            accent,
         );
     }
 }
