@@ -4577,3 +4577,721 @@ impl AiChatState {
         );
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// 11. PizSurf Browser
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebBlock {
+    Heading(u8, String),
+    Paragraph(String),
+    Link(String, String),
+    Code(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct WebPage {
+    pub title: String,
+    pub url: String,
+    pub blocks: Vec<WebBlock>,
+}
+
+pub fn decode_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp + 1..];
+        if let Some(semi) = tail.find(';').filter(|&p| p <= 10) {
+            let ent = &tail[..semi];
+            let decoded = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                "nbsp" => Some(' '),
+                "ndash" => Some('-'),
+                "mdash" => Some('-'),
+                "hellip" => Some('.'),
+                "bull" => Some('*'),
+                _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                    u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+                }
+                _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &tail[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_attr(attrs: &str, name: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let needle = format!("{name}=");
+    let pos = lower.find(&needle)?;
+    let val_start = attrs[pos + needle.len()..].trim_start();
+    if let Some(first) = val_start.bytes().next() {
+        if first == b'"' || first == b'\'' {
+            let inner = &val_start[1..];
+            let end = inner.find(first as char)?;
+            return Some(decode_html_entities(&inner[..end]));
+        }
+        let end = val_start.find(char::is_whitespace).unwrap_or(val_start.len());
+        return Some(decode_html_entities(&val_start[..end]));
+    }
+    None
+}
+
+pub fn normalize_address(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("about:home") || s.eq_ignore_ascii_case("about:pizdos") {
+        return String::from("about:pizdos");
+    }
+    if s.starts_with("https://") || s.starts_with("http://") || s.starts_with("about:") {
+        return String::from(s);
+    }
+    if !s.contains(' ') && (s.contains('.') || s.starts_with("localhost")) {
+        return format!("https://{s}");
+    }
+    let mut enc = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => enc.push(*b as char),
+            b' ' => enc.push('+'),
+            other => enc.push_str(&format!("%{other:02X}")),
+        }
+    }
+    format!("https://lite.duckduckgo.com/lite/?q={enc}")
+}
+
+pub fn resolve_url(base: &str, href: &str) -> String {
+    let h = href.trim();
+    if h.is_empty() || h.starts_with('#') || h.starts_with("javascript:") {
+        return String::from(base);
+    }
+    if h.starts_with("https://") || h.starts_with("http://") || h.starts_with("about:") {
+        return String::from(h);
+    }
+    let scheme_end = base.find("://").unwrap_or(0);
+    let after_scheme = if scheme_end > 0 { scheme_end + 3 } else { 0 };
+    if h.starts_with("//") {
+        let scheme = if scheme_end > 0 { &base[..scheme_end] } else { "https" };
+        return format!("{scheme}:{h}");
+    }
+    let host_end = base[after_scheme..]
+        .find('/')
+        .map(|i| after_scheme + i)
+        .unwrap_or(base.len());
+    let origin = &base[..host_end];
+    if h.starts_with('/') {
+        return format!("{origin}{h}");
+    }
+    let dir_end = base[host_end..]
+        .rfind('/')
+        .map(|i| host_end + i + 1)
+        .unwrap_or(host_end);
+    if dir_end <= host_end {
+        format!("{origin}/{h}")
+    } else {
+        format!("{}{h}", &base[..dir_end])
+    }
+}
+
+fn push_clean_block(blocks: &mut Vec<WebBlock>, text: &mut String, heading: Option<u8>, is_pre: bool) {
+    let trimmed = if is_pre {
+        text.trim_matches('\n').to_string()
+    } else {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    text.clear();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(lvl) = heading {
+        blocks.push(WebBlock::Heading(lvl, trimmed));
+    } else if is_pre {
+        blocks.push(WebBlock::Code(trimmed));
+    } else {
+        blocks.push(WebBlock::Paragraph(trimmed));
+    }
+}
+
+pub fn parse_html_page(url: &str, html: &str) -> WebPage {
+    let bytes = html.as_bytes();
+    let mut blocks = Vec::new();
+    let mut title = String::new();
+    let mut text_buf = String::new();
+    let mut cur_href: Option<String> = None;
+    let mut link_buf = String::new();
+    let mut heading: Option<u8> = None;
+    let mut in_title = false;
+    let mut in_pre = false;
+    let mut skip_tag: Option<&'static str> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let text_chunk = &html[i..];
+            if text_chunk.starts_with("<!--")
+                && let Some(cend) = text_chunk.find("-->")
+            {
+                i += cend + 3;
+                continue;
+            }
+            if let Some(rel_end) = text_chunk.find('>') {
+                let raw_tag = &text_chunk[1..rel_end];
+                i += rel_end + 1;
+                let trimmed = raw_tag.trim();
+                let is_close = trimmed.starts_with('/');
+                let name_raw = if is_close { trimmed[1..].trim() } else { trimmed };
+                let name_end = name_raw
+                    .find(|c: char| c.is_whitespace() || c == '/')
+                    .unwrap_or(name_raw.len());
+                let tag = name_raw[..name_end].to_ascii_lowercase();
+                let attrs = &name_raw[name_end..];
+
+                if let Some(sk) = skip_tag {
+                    if is_close && tag == sk {
+                        skip_tag = None;
+                    }
+                    continue;
+                }
+                if !is_close && matches!(tag.as_str(), "script" | "style" | "noscript" | "svg") {
+                    skip_tag = Some(match tag.as_str() {
+                        "script" => "script",
+                        "style" => "style",
+                        "noscript" => "noscript",
+                        _ => "svg",
+                    });
+                    continue;
+                }
+                match tag.as_str() {
+                    "title" => {
+                        in_title = !is_close;
+                    }
+                    "h1" | "h2" | "h3" | "h4" => {
+                        let lvl = tag.as_bytes()[1].saturating_sub(b'0').clamp(1, 3);
+                        if !is_close {
+                            push_clean_block(&mut blocks, &mut text_buf, heading.take(), in_pre);
+                            heading = Some(lvl);
+                        } else {
+                            push_clean_block(&mut blocks, &mut text_buf, heading.take(), in_pre);
+                        }
+                    }
+                    "pre" => {
+                        if !is_close {
+                            push_clean_block(&mut blocks, &mut text_buf, heading.take(), in_pre);
+                            in_pre = true;
+                        } else {
+                            push_clean_block(&mut blocks, &mut text_buf, None, true);
+                            in_pre = false;
+                        }
+                    }
+                    "a" => {
+                        if !is_close {
+                            if let Some(href) = extract_attr(attrs, "href") {
+                                push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
+                                cur_href = Some(href);
+                                link_buf.clear();
+                            }
+                        } else if let Some(href) = cur_href.take() {
+                            let label = link_buf.split_whitespace().collect::<Vec<_>>().join(" ");
+                            link_buf.clear();
+                            if !label.is_empty() {
+                                blocks.push(WebBlock::Link(label, resolve_url(url, &href)));
+                            }
+                        }
+                    }
+                    "p" | "div" | "li" | "br" | "tr" | "section" | "article" | "header" | "footer" => {
+                        if cur_href.is_none() {
+                            push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
+                        }
+                        if tag == "li" && !is_close {
+                            text_buf.push_str("* ");
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        let next_lt = html[i..].find('<').map(|p| i + p).unwrap_or(html.len());
+        let plain = decode_html_entities(&html[i..next_lt]);
+        if in_title {
+            title.push_str(&plain);
+        } else if cur_href.is_some() {
+            link_buf.push_str(&plain);
+        } else if !in_title && skip_tag.is_none() {
+            text_buf.push_str(&plain);
+        }
+        i = next_lt;
+    }
+    push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
+
+    if !html.contains('<') && blocks.is_empty() {
+        for line in html.lines() {
+            let l = line.trim();
+            if !l.is_empty() {
+                blocks.push(WebBlock::Paragraph(String::from(l)));
+            }
+        }
+    }
+    let clean_title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    WebPage {
+        title: if clean_title.is_empty() {
+            String::from(url)
+        } else {
+            clean_title
+        },
+        url: String::from(url),
+        blocks,
+    }
+}
+
+pub fn built_in_home_page() -> WebPage {
+    WebPage {
+        title: String::from("PizSurf Home"),
+        url: String::from("about:pizdos"),
+        blocks: vec![
+            WebBlock::Heading(1, String::from("PizSurf Browser - pizdOS 2.1(00)")),
+            WebBlock::Paragraph(String::from(
+                "Zero-deps Rust web reader with live HTTP/HTTPS fetch and clickable links.",
+            )),
+            WebBlock::Heading(2, String::from("Quick Bookmarks")),
+            WebBlock::Link(
+                String::from("[Search] DuckDuckGo Lite"),
+                String::from("https://lite.duckduckgo.com/lite/"),
+            ),
+            WebBlock::Link(
+                String::from("[News] Hacker News"),
+                String::from("https://news.ycombinator.com/"),
+            ),
+            WebBlock::Link(
+                String::from("[Wiki] Wikipedia Mobile"),
+                String::from("https://en.m.wikipedia.org/wiki/Main_Page"),
+            ),
+            WebBlock::Link(
+                String::from("[Weather] wttr.in"),
+                String::from("https://wttr.in/?format=4"),
+            ),
+            WebBlock::Link(
+                String::from("[Test] example.com"),
+                String::from("https://example.com/"),
+            ),
+        ],
+    }
+}
+
+type LinkHitbox = (i32, i32, i32, i32, String);
+
+pub struct BrowserState {
+    pub url_input: String,
+    pub url_focused: bool,
+    pub current_url: String,
+    pub history: Vec<String>,
+    pub history_pos: usize,
+    pub page: WebPage,
+    pub scroll: usize,
+    pub loading: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<WebPage, String>>>,
+    rendered_links: RefCell<Vec<LinkHitbox>>,
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserState {
+    pub fn new() -> Self {
+        let home = built_in_home_page();
+        Self {
+            url_input: home.url.clone(),
+            url_focused: false,
+            current_url: home.url.clone(),
+            history: vec![home.url.clone()],
+            history_pos: 0,
+            page: home,
+            scroll: 0,
+            loading: false,
+            rx: None,
+            rendered_links: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn navigate(&mut self, raw: &str, push_hist: bool) {
+        let url = normalize_address(raw);
+        self.url_input = url.clone();
+        self.current_url = url.clone();
+        self.url_focused = false;
+        self.scroll = 0;
+        if push_hist {
+            if self.history_pos + 1 < self.history.len() {
+                self.history.truncate(self.history_pos + 1);
+            }
+            if self.history.last() != Some(&url) {
+                self.history.push(url.clone());
+                self.history_pos = self.history.len() - 1;
+            }
+        }
+        if url == "about:pizdos" {
+            self.loading = false;
+            self.rx = None;
+            self.page = built_in_home_page();
+            return;
+        }
+        self.loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let out = Command::new("curl")
+                .args([
+                    "-sSL",
+                    "--max-time",
+                    "15",
+                    "-A",
+                    "PizSurf/2.1 (pizdOS)",
+                    &url,
+                ])
+                .output();
+            let res = match out {
+                Ok(o) if o.status.success() => {
+                    let html = String::from_utf8_lossy(&o.stdout);
+                    Ok(parse_html_page(&url, &html))
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    Err(if err.is_empty() {
+                        format!("HTTP fetch failed ({})", o.status)
+                    } else {
+                        err
+                    })
+                }
+                Err(e) => Err(format!("curl not found ({e}). Install: piz-get install curl")),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn back(&mut self) {
+        if self.history_pos > 0 {
+            self.history_pos -= 1;
+            let url = self.history[self.history_pos].clone();
+            self.navigate(&url, false);
+        }
+    }
+
+    pub fn forward(&mut self) {
+        if self.history_pos + 1 < self.history.len() {
+            self.history_pos += 1;
+            let url = self.history[self.history_pos].clone();
+            self.navigate(&url, false);
+        }
+    }
+
+    pub fn poll(&mut self) -> bool {
+        let Some(ref rx) = self.rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.loading = false;
+                self.rx = None;
+                match res {
+                    Ok(p) => {
+                        self.page = p;
+                        self.scroll = 0;
+                    }
+                    Err(err) => {
+                        self.page = WebPage {
+                            title: String::from("Error"),
+                            url: self.current_url.clone(),
+                            blocks: vec![
+                                WebBlock::Heading(1, String::from("Failed to load page")),
+                                WebBlock::Paragraph(err),
+                                WebBlock::Link(
+                                    String::from("Back to about:pizdos"),
+                                    String::from("about:pizdos"),
+                                ),
+                            ],
+                        };
+                    }
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.loading = false;
+                self.rx = None;
+                true
+            }
+        }
+    }
+
+    pub fn on_key(&mut self, key: &KeyEvent) {
+        if self.url_focused {
+            match key {
+                KeyEvent::Char(c) if !c.is_control() => {
+                    if self.url_input.len() < 256 {
+                        self.url_input.push(*c);
+                    }
+                }
+                KeyEvent::Backspace => {
+                    self.url_input.pop();
+                }
+                KeyEvent::Enter => {
+                    let target = self.url_input.clone();
+                    self.navigate(&target, true);
+                }
+                KeyEvent::Escape => self.url_focused = false,
+                KeyEvent::Paste(s) => {
+                    for c in s.chars().filter(|c| !c.is_control()) {
+                        self.url_input.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            KeyEvent::Down => self.scroll = self.scroll.saturating_add(3),
+            KeyEvent::Up => self.scroll = self.scroll.saturating_sub(3),
+            KeyEvent::Char('r') | KeyEvent::Char('R') => {
+                let u = self.current_url.clone();
+                self.navigate(&u, false);
+            }
+            KeyEvent::Char('l') => self.url_focused = true,
+            _ => {}
+        }
+    }
+
+    pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) {
+        // Toolbar row (32..56)
+        if (32..=56).contains(&ly) {
+            if (8..=34).contains(&lx) {
+                self.back();
+                return;
+            }
+            if (38..=64).contains(&lx) {
+                self.forward();
+                return;
+            }
+            if (68..=94).contains(&lx) {
+                let u = self.current_url.clone();
+                self.navigate(&u, false);
+                return;
+            }
+            if lx >= ww - 44 && lx <= ww - 8 {
+                let target = self.url_input.clone();
+                self.navigate(&target, true);
+                return;
+            }
+            if (98..=ww - 50).contains(&lx) {
+                self.url_focused = true;
+                return;
+            }
+        }
+        self.url_focused = false;
+        // Scroll buttons at right edge of viewport
+        if lx >= ww - 28 && ly >= 62 && ly <= wh - 10 {
+            if ly < (62 + wh - 10) / 2 {
+                self.scroll = self.scroll.saturating_sub(4);
+            } else {
+                self.scroll = self.scroll.saturating_add(4);
+            }
+            return;
+        }
+        let clicked = {
+            let links = self.rendered_links.borrow();
+            links
+                .iter()
+                .find(|(rx, ry, rw, rh, _)| lx >= *rx && lx <= rx + rw && ly >= *ry && ly <= ry + rh)
+                .map(|(_, _, _, _, href)| href.clone())
+        };
+        if let Some(href) = clicked {
+            self.navigate(&href, true);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        wx: i32,
+        wy: i32,
+        ww: i32,
+        wh: i32,
+        accent: u32,
+        lang: Lang,
+    ) {
+        // Toolbar
+        canvas.draw_button(
+            wx + 8,
+            wy + 32,
+            26,
+            24,
+            "<",
+            0x1E293B,
+            if self.history_pos > 0 { 0xE2E8F0 } else { 0x475569 },
+            accent,
+        );
+        canvas.draw_button(
+            wx + 38,
+            wy + 32,
+            26,
+            24,
+            ">",
+            0x1E293B,
+            if self.history_pos + 1 < self.history.len() { 0xE2E8F0 } else { 0x475569 },
+            accent,
+        );
+        canvas.draw_button(wx + 68, wy + 32, 26, 24, "R", 0x1E293B, 0xE2E8F0, accent);
+
+        let bar_w = (ww - 152).max(60);
+        canvas.fill_rounded_rect(wx + 98, wy + 32, bar_w, 24, 6, 0x0B101B);
+        canvas.draw_rounded_rect_alpha(
+            wx + 98,
+            wy + 32,
+            bar_w,
+            24,
+            6,
+            if self.url_focused { accent } else { 0xFFFFFF },
+            if self.url_focused { 160 } else { 30 },
+        );
+        let url_txt = if self.url_focused {
+            format!("{}_", self.url_input)
+        } else {
+            self.url_input.clone()
+        };
+        canvas.draw_text_clipped(wx + 104, wy + 37, bar_w - 12, &url_txt, 0xE2E8F0, 1);
+        canvas.draw_button(wx + ww - 44, wy + 32, 36, 24, "Go", accent, 0xFFFFFF, accent);
+
+        // Viewport
+        let vx = wx + 8;
+        let vy = wy + 62;
+        let vw = (ww - 16).max(80);
+        let vh = (wh - 70).max(60);
+        canvas.fill_rounded_rect(vx, vy, vw, vh, 8, 0x090D16);
+        canvas.draw_rounded_rect_alpha(vx, vy, vw, vh, 8, 0xFFFFFF, 20);
+
+        if self.loading {
+            canvas.draw_text_clipped(
+                vx + 14,
+                vy + 14,
+                vw - 28,
+                tr(lang, "Загрузка страницы...", "Loading page..."),
+                accent,
+                1,
+            );
+            return;
+        }
+
+        // Flatten blocks into visual rows
+        enum VisRow {
+            Text { text: String, col: u32, scale: i32, bg: Option<u32> },
+            Link { text: String, href: String },
+        }
+        let max_c1 = ((vw - 36) / 7).max(16) as usize;
+        let mut rows: Vec<VisRow> = Vec::new();
+        for blk in &self.page.blocks {
+            match blk {
+                WebBlock::Heading(lvl, s) => {
+                    let scale = if *lvl == 1 { 2 } else { 1 };
+                    let cap = if scale == 2 { (max_c1 / 2).max(10) } else { max_c1 };
+                    let mut cur = String::new();
+                    for w in s.split_whitespace() {
+                        if cur.len() + w.len() + 1 > cap && !cur.is_empty() {
+                            rows.push(VisRow::Text { text: cur, col: 0xF8FAFC, scale, bg: None });
+                            cur = String::new();
+                        }
+                        if !cur.is_empty() {
+                            cur.push(' ');
+                        }
+                        cur.push_str(w);
+                    }
+                    if !cur.is_empty() {
+                        rows.push(VisRow::Text { text: cur, col: 0xF8FAFC, scale, bg: None });
+                    }
+                }
+                WebBlock::Paragraph(s) => {
+                    let mut cur = String::new();
+                    for w in s.split_whitespace() {
+                        if cur.len() + w.len() + 1 > max_c1 && !cur.is_empty() {
+                            rows.push(VisRow::Text { text: cur, col: 0xCBD5E1, scale: 1, bg: None });
+                            cur = String::new();
+                        }
+                        if !cur.is_empty() {
+                            cur.push(' ');
+                        }
+                        cur.push_str(w);
+                    }
+                    if !cur.is_empty() {
+                        rows.push(VisRow::Text { text: cur, col: 0xCBD5E1, scale: 1, bg: None });
+                    }
+                }
+                WebBlock::Code(s) => {
+                    for l in s.lines().take(12) {
+                        rows.push(VisRow::Text {
+                            text: String::from(l),
+                            col: 0x86EFAC,
+                            scale: 1,
+                            bg: Some(0x111827),
+                        });
+                    }
+                }
+                WebBlock::Link(lbl, href) => {
+                    rows.push(VisRow::Link {
+                        text: format!("-> {lbl}"),
+                        href: href.clone(),
+                    });
+                }
+            }
+        }
+
+        let start = self.scroll.min(rows.len().saturating_sub(1));
+        let mut hit_links = self.rendered_links.borrow_mut();
+        hit_links.clear();
+        let mut cy = vy + 10;
+        let max_y = vy + vh - 12;
+        for row in &rows[start..] {
+            let rh = match row {
+                VisRow::Text { scale: 2, .. } => 26,
+                _ => 18,
+            };
+            if cy + rh > max_y {
+                break;
+            }
+            match row {
+                VisRow::Text { text, col, scale, bg } => {
+                    if let Some(bgc) = bg {
+                        canvas.fill_rect(vx + 10, cy - 1, vw - 36, 16, *bgc);
+                    }
+                    canvas.draw_text_clipped(vx + 12, cy, vw - 38, text, *col, *scale);
+                }
+                VisRow::Link { text, href } => {
+                    let tw = canvas.measure_text(text, 1).min(vw - 40);
+                    canvas.draw_text_clipped(vx + 12, cy, vw - 38, text, 0x38BDF8, 1);
+                    canvas.fill_rect(vx + 12, cy + 14, tw, 1, 0x38BDF8);
+                    hit_links.push((20, cy - wy, tw + 8, 17, href.clone()));
+                }
+            }
+            cy += rh;
+        }
+        // Subtle scroll up/down buttons on right edge
+        if rows.len() > 1 {
+            canvas.draw_text_clipped(wx + ww - 22, vy + 6, 16, "^", 0x94A3B8, 1);
+            canvas.draw_text_clipped(wx + ww - 22, vy + vh - 20, 16, "v", 0x94A3B8, 1);
+        }
+    }
+}

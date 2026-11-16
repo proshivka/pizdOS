@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    AiChatState, CalcState, Game2048State, KeyEvent, Lang, MatrixState, MinesweeperState,
-    NotepadState, PaintAction, PaintState, PizViewState, SettingsAction, SettingsState, SnakeEvent,
-    SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
+    AiChatState, BrowserState, CalcState, Game2048State, KeyEvent, Lang, MatrixState,
+    MinesweeperState, NotepadState, PaintAction, PaintState, PizViewState, SettingsAction,
+    SettingsState, SnakeEvent, SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
 };
 use crate::display_srv::{DisplayServer, GuestProto};
 use crate::gfx::Canvas;
@@ -32,6 +32,7 @@ pub enum AppId {
     PizView,
     Minesweeper,
     Ai,
+    Browser,
     Guest(u32),
 }
 
@@ -59,6 +60,8 @@ impl AppId {
             (AppId::Matrix, Lang::Ru) => "Матрица",
             (AppId::Matrix, Lang::En) => "Matrix",
             (AppId::Ai, _) => "PizAI",
+            (AppId::Browser, Lang::Ru) => "Браузер",
+            (AppId::Browser, Lang::En) => "Browser",
             (AppId::Game2048, _) => "2048",
             (AppId::PizView, Lang::Ru) => "Просмотр",
             (AppId::PizView, Lang::En) => "PizView",
@@ -81,6 +84,7 @@ impl AppId {
             AppId::Calc => 0x38BDF8,
             AppId::Matrix => 0x22C55E,
             AppId::Ai => 0xA855F7,
+            AppId::Browser => 0x0EA5E9,
             AppId::Game2048 => 0xF59E0B,
             AppId::PizView => 0x06B6D4,
             AppId::Minesweeper => 0xF43F5E,
@@ -257,7 +261,9 @@ pub struct FileItem {
     pub path: PathBuf,
 }
 
-const START_ITEMS: [Option<AppId>; 14] = [
+const START_ITEMS: [Option<AppId>; 16] = [
+    Some(AppId::Browser),
+    Some(AppId::Ai),
     Some(AppId::Terminal),
     Some(AppId::Calc),
     Some(AppId::Paint),
@@ -274,7 +280,7 @@ const START_ITEMS: [Option<AppId>; 14] = [
     None,
 ];
 
-const DESKTOP_ICONS: [(AppId, i32, i32, u32); 13] = [
+const DESKTOP_ICONS: [(AppId, i32, i32, u32); 14] = [
     (AppId::Terminal, 18, 42, 0x3FB950),
     (AppId::PizGet, 18, 114, 0xD29922),
     (AppId::Paint, 18, 186, 0xBC8CFF),
@@ -288,6 +294,7 @@ const DESKTOP_ICONS: [(AppId, i32, i32, u32); 13] = [
     (AppId::Minesweeper, 102, 330, 0xF43F5E),
     (AppId::Files, 102, 402, 0x58A6FF),
     (AppId::Ai, 186, 42, 0xA855F7),
+    (AppId::Browser, 186, 114, 0x0EA5E9),
 ];
 
 struct WallpaperCache {
@@ -353,8 +360,9 @@ pub struct Desktop {
     pub dock_float_anim: f32,
     pub dock_float_vel: f32,
     pub last_canvas_size: (i32, i32),
-    pub icon_hover: [f32; 13],
+    pub icon_hover: [f32; 14],
     pub ai: AiChatState,
+    pub browser: BrowserState,
     pub display_srv: DisplayServer,
     pub mouse_x: i32,
     pub mouse_y: i32,
@@ -580,8 +588,9 @@ impl Desktop {
             dock_float_anim: 0.0,
             dock_float_vel: 0.0,
             last_canvas_size: (width.max(320), height.max(240)),
-            icon_hover: [0.0; 13],
+            icon_hover: [0.0; 14],
             ai: AiChatState::new(settings.ai_api_key.clone(), settings.ai_model_idx),
+            browser: BrowserState::new(),
             display_srv: if cfg!(test) {
                 DisplayServer::disabled()
             } else {
@@ -605,6 +614,7 @@ impl Desktop {
                 Window::new(AppId::PizView, 220, 86, 360, 300, false),
                 Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
                 Window::new(AppId::Ai, 210, 64, 430, 340, false),
+                Window::new(AppId::Browser, 170, 52, 480, 356, false),
                 Window::new(AppId::System, (width - 610).clamp(16, 190), 26, 330, 268, true),
                 Window::new(AppId::Settings, (width - 540).clamp(16, 370), 90, 520, 344, true),
             ],
@@ -664,6 +674,9 @@ impl Desktop {
             && let Some(surf) = self.display_srv.window(gid)
         {
             return surf.title.clone();
+        }
+        if id == AppId::Browser && !self.browser.page.title.is_empty() {
+            return self.browser.page.title.clone();
         }
         String::from(id.title(self.settings.lang))
     }
@@ -837,6 +850,7 @@ impl Desktop {
             (AppId::Calc, "calc math калькулятор счет"),
             (AppId::Matrix, "matrix rain матрица"),
             (AppId::Ai, "ai gemini chat нейросеть ии"),
+            (AppId::Browser, "browser web internet pizarf браузер интернет"),
             (AppId::Game2048, "2048 game puzzle игра плитки"),
             (AppId::PizView, "bmp image photo viewer картинка просмотр фото"),
             (AppId::Minesweeper, "minesweeper сапер игра мины"),
@@ -1206,6 +1220,7 @@ impl Desktop {
         self.tick = self.tick.wrapping_add(1);
         self.poll_display_server();
         self.ai.poll();
+        self.browser.poll();
         self.settings.step_anim();
         self.calc.step_anim();
 
@@ -1876,6 +1891,7 @@ impl Desktop {
                     _ => {}
                 }
             }
+            AppId::Browser => self.browser.on_key(&key),
             AppId::Guest(gid) => {
                 let ch = match key {
                     KeyEvent::Char(c) => Some(c),
@@ -2769,6 +2785,7 @@ impl Desktop {
                     );
                 }
             }
+            AppId::Browser => self.browser.on_click(lx, ly, win.w, win.h),
             AppId::Settings => {
                 let old_scale = self.settings.ui_scale();
                 let prev_dock = self.settings.floating_dock;
@@ -4242,6 +4259,13 @@ impl Desktop {
                 canvas.draw_aa_line(cx - 9.0, cy, cx + 9.0, cy, 2.0, 0xC084FC, 255);
                 canvas.fill_aa_circle(cx, cy, 3.2, 0xF8FAFC, 255);
             }
+            AppId::Browser => {
+                canvas.fill_aa_circle(cx, cy, 8.5, 0x0EA5E9, 55);
+                canvas.draw_aa_line(cx - 8.5, cy, cx + 8.5, cy, 1.4, 0x38BDF8, 240);
+                canvas.draw_aa_line(cx, cy - 8.5, cx, cy + 8.5, 1.4, 0x38BDF8, 240);
+                canvas.draw_aa_line(cx - 6.0, cy - 5.5, cx + 6.0, cy - 5.5, 1.1, 0xBAE6FD, 190);
+                canvas.draw_aa_line(cx - 6.0, cy + 5.5, cx + 6.0, cy + 5.5, 1.1, 0xBAE6FD, 190);
+            }
             AppId::Game2048 => {
                 let qx = cx as i32 - 8;
                 let qy = cy as i32 - 8;
@@ -4390,6 +4414,7 @@ impl Desktop {
             AppId::Minesweeper => self.minesweeper.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Matrix => self.matrix.draw(canvas, win.x, win.y, win.w, win.h, self.tick, lang),
             AppId::Ai => self.ai.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
+            AppId::Browser => self.browser.draw(canvas, win.x, win.y, win.w, win.h, accent, lang),
             AppId::Guest(gid) => self.draw_guest_contents(canvas, win, gid, accent),
             AppId::Settings => self.settings.draw(
                 canvas,

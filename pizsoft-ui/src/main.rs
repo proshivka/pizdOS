@@ -911,7 +911,7 @@ mod tests {
 
         let mut canvas = Canvas::new(1160, 720);
         let mut desktop = Desktop::new(1160, 720);
-        assert_eq!(desktop.icon_hover.len(), 13);
+        assert_eq!(desktop.icon_hover.len(), 14);
 
         // Minimize all open windows and test clicking the new desktop "Файлы / Files" icon
         for w in &mut desktop.windows {
@@ -1319,5 +1319,42 @@ mod tests {
             .find(|e| e[0] == 4)
             .map(|e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]));
         assert_eq!(pressed_win, Some(child_wid));
+    }
+
+    #[test]
+    fn test_browser_html_parser_url_resolve_and_navigation() {
+        use crate::apps::{BrowserState, WebBlock, normalize_address, parse_html_page, resolve_url};
+
+        assert_eq!(normalize_address("example.com"), "https://example.com");
+        assert_eq!(
+            normalize_address("pizdos os"),
+            "https://lite.duckduckgo.com/lite/?q=pizdos+os"
+        );
+        assert_eq!(
+            resolve_url("https://example.com/dir/page.html", "/about"),
+            "https://example.com/about"
+        );
+        assert_eq!(
+            resolve_url("https://example.com/dir/page.html", "sub.html"),
+            "https://example.com/dir/sub.html"
+        );
+
+        let html = "<html><head><title>Hi &amp; Test</title><style>body{}</style></head>\
+                    <body><h1>Welcome</h1><p>Hello &lt;world&gt;!</p>\
+                    <a href='/next'>Go Next</a></body></html>";
+        let page = parse_html_page("https://example.com/", html);
+        assert_eq!(page.title, "Hi & Test");
+        assert!(page.blocks.contains(&WebBlock::Heading(1, String::from("Welcome"))));
+        assert!(page.blocks.contains(&WebBlock::Paragraph(String::from("Hello <world>!"))));
+        assert!(page.blocks.contains(&WebBlock::Link(
+            String::from("Go Next"),
+            String::from("https://example.com/next"),
+        )));
+
+        let mut br = BrowserState::new();
+        assert_eq!(br.current_url, "about:pizdos");
+        br.navigate("about:pizdos", true);
+        let mut canvas = Canvas::new(800, 600);
+        br.draw(&mut canvas, 100, 50, 480, 356, 0x0EA5E9, apps::Lang::Ru);
     }
 }
