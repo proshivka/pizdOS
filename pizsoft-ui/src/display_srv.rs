@@ -4,9 +4,28 @@ use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::thread;
 
 use crate::font;
+
+fn x11_log_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIZSOFT_X11_LOG").is_some())
+}
+
+fn x11_log(msg: &str) {
+    if !x11_log_enabled() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pizsoft_x11.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestProto {
@@ -1508,6 +1527,16 @@ impl DisplayServer {
         unmapped: &mut Vec<u32>,
     ) {
         let msb = c.msb;
+        if x11_log_enabled() {
+            x11_log(&format!(
+                "c{} seq={} op={} det={} len={}",
+                c.id,
+                c.seq,
+                op,
+                detail,
+                pkt.len()
+            ));
+        }
         match op {
             1 if pkt.len() >= 32 => {
                 // CreateWindow
@@ -1642,6 +1671,9 @@ impl DisplayServer {
                     }
                     c.paint_win_on_surface(&mut self.surfaces, wid);
                     c.send_map_notify(parent, wid);
+                    if wid != parent {
+                        c.send_map_notify(wid, wid);
+                    }
                     c.send_expose(wid, w, h);
                     // Expose any already-mapped children (e.g., created & mapped before parent)
                     let mut child_queue = c.sorted_children(wid);
@@ -1762,6 +1794,7 @@ impl DisplayServer {
                     }
                     if let Some((nx, ny, nw, nh, _, _, _, _)) = cfg {
                         c.send_configure_notify(wid, nx, ny, nw, nh);
+                        c.send_expose(wid, nw, nh);
                     }
                 }
             }
@@ -2654,6 +2687,9 @@ impl DisplayServer {
                 } else {
                     String::new()
                 };
+                if x11_log_enabled() {
+                    x11_log(&format!("  QueryExtension: '{name}'"));
+                }
                 let mut rep = [0u8; 32];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
@@ -2704,6 +2740,112 @@ impl DisplayServer {
                 rep[33] = 66;
                 rep[34] = 37;
                 rep[35] = 64;
+                c.tx.extend_from_slice(&rep);
+            }
+            39 => {
+                // GetMotionEvents -> 0 events
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            44 => {
+                // QueryKeymap -> 32-byte key_vector (40 bytes total)
+                let mut rep = [0u8; 40];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 2, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            48 => {
+                // QueryTextExtents -> fixed 8x14 metrics
+                let nchars = if pkt.len() >= 8 {
+                    ((pkt.len() - 8) / 2).saturating_sub(usize::from(detail != 0))
+                } else {
+                    0
+                };
+                let overall_w = (nchars as i32) * 8;
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], 11, msb); // font_ascent
+                w16(&mut rep[10..12], 3, msb); // font_descent
+                w16(&mut rep[12..14], 11, msb); // overall_ascent
+                w16(&mut rep[14..16], 3, msb); // overall_descent
+                w32(&mut rep[16..20], overall_w as u32, msb); // overall_width
+                w32(&mut rep[24..28], overall_w as u32, msb); // overall_right
+                c.tx.extend_from_slice(&rep);
+            }
+            50 | 52 | 110 => {
+                // ListFontsWithInfo (50), GetFontPath (52), ListHosts (110) -> empty
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            83 => {
+                // ListInstalledColormaps -> [DEF_COLORMAP]
+                let mut rep = [0u8; 36];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 1, msb);
+                w16(&mut rep[8..10], 1, msb);
+                w32(&mut rep[32..36], DEF_COLORMAP, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            99 => {
+                // ListExtensions -> ["XInputExtension", "Generic Event Extension"]
+                let exts: [&[u8]; 2] = [b"XInputExtension", b"Generic Event Extension"];
+                let mut list = Vec::new();
+                for e in exts {
+                    list.push(e.len() as u8);
+                    list.extend_from_slice(e);
+                }
+                let words = pad4(list.len()) / 4;
+                let mut rep = vec![0u8; 32 + words * 4];
+                rep[0] = 1;
+                rep[1] = exts.len() as u8;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], words as u32, msb);
+                rep[32..32 + list.len()].copy_from_slice(&list);
+                c.tx.extend_from_slice(&rep);
+            }
+            103 => {
+                // GetKeyboardControl
+                let mut rep = [0u8; 52];
+                rep[0] = 1;
+                rep[1] = 1; // global_auto_repeat = On
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 5, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            106 => {
+                // GetPointerControl
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w16(&mut rep[8..10], 1, msb);
+                w16(&mut rep[10..12], 1, msb);
+                w16(&mut rep[12..14], 1, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            108 => {
+                // GetScreenSaver
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            117 => {
+                // GetPointerMapping -> [1, 2, 3]
+                let mut rep = [0u8; 36];
+                rep[0] = 1;
+                rep[1] = 3; // map_len
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 1, msb);
+                rep[32] = 1;
+                rep[33] = 2;
+                rep[34] = 3;
                 c.tx.extend_from_slice(&rep);
             }
             XGE_EXT_OPCODE => {
