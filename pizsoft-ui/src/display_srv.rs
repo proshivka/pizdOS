@@ -53,6 +53,10 @@ const XGE_EXT_OPCODE: u8 = 130;
 const XINPUT_EXT_OPCODE: u8 = 131;
 const XINPUT_FIRST_EVENT: u8 = 66;
 const XINPUT_FIRST_ERROR: u8 = 129;
+const RENDER_EXT_OPCODE: u8 = 132;
+const RENDER_FIRST_ERROR: u8 = 142;
+const SHAPE_EXT_OPCODE: u8 = 133;
+const SHAPE_FIRST_EVENT: u8 = 70;
 
 #[inline]
 fn pad4(n: usize) -> usize {
@@ -107,6 +111,135 @@ fn fill_rect_buf(buf: &mut [u32], (bw, bh): (i32, i32), x: i32, y: i32, w: i32, 
         for px in x0..x1 {
             buf[row + px as usize] = c;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blend_rect_buf(
+    buf: &mut [u32],
+    (bw, bh): (i32, i32),
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    col: u32,
+    alpha: u32,
+) {
+    if alpha == 0 {
+        return;
+    }
+    if alpha >= 254 {
+        fill_rect_buf(buf, (bw, bh), x, y, w, h, col);
+        return;
+    }
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(bw);
+    let y1 = (y + h).min(bh);
+    let sr = (col >> 16) & 0xFF;
+    let sg = (col >> 8) & 0xFF;
+    let sb = col & 0xFF;
+    let inv = 255 - alpha;
+    for py in y0..y1 {
+        let row = (py * bw) as usize;
+        for px in x0..x1 {
+            let d = buf[row + px as usize];
+            let r = (sr * alpha + ((d >> 16) & 0xFF) * inv) / 255;
+            let g = (sg * alpha + ((d >> 8) & 0xFF) * inv) / 255;
+            let b = (sb * alpha + (d & 0xFF) * inv) / 255;
+            buf[row + px as usize] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+fn resolve_x11_color(raw: &str) -> (u16, u16, u16) {
+    let s = raw.trim().to_ascii_lowercase();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 3 {
+            let r = u16::from_str_radix(&hex[0..1], 16).unwrap_or(15) * 4369;
+            let g = u16::from_str_radix(&hex[1..2], 16).unwrap_or(15) * 4369;
+            let b = u16::from_str_radix(&hex[2..3], 16).unwrap_or(15) * 4369;
+            return (r, g, b);
+        }
+        if hex.len() == 6 {
+            let r = u16::from_str_radix(&hex[0..2], 16).unwrap_or(255) * 257;
+            let g = u16::from_str_radix(&hex[2..4], 16).unwrap_or(255) * 257;
+            let b = u16::from_str_radix(&hex[4..6], 16).unwrap_or(255) * 257;
+            return (r, g, b);
+        }
+        if hex.len() == 12 {
+            let r = u16::from_str_radix(&hex[0..4], 16).unwrap_or(0xFFFF);
+            let g = u16::from_str_radix(&hex[4..8], 16).unwrap_or(0xFFFF);
+            let b = u16::from_str_radix(&hex[8..12], 16).unwrap_or(0xFFFF);
+            return (r, g, b);
+        }
+    }
+    if let Some(rest) = s.strip_prefix("rgb:") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 3 {
+            let parse_comp = |p: &str| -> u16 {
+                let v = u16::from_str_radix(p, 16).unwrap_or(0xFF);
+                match p.len() {
+                    1 => v * 4369,
+                    2 => v * 257,
+                    3 => (v << 4) | (v >> 8),
+                    _ => v,
+                }
+            };
+            return (parse_comp(parts[0]), parse_comp(parts[1]), parse_comp(parts[2]));
+        }
+    }
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(pct_s) = clean.strip_prefix("gray").or_else(|| clean.strip_prefix("grey"))
+        && let Ok(pct) = pct_s.parse::<u32>()
+    {
+        let v = ((pct.min(100) * 65535) / 100) as u16;
+        return (v, v, v);
+    }
+    match clean.as_str() {
+        "black" => (0, 0, 0),
+        "white" => (0xFFFF, 0xFFFF, 0xFFFF),
+        "red" => (0xFFFF, 0, 0),
+        "green" => (0, 0xFFFF, 0),
+        "blue" => (0, 0, 0xFFFF),
+        "yellow" => (0xFFFF, 0xFFFF, 0),
+        "cyan" => (0, 0xFFFF, 0xFFFF),
+        "magenta" => (0xFFFF, 0, 0xFFFF),
+        "gray" | "grey" => (0xBEBE, 0xBEBE, 0xBEBE),
+        "lightgray" | "lightgrey" => (0xD3D3, 0xD3D3, 0xD3D3),
+        "darkgray" | "darkgrey" => (0xA9A9, 0xA9A9, 0xA9A9),
+        "dimgray" | "dimgrey" => (0x6969, 0x6969, 0x6969),
+        "gainsboro" => (0xDCDC, 0xDCDC, 0xDCDC),
+        "silver" => (0xC0C0, 0xC0C0, 0xC0C0),
+        "slategray" | "slategrey" => (0x7070, 0x8080, 0x9090),
+        "lightslategray" | "lightslategrey" => (0x7777, 0x8888, 0x9999),
+        "darkslategray" | "darkslategrey" => (0x2F2F, 0x4F4F, 0x4F4F),
+        "steelblue" => (0x4646, 0x8282, 0xB4B4),
+        "lightsteelblue" => (0xB0B0, 0xC4C4, 0xDEDE),
+        "royalblue" => (0x4141, 0x6969, 0xE1E1),
+        "navy" | "navyblue" => (0, 0, 0x8080),
+        "midnightblue" => (0x1919, 0x1919, 0x7070),
+        "lightblue" => (0xADAD, 0xD8D8, 0xE6E6),
+        "skyblue" => (0x8787, 0xCECE, 0xEBEB),
+        "darkblue" => (0, 0, 0x8B8B),
+        "darkgreen" => (0, 0x6464, 0),
+        "darkred" => (0x8B8B, 0, 0),
+        "orange" => (0xFFFF, 0xA5A5, 0),
+        "darkorange" => (0xFFFF, 0x8C8C, 0),
+        "gold" => (0xFFFF, 0xD7D7, 0),
+        "pink" => (0xFFFF, 0xC0C0, 0xCBCB),
+        "purple" => (0xA0A0, 0x2020, 0xF0F0),
+        "violet" => (0xEEEE, 0x8282, 0xEEEE),
+        "brown" => (0xA5A5, 0x2A2A, 0x2A2A),
+        "tan" => (0xD2D2, 0xB4B4, 0x8C8C),
+        "beige" => (0xF5F5, 0xF5F5, 0xDCDC),
+        "wheat" => (0xF5F5, 0xDEDE, 0xB3B3),
+        "ivory" => (0xFFFF, 0xFFFF, 0xF0F0),
+        "linen" => (0xFAFA, 0xF0F0, 0xE6E6),
+        "maroon" => (0xB0B0, 0x3030, 0x6060),
+        "teal" => (0, 0x8080, 0x8080),
+        "olive" => (0x8080, 0x8080, 0),
+        _ => (0xE0E0, 0xE0E0, 0xE0E0),
     }
 }
 
@@ -630,20 +763,32 @@ enum X11Io {
 
 impl X11Io {
     fn try_read(&mut self, dst: &mut Vec<u8>) -> io::Result<usize> {
+        let mut total = 0usize;
         let mut tmp = [0u8; 16384];
-        let res = match self {
-            X11Io::Tcp(s) => s.read(&mut tmp),
-            #[cfg(target_os = "linux")]
-            X11Io::Unix(s) => s.read(&mut tmp),
-        };
-        match res {
-            Ok(0) => Err(io::Error::new(ErrorKind::UnexpectedEof, "eof")),
-            Ok(n) => {
-                dst.extend_from_slice(&tmp[..n]);
-                Ok(n)
+        loop {
+            let res = match self {
+                X11Io::Tcp(s) => s.read(&mut tmp),
+                #[cfg(target_os = "linux")]
+                X11Io::Unix(s) => s.read(&mut tmp),
+            };
+            match res {
+                Ok(0) => {
+                    return if total > 0 {
+                        Ok(total)
+                    } else {
+                        Err(io::Error::new(ErrorKind::UnexpectedEof, "eof"))
+                    };
+                }
+                Ok(n) => {
+                    dst.extend_from_slice(&tmp[..n]);
+                    total += n;
+                    if total >= 262_144 {
+                        return Ok(total);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(total),
+                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
         }
     }
 
@@ -691,11 +836,17 @@ struct XGc {
 impl Default for XGc {
     fn default() -> Self {
         Self {
-            fg: 0x00FF_FFFF,
-            bg: 0x0000_0000,
+            fg: 0x0000_0000,
+            bg: 0x00FF_FFFF,
             line_width: 1,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum XRenderPic {
+    Drawable { did: u32, fmt: u32, repeat: bool },
+    Solid(u32),
 }
 
 struct X11Client {
@@ -709,6 +860,7 @@ struct X11Client {
     windows: HashMap<u32, XWin>,
     pixmaps: HashMap<u32, XPixmap>,
     gcs: HashMap<u32, XGc>,
+    pictures: HashMap<u32, XRenderPic>,
     atoms: HashMap<u32, String>,
     atom_names: HashMap<String, u32>,
     props: HashMap<(u32, u32), (u32, u8, Vec<u8>)>,
@@ -753,6 +905,7 @@ impl X11Client {
             windows: HashMap::new(),
             pixmaps: HashMap::new(),
             gcs: HashMap::new(),
+            pictures: HashMap::new(),
             atoms,
             atom_names,
             props: HashMap::new(),
@@ -1793,6 +1946,9 @@ impl DisplayServer {
                         cfg = Some((nx, ny, nw, nh, nbw, gid_opt, parent, bg));
                     }
                     if let Some((nx, ny, nw, nh, _, _, _, _)) = cfg {
+                        if c.windows.get(&wid).is_some_and(|w| w.mapped) {
+                            c.paint_win_on_surface(&mut self.surfaces, wid);
+                        }
                         c.send_configure_notify(wid, nx, ny, nw, nh);
                         c.send_expose(wid, nw, nh);
                     }
@@ -2110,6 +2266,24 @@ impl DisplayServer {
                 let next = parse_gc_values(prev, mask, &pkt[12..], msb);
                 c.gcs.insert(gid, next);
             }
+            57 if pkt.len() >= 16 => {
+                // CopyGC (src -> dst with value-mask)
+                let src_gid = r32(&pkt[4..8], msb);
+                let dst_gid = r32(&pkt[8..12], msb);
+                let mask = r32(&pkt[12..16], msb);
+                let src = c.gcs.get(&src_gid).copied().unwrap_or_default();
+                let mut dst = c.gcs.get(&dst_gid).copied().unwrap_or_default();
+                if (mask & (1 << 2)) != 0 {
+                    dst.fg = src.fg;
+                }
+                if (mask & (1 << 3)) != 0 {
+                    dst.bg = src.bg;
+                }
+                if (mask & (1 << 4)) != 0 {
+                    dst.line_width = src.line_width;
+                }
+                c.gcs.insert(dst_gid, dst);
+            }
             60 if pkt.len() >= 8 => {
                 let gid = r32(&pkt[4..8], msb);
                 c.gcs.remove(&gid);
@@ -2188,6 +2362,69 @@ impl DisplayServer {
                                 if sxx >= 0 && sxx < sw && dxx >= 0 && dxx < tw {
                                     dst_px[(dyy * tw + dxx) as usize] =
                                         spx[(syy * sw + sxx) as usize];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            63 if pkt.len() >= 32 => {
+                // CopyPlane (1-bit plane -> Window/Pixmap using gc.fg / gc.bg)
+                let src_id = r32(&pkt[4..8], msb);
+                let dst_id = r32(&pkt[8..12], msb);
+                let gcid = r32(&pkt[12..16], msb);
+                let sx = r16(&pkt[16..18], msb) as i16 as i32;
+                let sy = r16(&pkt[18..20], msb) as i16 as i32;
+                let dx = r16(&pkt[20..22], msb) as i16 as i32;
+                let dy = r16(&pkt[22..24], msb) as i16 as i32;
+                let cw = r16(&pkt[24..26], msb) as i32;
+                let ch = r16(&pkt[26..28], msb) as i32;
+                let bit_plane = r32(&pkt[28..32], msb);
+                let gc = c.gcs.get(&gcid).copied().unwrap_or_default();
+                let copied = if let Some(pm) = c.pixmaps.get(&src_id) {
+                    Some((pm.w, pm.h, 0, 0, pm.pixels.clone()))
+                } else if let Some((gid, sox, soy)) = c.find_root_gid(src_id)
+                    && let Some(surf) = self.surfaces.get(&gid)
+                {
+                    Some((surf.w, surf.h, sox, soy, surf.pixels.clone()))
+                } else {
+                    None
+                };
+                if let Some((sw, sh, sox, soy, spx)) = copied {
+                    let mut tw = 0;
+                    let mut th = 0;
+                    let mut dox = 0;
+                    let mut doy = 0;
+                    let mut target: Option<&mut [u32]> = None;
+                    if let Some((dgid, gx, gy)) = c.find_root_gid(dst_id)
+                        && let Some(dsurf) = self.surfaces.get_mut(&dgid)
+                    {
+                        tw = dsurf.w;
+                        th = dsurf.h;
+                        dox = gx;
+                        doy = gy;
+                        target = Some(&mut dsurf.pixels);
+                    } else if let Some(dpm) = c.pixmaps.get_mut(&dst_id) {
+                        tw = dpm.w;
+                        th = dpm.h;
+                        target = Some(&mut dpm.pixels);
+                    }
+                    if let Some(dst_px) = target {
+                        let fg = gc.fg & 0x00FF_FFFF;
+                        let bg = gc.bg & 0x00FF_FFFF;
+                        for row in 0..ch {
+                            let syy = soy + sy + row;
+                            let dyy = doy + dy + row;
+                            if syy < 0 || syy >= sh || dyy < 0 || dyy >= th {
+                                continue;
+                            }
+                            for col in 0..cw {
+                                let sxx = sox + sx + col;
+                                let dxx = dox + dx + col;
+                                if sxx >= 0 && sxx < sw && dxx >= 0 && dxx < tw {
+                                    let v = spx[(syy * sw + sxx) as usize];
+                                    let set = (v & bit_plane) != 0;
+                                    dst_px[(dyy * tw + dxx) as usize] = if set { fg } else { bg };
                                 }
                             }
                         }
@@ -2390,9 +2627,11 @@ impl DisplayServer {
                                 put_px(buf, tw, th, ox + dx + col, oy + dy + row, val);
                             }
                         }
-                    } else if detail == 0 {
-                        // XYBitmap 1bpp
+                    } else if detail == 0 || (detail == 1 && depth == 1) {
+                        // XYBitmap 1bpp / XYPixmap 1bpp
                         let stride = (((iw + 31) / 32) * 4) as usize;
+                        let on_col = if detail == 1 { 0x00FF_FFFF } else { gc.fg };
+                        let off_col = if detail == 1 { 0x0000_0000 } else { gc.bg };
                         for row in 0..ih {
                             let roff = (row as usize) * stride;
                             if roff + stride > img.len() {
@@ -2407,7 +2646,27 @@ impl DisplayServer {
                                     th,
                                     ox + dx + col,
                                     oy + dy + row,
-                                    if set { gc.fg } else { gc.bg },
+                                    if set { on_col } else { off_col },
+                                );
+                            }
+                        }
+                    } else if detail == 2 && depth == 8 {
+                        // ZPixmap 8bpp (alpha/grayscale mask)
+                        let stride = pad4(iw as usize);
+                        for row in 0..ih {
+                            let roff = (row as usize) * stride;
+                            if roff + (iw as usize) > img.len() {
+                                break;
+                            }
+                            for col in 0..iw {
+                                let v = img[roff + col as usize] as u32;
+                                put_px(
+                                    buf,
+                                    tw,
+                                    th,
+                                    ox + dx + col,
+                                    oy + dy + row,
+                                    (v << 16) | (v << 8) | v,
                                 );
                             }
                         }
@@ -2566,10 +2825,12 @@ impl DisplayServer {
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
                 w32(&mut rep[4..8], 7, msb); // 7 extra 4-byte words (28 bytes)
-                // min_bounds (8..20) & max_bounds (24..36): character_width=8, ascent=11, descent=3
+                // min_bounds (8..20) & max_bounds (24..36): rightSideBearing=8, character_width=8, ascent=11, descent=3
+                w16(&mut rep[10..12], 8, msb);
                 w16(&mut rep[12..14], 8, msb);
                 w16(&mut rep[14..16], 11, msb);
                 w16(&mut rep[16..18], 3, msb);
+                w16(&mut rep[26..28], 8, msb);
                 w16(&mut rep[28..30], 8, msb);
                 w16(&mut rep[30..32], 11, msb);
                 w16(&mut rep[32..34], 3, msb);
@@ -2581,10 +2842,25 @@ impl DisplayServer {
                 c.tx.extend_from_slice(&rep);
             }
             49 => {
-                // ListFonts -> 0 matching fonts
-                let mut rep = [0u8; 32];
+                // ListFonts -> ["fixed", "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso8859-1"]
+                let max_names = if pkt.len() >= 6 { r16(&pkt[4..6], msb) as usize } else { 2 };
+                let fonts: [&[u8]; 2] = [
+                    b"fixed",
+                    b"-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso8859-1",
+                ];
+                let count = fonts.len().min(max_names);
+                let mut list = Vec::new();
+                for f in &fonts[..count] {
+                    list.push(f.len() as u8);
+                    list.extend_from_slice(f);
+                }
+                let words = pad4(list.len()) / 4;
+                let mut rep = vec![0u8; 32 + words * 4];
                 rep[0] = 1;
                 w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], words as u32, msb);
+                w16(&mut rep[8..10], count as u16, msb);
+                rep[32..32 + list.len()].copy_from_slice(&list);
                 c.tx.extend_from_slice(&rep);
             }
             84 => {
@@ -2610,17 +2886,7 @@ impl DisplayServer {
                 } else {
                     String::new()
                 };
-                let (r, g, b): (u16, u16, u16) = match name.as_str() {
-                    "black" => (0, 0, 0),
-                    "red" => (0xFFFF, 0, 0),
-                    "green" => (0, 0xFFFF, 0),
-                    "blue" => (0, 0, 0xFFFF),
-                    "yellow" => (0xFFFF, 0xFFFF, 0),
-                    "cyan" => (0, 0xFFFF, 0xFFFF),
-                    "magenta" => (0xFFFF, 0, 0xFFFF),
-                    "gray" | "grey" => (0x8000, 0x8000, 0x8000),
-                    _ => (0xFFFF, 0xFFFF, 0xFFFF),
-                };
+                let (r, g, b) = resolve_x11_color(&name);
                 let pixel = (((r >> 8) as u32) << 16) | (((g >> 8) as u32) << 8) | ((b >> 8) as u32);
                 let mut rep = [0u8; 32];
                 rep[0] = 1;
@@ -2703,6 +2969,16 @@ impl DisplayServer {
                     "Generic Event Extension" => {
                         rep[8] = 1;
                         rep[9] = XGE_EXT_OPCODE;
+                    }
+                    "RENDER" => {
+                        rep[8] = 1;
+                        rep[9] = RENDER_EXT_OPCODE;
+                        rep[11] = RENDER_FIRST_ERROR;
+                    }
+                    "SHAPE" => {
+                        rep[8] = 1;
+                        rep[9] = SHAPE_EXT_OPCODE;
+                        rep[10] = SHAPE_FIRST_EVENT;
                     }
                     _ => {}
                 }
@@ -2794,8 +3070,13 @@ impl DisplayServer {
                 c.tx.extend_from_slice(&rep);
             }
             99 => {
-                // ListExtensions -> ["XInputExtension", "Generic Event Extension"]
-                let exts: [&[u8]; 2] = [b"XInputExtension", b"Generic Event Extension"];
+                // ListExtensions -> ["XInputExtension", "Generic Event Extension", "RENDER", "SHAPE"]
+                let exts: [&[u8]; 4] = [
+                    b"XInputExtension",
+                    b"Generic Event Extension",
+                    b"RENDER",
+                    b"SHAPE",
+                ];
                 let mut list = Vec::new();
                 for e in exts {
                     list.push(e.len() as u8);
@@ -2859,6 +3140,198 @@ impl DisplayServer {
             }
             XINPUT_EXT_OPCODE => {
                 self.handle_xinput_req(c, detail, pkt);
+            }
+            RENDER_EXT_OPCODE => {
+                self.handle_render_req(c, detail, pkt);
+            }
+            SHAPE_EXT_OPCODE => {
+                self.handle_shape_req(c, detail);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_shape_req(&self, c: &mut X11Client, minor: u8) {
+        let msb = c.msb;
+        if minor == 0 {
+            // ShapeQueryVersion -> 1.1
+            let mut rep = [0u8; 32];
+            rep[0] = 1;
+            w16(&mut rep[2..4], c.seq, msb);
+            w16(&mut rep[8..10], 1, msb);
+            w16(&mut rep[10..12], 1, msb);
+            c.tx.extend_from_slice(&rep);
+        }
+    }
+
+    fn handle_render_req(&mut self, c: &mut X11Client, minor: u8, pkt: &[u8]) {
+        let msb = c.msb;
+        const FMT_ARGB32: u32 = 0x20;
+        const FMT_RGB24: u32 = 0x21;
+        const FMT_A8: u32 = 0x22;
+        match minor {
+            0 => {
+                // RenderQueryVersion -> 0.11
+                let mut rep = [0u8; 32];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[8..12], 0, msb);
+                w32(&mut rep[12..16], 11, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            1 => {
+                // RenderQueryPictFormats: 3 PictFormInfo (28 bytes each = 84) + 1 PictScreen (8 + 8 + 8 + 8 = 32)
+                // Total payload = 84 + 32 = 116 bytes = 29 words
+                let mut rep = vec![0u8; 32 + 116];
+                rep[0] = 1;
+                w16(&mut rep[2..4], c.seq, msb);
+                w32(&mut rep[4..8], 29, msb);
+                w32(&mut rep[8..12], 3, msb); // numFormats
+                w32(&mut rep[12..16], 1, msb); // numScreens
+                w32(&mut rep[16..20], 1, msb); // numDepths
+                w32(&mut rep[20..24], 1, msb); // numVisuals
+
+                // PictFormInfo 0: ARGB32
+                let f0 = 32usize;
+                w32(&mut rep[f0..f0 + 4], FMT_ARGB32, msb);
+                rep[f0 + 4] = 1; // Direct
+                rep[f0 + 5] = 32; // depth
+                w16(&mut rep[f0 + 8..f0 + 10], 16, msb);
+                w16(&mut rep[f0 + 10..f0 + 12], 255, msb);
+                w16(&mut rep[f0 + 12..f0 + 14], 8, msb);
+                w16(&mut rep[f0 + 14..f0 + 16], 255, msb);
+                w16(&mut rep[f0 + 16..f0 + 18], 0, msb);
+                w16(&mut rep[f0 + 18..f0 + 20], 255, msb);
+                w16(&mut rep[f0 + 20..f0 + 22], 24, msb);
+                w16(&mut rep[f0 + 22..f0 + 24], 255, msb);
+
+                // PictFormInfo 1: RGB24 (x8r8g8b8)
+                let f1 = 32 + 28;
+                w32(&mut rep[f1..f1 + 4], FMT_RGB24, msb);
+                rep[f1 + 4] = 1; // Direct
+                rep[f1 + 5] = 24;
+                w16(&mut rep[f1 + 8..f1 + 10], 16, msb);
+                w16(&mut rep[f1 + 10..f1 + 12], 255, msb);
+                w16(&mut rep[f1 + 12..f1 + 14], 8, msb);
+                w16(&mut rep[f1 + 14..f1 + 16], 255, msb);
+                w16(&mut rep[f1 + 16..f1 + 18], 0, msb);
+                w16(&mut rep[f1 + 18..f1 + 20], 255, msb);
+
+                // PictFormInfo 2: A8
+                let f2 = 32 + 56;
+                w32(&mut rep[f2..f2 + 4], FMT_A8, msb);
+                rep[f2 + 4] = 1; // Direct
+                rep[f2 + 5] = 8;
+                w16(&mut rep[f2 + 20..f2 + 22], 0, msb);
+                w16(&mut rep[f2 + 22..f2 + 24], 255, msb);
+
+                // PictScreen (8) -> PictDepth (8) -> PictVisual (8) -> root visual matches FMT_RGB24
+                let s0 = 32 + 84;
+                w32(&mut rep[s0..s0 + 4], 1, msb); // numDepths
+                w32(&mut rep[s0 + 4..s0 + 8], FMT_RGB24, msb); // fallback
+                rep[s0 + 8] = 24; // depth
+                w16(&mut rep[s0 + 10..s0 + 12], 1, msb); // numVisuals
+                w32(&mut rep[s0 + 16..s0 + 20], ROOT_VISUAL, msb);
+                w32(&mut rep[s0 + 20..s0 + 24], FMT_RGB24, msb);
+                c.tx.extend_from_slice(&rep);
+            }
+            4 if pkt.len() >= 16 => {
+                // RenderCreatePicture: pid(4), drawable(8), format(12), mask(16)
+                let pid = r32(&pkt[4..8], msb);
+                let did = r32(&pkt[8..12], msb);
+                let fmt = r32(&pkt[12..16], msb);
+                c.pictures.insert(pid, XRenderPic::Drawable { did, fmt, repeat: false });
+            }
+            5 if pkt.len() >= 12 => {
+                // RenderChangePicture: pid(4), mask(8), values(12..)
+                let pid = r32(&pkt[4..8], msb);
+                let mask = r32(&pkt[8..12], msb);
+                if (mask & 1) != 0 && pkt.len() >= 16
+                    && let Some(XRenderPic::Drawable { repeat, .. }) = c.pictures.get_mut(&pid)
+                {
+                    *repeat = r32(&pkt[12..16], msb) != 0;
+                }
+            }
+            7 if pkt.len() >= 8 => {
+                let pid = r32(&pkt[4..8], msb);
+                c.pictures.remove(&pid);
+            }
+            33 if pkt.len() >= 16 => {
+                // RenderCreateSolidFill: pid(4), color(r16,g16,b16,a16 at 8..16)
+                let pid = r32(&pkt[4..8], msb);
+                let r = (r16(&pkt[8..10], msb) >> 8) as u32;
+                let g = (r16(&pkt[10..12], msb) >> 8) as u32;
+                let b = (r16(&pkt[12..14], msb) >> 8) as u32;
+                let a = (r16(&pkt[14..16], msb) >> 8) as u32;
+                c.pictures.insert(pid, XRenderPic::Solid((a << 24) | (r << 16) | (g << 8) | b));
+            }
+            26 if pkt.len() >= 20 => {
+                // RenderFillRectangles: op(4), pad, dst(8..12), color(12..20), rects(20..)
+                let dst_pid = r32(&pkt[8..12], msb);
+                let r = (r16(&pkt[12..14], msb) >> 8) as u32;
+                let g = (r16(&pkt[14..16], msb) >> 8) as u32;
+                let b = (r16(&pkt[16..18], msb) >> 8) as u32;
+                let a = (r16(&pkt[18..20], msb) >> 8) as u32;
+                let col = (r << 16) | (g << 8) | b;
+                if let Some(XRenderPic::Drawable { did, .. }) = c.pictures.get(&dst_pid).copied()
+                    && let Some((gid, ox, oy)) = c.find_root_gid(did)
+                    && let Some(surf) = self.surfaces.get_mut(&gid)
+                {
+                    for rect in pkt[20..].as_chunks::<8>().0 {
+                        let rx = ox + (r16(&rect[0..2], msb) as i16 as i32);
+                        let ry = oy + (r16(&rect[2..4], msb) as i16 as i32);
+                        let rw = r16(&rect[4..6], msb) as i32;
+                        let rh = r16(&rect[6..8], msb) as i32;
+                        if a >= 250 {
+                            fill_rect_buf(&mut surf.pixels, (surf.w, surf.h), rx, ry, rw, rh, col);
+                        } else if a > 0 {
+                            blend_rect_buf(&mut surf.pixels, (surf.w, surf.h), rx, ry, rw, rh, col, a);
+                        }
+                    }
+                }
+            }
+            8 if pkt.len() >= 36 => {
+                // RenderComposite: op(4), src(8), mask(12), dst(16), sx(20), sy(22), mx(24), my(26), dx(28), dy(30), w(32), h(34)
+                let src_pid = r32(&pkt[8..12], msb);
+                let dst_pid = r32(&pkt[16..20], msb);
+                let dx = r16(&pkt[28..30], msb) as i16 as i32;
+                let dy = r16(&pkt[30..32], msb) as i16 as i32;
+                let w = r16(&pkt[32..34], msb) as i32;
+                let h = r16(&pkt[34..36], msb) as i32;
+                if let (Some(src), Some(XRenderPic::Drawable { did, .. })) =
+                    (c.pictures.get(&src_pid).copied(), c.pictures.get(&dst_pid).copied())
+                    && let Some((gid, ox, oy)) = c.find_root_gid(did)
+                    && let Some(surf) = self.surfaces.get_mut(&gid)
+                {
+                    if let XRenderPic::Solid(argb) = src {
+                        let a = (argb >> 24) & 0xFF;
+                        let rgb = argb & 0x00FF_FFFF;
+                        blend_rect_buf(&mut surf.pixels, (surf.w, surf.h), ox + dx, oy + dy, w, h, rgb, a);
+                    } else if let XRenderPic::Drawable { did: sdid, repeat, fmt } = src
+                        && fmt != FMT_A8
+                        && let Some(spm) = c.pixmaps.get(&sdid)
+                    {
+                        let sx0 = r16(&pkt[20..22], msb) as i16 as i32;
+                        let sy0 = r16(&pkt[22..24], msb) as i16 as i32;
+                        if repeat && spm.w == 1 && spm.h == 1 && !spm.pixels.is_empty() {
+                            fill_rect_buf(&mut surf.pixels, (surf.w, surf.h), ox + dx, oy + dy, w, h, spm.pixels[0]);
+                        } else {
+                            for row in 0..h {
+                                let syy = sy0 + row;
+                                if syy < 0 || syy >= spm.h {
+                                    continue;
+                                }
+                                for col in 0..w {
+                                    let sxx = sx0 + col;
+                                    if sxx >= 0 && sxx < spm.w {
+                                        let v = spm.pixels[(syy * spm.w + sxx) as usize];
+                                        put_px(&mut surf.pixels, surf.w, surf.h, ox + dx + col, oy + dy + row, v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }

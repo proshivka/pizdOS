@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    AiChatState, BrowserState, CalcState, Game2048State, KeyEvent, Lang, MatrixState,
+    AiChatState, BrowserState, CalcState, CuAction, Game2048State, KeyEvent, Lang, MatrixState,
     MinesweeperState, NotepadState, PaintAction, PaintState, PizViewState, SettingsAction,
-    SettingsState, SnakeEvent, SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES, tr,
+    SettingsState, SnakeEvent, SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES,
+    parse_cu_action, tr,
 };
 use crate::display_srv::{DisplayServer, GuestProto};
 use crate::gfx::Canvas;
@@ -589,7 +590,7 @@ impl Desktop {
             dock_float_vel: 0.0,
             last_canvas_size: (width.max(320), height.max(240)),
             icon_hover: [0.0; 14],
-            ai: AiChatState::new(settings.ai_api_key.clone(), settings.ai_model_idx),
+            ai: AiChatState::new(&settings),
             browser: BrowserState::new(),
             display_srv: if cfg!(test) {
                 DisplayServer::disabled()
@@ -1216,10 +1217,115 @@ impl Desktop {
         (dock_x + 102 + pos * (pill_w + 4), task_y + 6, pill_w)
     }
 
+    fn sync_ai_settings(&mut self) {
+        self.settings.ai_provider = self.ai.provider.as_u8();
+        self.settings.ai_api_key = self.ai.api_key.clone();
+        self.settings.ai_base_url = self.ai.base_url.clone();
+        self.settings.ai_custom_model = self.ai.custom_model.clone();
+        self.settings.ai_model_idx = self.ai.model_idx;
+        self.settings.ai_thinking_idx = self.ai.thinking.idx();
+        self.settings.ai_thinking_mask = self.ai.custom_thinking_mask;
+        crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
+    }
+
+    pub fn capture_screen_png_base64(&self) -> (String, i32, i32) {
+        let (w, h) = self.last_canvas_size;
+        let mut cap = Canvas::new(w.max(320) as usize, h.max(240) as usize);
+        self.render(&mut cap);
+        let b64 = crate::gfx::encode_png_base64(&cap.pixels, cap.width, cap.height);
+        (b64, cap.width as i32, cap.height as i32)
+    }
+
+    fn execute_cu_action(&mut self, act: CuAction) -> bool {
+        let (cw, ch) = self.last_canvas_size;
+        match act {
+            CuAction::Move(x, y) => {
+                self.on_mouse_move(x, y, cw, ch);
+                self.ai.messages.push((false, format!("[CU] move({x}, {y})")));
+                false
+            }
+            CuAction::Click(x, y) => {
+                self.on_mouse_move(x, y, cw, ch);
+                self.on_mouse_down(x, y, cw, ch);
+                self.on_mouse_up();
+                self.push_toast(format!("PizAI -> click({x}, {y})"), 0x10B981);
+                self.ai.messages.push((false, format!("[CU] click({x}, {y})")));
+                false
+            }
+            CuAction::DoubleClick(x, y) => {
+                self.on_mouse_move(x, y, cw, ch);
+                self.on_mouse_down(x, y, cw, ch);
+                self.on_mouse_up();
+                self.on_mouse_down(x, y, cw, ch);
+                self.on_mouse_up();
+                self.push_toast(format!("PizAI -> dblclick({x}, {y})"), 0x10B981);
+                self.ai.messages.push((false, format!("[CU] double_click({x}, {y})")));
+                false
+            }
+            CuAction::Type(txt) => {
+                for ch_in in txt.chars() {
+                    self.on_key(KeyEvent::Char(ch_in));
+                }
+                self.ai.messages.push((false, format!("[CU] type({txt})")));
+                false
+            }
+            CuAction::Key(name) => {
+                let ev = match name.to_ascii_lowercase().as_str() {
+                    "enter" | "return" => Some(KeyEvent::Enter),
+                    "backspace" => Some(KeyEvent::Backspace),
+                    "escape" | "esc" => Some(KeyEvent::Escape),
+                    "tab" => Some(KeyEvent::Tab),
+                    "up" => Some(KeyEvent::Up),
+                    "down" => Some(KeyEvent::Down),
+                    "left" => Some(KeyEvent::Left),
+                    "right" => Some(KeyEvent::Right),
+                    _ => None,
+                };
+                if let Some(k) = ev {
+                    self.on_key(k);
+                }
+                self.ai.messages.push((false, format!("[CU] key({name})")));
+                false
+            }
+            CuAction::Wait => {
+                self.ai.messages.push((false, String::from("[CU] wait")));
+                false
+            }
+            CuAction::Done(summary) => {
+                self.ai.messages.push((false, summary));
+                true
+            }
+        }
+    }
+
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.poll_display_server();
-        self.ai.poll();
+        if self.ai.cu_needs_capture && self.ai.cu_active {
+            let (b64, w, h) = self.capture_screen_png_base64();
+            self.ai.dispatch_cu_screen(&b64, w, h);
+        }
+        if let Some(reply) = self.ai.poll()
+            && self.ai.cu_active
+        {
+            if let Some(act) = parse_cu_action(&reply) {
+                let done = self.execute_cu_action(act);
+                if done || self.ai.cu_steps >= 10 {
+                    self.ai.cu_active = false;
+                } else {
+                    self.ai.cu_wait_ticks = 12;
+                }
+            } else {
+                self.ai.messages.push((false, reply));
+                self.ai.cu_active = false;
+            }
+        }
+        if self.ai.cu_wait_ticks > 0 {
+            self.ai.cu_wait_ticks -= 1;
+            if self.ai.cu_wait_ticks == 0 && self.ai.cu_active && !self.ai.busy {
+                self.ai.cu_needs_capture = true;
+            }
+        }
         self.browser.poll();
         self.settings.step_anim();
         self.calc.step_anim();
@@ -1878,13 +1984,7 @@ impl Desktop {
                     KeyEvent::Backspace => self.ai.on_backspace(),
                     KeyEvent::Enter => {
                         if self.ai.on_enter() {
-                            self.settings.ai_api_key = self.ai.api_key.clone();
-                            self.settings.ai_model_idx = self.ai.model_idx;
-                            crate::config::save_config(
-                                &self.settings,
-                                self.snake.best_score,
-                                &self.sticky_note,
-                            );
+                            self.sync_ai_settings();
                         }
                     }
                     KeyEvent::Paste(s) => self.ai.paste(&s),
@@ -2776,13 +2876,7 @@ impl Desktop {
             }
             AppId::Ai => {
                 if self.ai.on_click(lx, ly, win.w, win.h) {
-                    self.settings.ai_api_key = self.ai.api_key.clone();
-                    self.settings.ai_model_idx = self.ai.model_idx;
-                    crate::config::save_config(
-                        &self.settings,
-                        self.snake.best_score,
-                        &self.sticky_note,
-                    );
+                    self.sync_ai_settings();
                 }
             }
             AppId::Browser => self.browser.on_click(lx, ly, win.w, win.h),

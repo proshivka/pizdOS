@@ -102,7 +102,30 @@ pub fn load_config_from(path: &std::path::Path, settings: &mut SettingsState) ->
             }
             "ai_model_idx" => {
                 if let Ok(m) = v.parse::<usize>() {
-                    settings.ai_model_idx = m.min(1);
+                    settings.ai_model_idx = m.min(crate::apps::AI_MODELS.len().saturating_sub(1));
+                }
+            }
+            "ai_provider" => {
+                if let Ok(p) = v.parse::<u8>() {
+                    settings.ai_provider = p.min(2);
+                }
+            }
+            "ai_base_url" => {
+                settings.ai_base_url = v.to_string();
+            }
+            "ai_custom_model" => {
+                settings.ai_custom_model = v.to_string();
+            }
+            "ai_thinking_idx" => {
+                if let Ok(t) = v.parse::<usize>() {
+                    settings.ai_thinking_idx = t.min(5);
+                }
+            }
+            "ai_thinking_mask" => {
+                if let Ok(mk) = v.parse::<u8>()
+                    && mk != 0
+                {
+                    settings.ai_thinking_mask = mk & 0x3F;
                 }
             }
             _ => {}
@@ -159,7 +182,12 @@ pub fn save_config_to(
          best_snake={best_snake}\n\
          sticky_note={escaped_note}\n\
          ai_api_key={}\n\
-         ai_model_idx={}\n",
+         ai_model_idx={}\n\
+         ai_provider={}\n\
+         ai_base_url={}\n\
+         ai_custom_model={}\n\
+         ai_thinking_idx={}\n\
+         ai_thinking_mask={}\n",
         settings.accent_idx,
         b(settings.show_grid),
         b(settings.show_icons),
@@ -178,7 +206,12 @@ pub fn save_config_to(
         settings.res_idx,
         b(settings.show_clock),
         settings.ai_api_key.replace(['\r', '\n'], ""),
-        settings.ai_model_idx.min(1),
+        settings.ai_model_idx.min(crate::apps::AI_MODELS.len().saturating_sub(1)),
+        settings.ai_provider.min(2),
+        settings.ai_base_url.replace(['\r', '\n'], ""),
+        settings.ai_custom_model.replace(['\r', '\n'], ""),
+        settings.ai_thinking_idx.min(5),
+        settings.ai_thinking_mask & 0x3F,
     );
     let _ = fs::write(path, out);
 }

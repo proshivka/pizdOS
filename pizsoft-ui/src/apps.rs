@@ -1676,6 +1676,11 @@ pub struct SettingsState {
     pub res_idx: usize,
     pub ai_api_key: String,
     pub ai_model_idx: usize,
+    pub ai_provider: u8,
+    pub ai_base_url: String,
+    pub ai_custom_model: String,
+    pub ai_thinking_idx: usize,
+    pub ai_thinking_mask: u8,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub persistent_island: bool,
@@ -1717,6 +1722,11 @@ impl SettingsState {
             res_idx: 0,
             ai_api_key: String::new(),
             ai_model_idx: 0,
+            ai_provider: 0,
+            ai_base_url: String::new(),
+            ai_custom_model: String::new(),
+            ai_thinking_idx: 2,
+            ai_thinking_mask: 0b0011_1111,
             crosshair_cursor: false,
             show_clock: true,
             persistent_island: false,
@@ -4208,9 +4218,154 @@ impl MinesweeperState {
     }
 }
 
-pub const AI_MODELS: [(&str, &str); 2] = [
-    ("Gemini 3.5 Flash-Lite", "gemini-flash-lite-latest"),
-    ("Gemini 4 Hydrogen", "gemini-flash-latest"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiProvider {
+    Gemini,
+    OpenAi,
+    Anthropic,
+}
+
+impl AiProvider {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::OpenAi,
+            2 => Self::Anthropic,
+            _ => Self::Gemini,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Gemini => 0,
+            Self::OpenAi => 1,
+            Self::Anthropic => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gemini => "Google AI Studio",
+            Self::OpenAi => "OpenAI-compat",
+            Self::Anthropic => "Anthropic-compat",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+            Self::OpenAi => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+pub const ALL_THINKING_LEVELS: [ThinkingLevel; 6] = [
+    ThinkingLevel::Off,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+    ThinkingLevel::Max,
+];
+
+impl ThinkingLevel {
+    pub fn from_idx(i: usize) -> Self {
+        ALL_THINKING_LEVELS[i.min(ALL_THINKING_LEVELS.len() - 1)]
+    }
+
+    pub fn idx(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+            Self::XHigh => 4,
+            Self::Max => 5,
+        }
+    }
+
+    pub fn bit(self) -> u8 {
+        1u8 << self.idx()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Med",
+            Self::High => "High",
+            Self::XHigh => "XHigh",
+            Self::Max => "Max",
+        }
+    }
+}
+
+pub struct AiModelSpec {
+    pub label: &'static str,
+    pub model_id: &'static str,
+    pub provider: AiProvider,
+    pub thinking: &'static [ThinkingLevel],
+}
+
+pub const AI_MODELS: [AiModelSpec; 7] = [
+    AiModelSpec {
+        label: "Gemini 3.5 Flash-Lite",
+        model_id: "gemini-flash-lite-latest",
+        provider: AiProvider::Gemini,
+        thinking: &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "Gemini 4 Hydrogen",
+        model_id: "gemini-flash-latest",
+        provider: AiProvider::Gemini,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max],
+    },
+    AiModelSpec {
+        label: "Gemini 2.5 Pro",
+        model_id: "gemini-2.5-pro",
+        provider: AiProvider::Gemini,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Max],
+    },
+    AiModelSpec {
+        label: "GPT-5 (OpenAI)",
+        model_id: "gpt-5",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh],
+    },
+    AiModelSpec {
+        label: "o4-mini (OpenAI)",
+        model_id: "o4-mini",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "DeepSeek R1",
+        model_id: "deepseek-reasoner",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "Claude Sonnet 4.5",
+        model_id: "claude-sonnet-4-5",
+        provider: AiProvider::Anthropic,
+        thinking: &[
+            ThinkingLevel::Off,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ],
+    },
 ];
 
 pub fn json_escape(s: &str) -> String {
@@ -4259,46 +4414,141 @@ fn unescape_json_str(raw: &str) -> String {
     out
 }
 
+fn extract_json_field_all(json: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{key}\"");
+    let mut results = Vec::new();
+    let mut scan = json;
+    while let Some(pos) = scan.find(&pat) {
+        let rest = &scan[pos + pat.len()..];
+        let Some(colon) = rest.find(':') else {
+            scan = rest;
+            continue;
+        };
+        let after = rest[colon + 1..].trim_start();
+        if let Some(stripped) = after.strip_prefix('"') {
+            let mut end = 0usize;
+            let bytes = stripped.as_bytes();
+            while end < bytes.len() {
+                if bytes[end] == b'\\' {
+                    end += 2;
+                    continue;
+                }
+                if bytes[end] == b'"' {
+                    results.push(unescape_json_str(&stripped[..end]));
+                    scan = &stripped[end + 1..];
+                    break;
+                }
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+        } else {
+            scan = after;
+        }
+    }
+    results
+}
+
 fn extract_json_field(json: &str, key: &str) -> Option<String> {
+    extract_json_field_all(json, key).into_iter().next()
+}
+
+fn extract_json_int(json: &str, key: &str) -> Option<i32> {
     let pat = format!("\"{key}\"");
     let pos = json.find(&pat)?;
     let rest = &json[pos + pat.len()..];
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
-    if !after.starts_with('"') {
-        return None;
-    }
-    let mut end = 1usize;
-    let bytes = after.as_bytes();
-    while end < bytes.len() {
-        if bytes[end] == b'\\' {
-            end += 2;
-            continue;
-        }
-        if bytes[end] == b'"' {
-            return Some(unescape_json_str(&after[1..end]));
-        }
-        end += 1;
-    }
-    None
+    let num: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    num.parse::<i32>().ok()
 }
 
-pub fn extract_gemini_text(json: &str) -> Result<String, String> {
-    if let Some(err_msg) = extract_json_field(json, "message")
-        && json.contains("\"error\"")
+pub fn extract_ai_response(provider: AiProvider, json: &str) -> Result<String, String> {
+    if json.contains("\"error\"")
+        && let Some(err_msg) = extract_json_field(json, "message")
     {
         return Err(err_msg);
     }
-    if let Some(txt) = extract_json_field(json, "text") {
-        return Ok(txt);
+    let text = match provider {
+        AiProvider::Gemini => extract_json_field_all(json, "text").into_iter().last(),
+        AiProvider::OpenAi => extract_json_field(json, "content"),
+        AiProvider::Anthropic => extract_json_field_all(json, "text").into_iter().last(),
+    };
+    text.ok_or_else(|| String::from("Empty or invalid response from API"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CuAction {
+    Move(i32, i32),
+    Click(i32, i32),
+    DoubleClick(i32, i32),
+    Type(String),
+    Key(String),
+    Wait,
+    Done(String),
+}
+
+pub fn parse_cu_action(reply: &str) -> Option<CuAction> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    if end <= start {
+        return None;
     }
-    Err(String::from("Empty or invalid response from Gemini API"))
+    let obj = &reply[start..=end];
+    let act = extract_json_field(obj, "action")?.to_ascii_lowercase();
+    match act.as_str() {
+        "click" => Some(CuAction::Click(
+            extract_json_int(obj, "x").unwrap_or(0),
+            extract_json_int(obj, "y").unwrap_or(0),
+        )),
+        "double_click" => Some(CuAction::DoubleClick(
+            extract_json_int(obj, "x").unwrap_or(0),
+            extract_json_int(obj, "y").unwrap_or(0),
+        )),
+        "move" => Some(CuAction::Move(
+            extract_json_int(obj, "x").unwrap_or(0),
+            extract_json_int(obj, "y").unwrap_or(0),
+        )),
+        "type" => extract_json_field(obj, "text").map(CuAction::Type),
+        "key" => extract_json_field(obj, "name")
+            .or_else(|| extract_json_field(obj, "key"))
+            .map(CuAction::Key),
+        "wait" => Some(CuAction::Wait),
+        "done" => Some(CuAction::Done(
+            extract_json_field(obj, "summary").unwrap_or_else(|| String::from("Done.")),
+        )),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiEditField {
+    Prompt,
+    ApiKey,
+    BaseUrl,
+    CustomModel,
 }
 
 pub struct AiChatState {
+    pub provider: AiProvider,
     pub api_key: String,
+    pub base_url: String,
+    pub custom_model: String,
     pub model_idx: usize,
-    pub key_editing: bool,
+    pub thinking: ThinkingLevel,
+    pub custom_thinking_mask: u8,
+    pub cfg_open: bool,
+    pub edit_field: AiEditField,
+    pub cu_enabled: bool,
+    pub cu_active: bool,
+    pub cu_goal: String,
+    pub cu_steps: u8,
+    pub cu_wait_ticks: u8,
+    pub cu_needs_capture: bool,
     pub input: String,
     pub messages: Vec<(bool, String)>,
     pub busy: bool,
@@ -4306,93 +4556,236 @@ pub struct AiChatState {
 }
 
 impl AiChatState {
-    pub fn new(api_key: String, model_idx: usize) -> Self {
-        Self {
-            api_key,
-            model_idx: model_idx.min(AI_MODELS.len() - 1),
-            key_editing: false,
+    pub fn new(settings: &SettingsState) -> Self {
+        let model_idx = settings.ai_model_idx.min(AI_MODELS.len() - 1);
+        let provider = AiProvider::from_u8(settings.ai_provider);
+        let mut s = Self {
+            provider,
+            api_key: settings.ai_api_key.clone(),
+            base_url: settings.ai_base_url.clone(),
+            custom_model: settings.ai_custom_model.clone(),
+            model_idx,
+            thinking: ThinkingLevel::from_idx(settings.ai_thinking_idx),
+            custom_thinking_mask: if settings.ai_thinking_mask == 0 {
+                0x3F
+            } else {
+                settings.ai_thinking_mask & 0x3F
+            },
+            cfg_open: false,
+            edit_field: AiEditField::Prompt,
+            cu_enabled: false,
+            cu_active: false,
+            cu_goal: String::new(),
+            cu_steps: 0,
+            cu_wait_ticks: 0,
+            cu_needs_capture: false,
             input: String::new(),
             messages: vec![(
                 false,
-                String::from("Привет! Я PizAI на базе Gemini API. Вставь свой ключ (кнопка Key) и пиши!"),
+                String::from(
+                    "PizAI (Google AI Studio / OpenAI / Anthropic + Computer Use). Нажми Cfg для ключа/API и CU для управления ОС!",
+                ),
             )],
             busy: false,
             rx: None,
+        };
+        s.clamp_thinking();
+        s
+    }
+
+    pub fn active_model_id(&self) -> String {
+        let cm = self.custom_model.trim();
+        if cm.is_empty() {
+            String::from(AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)].model_id)
+        } else {
+            String::from(cm)
         }
     }
 
-    pub fn poll(&mut self) -> bool {
-        let Some(ref rx) = self.rx else {
-            return false;
-        };
+    pub fn active_model_label(&self) -> String {
+        let cm = self.custom_model.trim();
+        if cm.is_empty() {
+            String::from(AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)].label)
+        } else {
+            String::from(cm)
+        }
+    }
+
+    pub fn supported_thinking(&self) -> Vec<ThinkingLevel> {
+        if !self.custom_model.trim().is_empty() {
+            let list: Vec<ThinkingLevel> = ALL_THINKING_LEVELS
+                .iter()
+                .copied()
+                .filter(|t| (self.custom_thinking_mask & t.bit()) != 0)
+                .collect();
+            if !list.is_empty() {
+                return list;
+            }
+            return vec![ThinkingLevel::Low, ThinkingLevel::High];
+        }
+        AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)]
+            .thinking
+            .to_vec()
+    }
+
+    pub fn clamp_thinking(&mut self) {
+        let allowed = self.supported_thinking();
+        if !allowed.contains(&self.thinking) {
+            let cur = self.thinking.idx() as i32;
+            if let Some(&best) = allowed.iter().min_by_key(|t| (t.idx() as i32 - cur).abs()) {
+                self.thinking = best;
+            }
+        }
+    }
+
+    pub fn cycle_thinking(&mut self) {
+        let allowed = self.supported_thinking();
+        if allowed.is_empty() {
+            return;
+        }
+        let pos = allowed.iter().position(|t| *t == self.thinking).unwrap_or(0);
+        self.thinking = allowed[(pos + 1) % allowed.len()];
+    }
+
+    pub fn cycle_model(&mut self) {
+        self.model_idx = (self.model_idx + 1) % AI_MODELS.len();
+        self.provider = AI_MODELS[self.model_idx].provider;
+        self.custom_model.clear();
+        self.clamp_thinking();
+    }
+
+    pub fn poll(&mut self) -> Option<String> {
+        let rx = self.rx.as_ref()?;
         match rx.try_recv() {
             Ok(res) => {
                 self.busy = false;
                 self.rx = None;
                 match res {
-                    Ok(reply) => self.messages.push((false, reply)),
-                    Err(err) => self.messages.push((false, format!("[ERR] {err}"))),
+                    Ok(reply) => {
+                        if !self.cu_active {
+                            self.messages.push((false, reply.clone()));
+                        }
+                        Some(reply)
+                    }
+                    Err(err) => {
+                        self.cu_active = false;
+                        self.messages.push((false, format!("[ERR] {err}")));
+                        None
+                    }
                 }
-                true
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.busy = false;
+                self.cu_active = false;
                 self.rx = None;
                 self.messages.push((false, String::from("[ERR] Worker disconnected")));
-                true
+                None
             }
         }
     }
 
-    pub fn send_prompt(&mut self) {
+    pub fn begin_prompt(&mut self) {
         let prompt = self.input.trim().to_string();
         if prompt.is_empty() || self.busy {
             return;
         }
-        if self.api_key.trim().is_empty() {
+        if self.api_key.trim().is_empty() && self.base_url.trim().is_empty() {
             self.messages.push((
                 false,
-                String::from("Сначала введи Gemini API Key (нажми кнопку Key вверху)."),
+                String::from("Сначала введи API Key (кнопка Cfg -> Key)."),
             ));
-            self.key_editing = true;
+            self.cfg_open = true;
+            self.edit_field = AiEditField::ApiKey;
             return;
         }
         self.input.clear();
         self.messages.push((true, prompt.clone()));
-        self.busy = true;
+        if self.cu_enabled {
+            self.cu_active = true;
+            self.cu_goal = prompt;
+            self.cu_steps = 0;
+            self.cu_wait_ticks = 0;
+            self.cu_needs_capture = true;
+            self.busy = true;
+        } else {
+            self.dispatch_api(&prompt, None);
+        }
+    }
 
+    pub fn dispatch_cu_screen(&mut self, png_b64: &str, sw: i32, sh: i32) {
+        self.cu_needs_capture = false;
+        self.cu_steps += 1;
+        let prompt = format!(
+            "You are controlling pizdOS ({sw}x{sh} px). Goal: {}. Step {}/10. \
+             Look at the attached desktop PNG screenshot and return ONLY one JSON object for the next action: \
+             {{\"action\":\"click\",\"x\":100,\"y\":200}} OR {{\"action\":\"double_click\",\"x\":100,\"y\":200}} \
+             OR {{\"action\":\"move\",\"x\":100,\"y\":200}} OR {{\"action\":\"type\",\"text\":\"abc\"}} \
+             OR {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}.",
+            self.cu_goal, self.cu_steps
+        );
+        self.dispatch_api(&prompt, Some(png_b64));
+    }
+
+    fn dispatch_api(&mut self, prompt: &str, png_b64: Option<&str>) {
+        self.busy = true;
+        let provider = self.provider;
         let key = self.api_key.trim().to_string();
-        let (_, model_id) = AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)];
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
-        );
-        let body = format!(
-            "{{\"contents\":[{{\"parts\":[{{\"text\":\"{}\"}}]}}]}}",
-            json_escape(&prompt)
-        );
+        let base = if self.base_url.trim().is_empty() {
+            provider.default_base_url().to_string()
+        } else {
+            self.base_url.trim().trim_end_matches('/').to_string()
+        };
+        let model_id = self.active_model_id();
+        let thinking = self.thinking;
+
+        let body = build_ai_request_json(provider, &model_id, thinking, prompt, png_b64);
+        let url = match provider {
+            AiProvider::Gemini => format!("{base}/models/{model_id}:generateContent?key={key}"),
+            AiProvider::OpenAi => format!("{base}/chat/completions"),
+            AiProvider::Anthropic => format!("{base}/messages"),
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let out = Command::new("curl")
-                .args([
-                    "-sS",
-                    "--max-time",
-                    "30",
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    &body,
-                    &url,
-                ])
-                .output();
+            let tmp = std::env::temp_dir().join("piz_ai_req.json");
+            if let Err(e) = fs::write(&tmp, body.as_bytes()) {
+                let _ = tx.send(Err(format!("Write temp req failed: {e}")));
+                return;
+            }
+            let at_path = format!("@{}", tmp.display());
+            let mut cmd = Command::new("curl");
+            cmd.args([
+                "-sS",
+                "--max-time",
+                "45",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+            ]);
+            match provider {
+                AiProvider::Gemini => {}
+                AiProvider::OpenAi => {
+                    if !key.is_empty() {
+                        cmd.arg("-H").arg(format!("Authorization: Bearer {key}"));
+                    }
+                }
+                AiProvider::Anthropic => {
+                    cmd.arg("-H")
+                        .arg(format!("x-api-key: {key}"))
+                        .arg("-H")
+                        .arg("anthropic-version: 2023-06-01");
+                }
+            }
+            cmd.arg("-d").arg(&at_path).arg(&url);
+            let out = cmd.output();
+            let _ = fs::remove_file(&tmp);
             let res = match out {
                 Ok(o) if o.status.success() => {
                     let s = String::from_utf8_lossy(&o.stdout);
-                    extract_gemini_text(&s)
+                    extract_ai_response(provider, &s)
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -4409,60 +4802,133 @@ impl AiChatState {
     }
 
     pub fn on_char(&mut self, ch: char) {
-        if self.key_editing {
-            if !ch.is_control() && self.api_key.len() < 128 {
-                self.api_key.push(ch);
+        if ch.is_control() {
+            return;
+        }
+        match self.edit_field {
+            AiEditField::ApiKey if self.api_key.len() < 160 => self.api_key.push(ch),
+            AiEditField::BaseUrl if self.base_url.len() < 160 => self.base_url.push(ch),
+            AiEditField::CustomModel if self.custom_model.len() < 80 => {
+                self.custom_model.push(ch);
+                self.clamp_thinking();
             }
-        } else if !ch.is_control() && self.input.len() < 512 {
-            self.input.push(ch);
+            AiEditField::Prompt if self.input.len() < 512 => self.input.push(ch),
+            _ => {}
         }
     }
 
     pub fn on_backspace(&mut self) {
-        if self.key_editing {
-            self.api_key.pop();
-        } else {
-            self.input.pop();
+        match self.edit_field {
+            AiEditField::ApiKey => {
+                self.api_key.pop();
+            }
+            AiEditField::BaseUrl => {
+                self.base_url.pop();
+            }
+            AiEditField::CustomModel => {
+                self.custom_model.pop();
+                self.clamp_thinking();
+            }
+            AiEditField::Prompt => {
+                self.input.pop();
+            }
         }
     }
 
     pub fn on_enter(&mut self) -> bool {
-        if self.key_editing {
-            self.key_editing = false;
+        if self.edit_field != AiEditField::Prompt {
+            self.edit_field = AiEditField::Prompt;
             return true;
         }
-        self.send_prompt();
+        self.begin_prompt();
         false
     }
 
     pub fn paste(&mut self, text: &str) {
-        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-        if self.key_editing {
-            self.api_key.push_str(&clean);
-        } else {
-            self.input.push_str(&clean);
+        for c in text.chars().filter(|c| !c.is_control()) {
+            self.on_char(c);
         }
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) -> bool {
         let mut changed = false;
-        // Model toggle pill at top-left (10..210, 34..56)
-        if (10..=210).contains(&lx) && (34..=56).contains(&ly) {
-            self.model_idx = (self.model_idx + 1) % AI_MODELS.len();
-            changed = true;
+        // Header row (34..56)
+        if (34..=56).contains(&ly) {
+            if (10..=178).contains(&lx) {
+                self.cycle_model();
+                return true;
+            }
+            if (182..=268).contains(&lx) {
+                self.cycle_thinking();
+                return true;
+            }
+            if (272..=342).contains(&lx) {
+                self.cu_enabled = !self.cu_enabled;
+                if !self.cu_enabled {
+                    self.cu_active = false;
+                }
+                return false;
+            }
+            if lx >= ww - 68 && lx <= ww - 10 {
+                self.cfg_open = !self.cfg_open;
+                if !self.cfg_open {
+                    self.edit_field = AiEditField::Prompt;
+                    changed = true;
+                }
+                return changed;
+            }
         }
-        // Key toggle button (ww - 72 .. ww - 10, 34..56)
-        if lx >= ww - 72 && lx <= ww - 10 && (34..=56).contains(&ly) {
-            self.key_editing = !self.key_editing;
-            changed = true;
+
+        if self.cfg_open && ly >= 62 && ly <= wh - 42 {
+            // Provider tabs at ly 68..90
+            if (68..=90).contains(&ly) {
+                let bw = (ww - 28) / 3;
+                let idx = ((lx - 10) / (bw + 4)).clamp(0, 2) as u8;
+                self.provider = AiProvider::from_u8(idx);
+                if let Some((mi, _)) = AI_MODELS
+                    .iter()
+                    .enumerate()
+                    .find(|(_, m)| m.provider == self.provider)
+                {
+                    self.model_idx = mi;
+                }
+                self.clamp_thinking();
+                return true;
+            }
+            if (96..=120).contains(&ly) {
+                self.edit_field = AiEditField::BaseUrl;
+            } else if (126..=150).contains(&ly) {
+                self.edit_field = AiEditField::ApiKey;
+            } else if (156..=180).contains(&ly) {
+                self.edit_field = AiEditField::CustomModel;
+            } else if (188..=212).contains(&ly) {
+                let cw = ((ww - 20) / 6).max(36);
+                let ti = ((lx - 10) / cw).clamp(0, 5) as usize;
+                let bit = ALL_THINKING_LEVELS[ti].bit();
+                let next = self.custom_thinking_mask ^ bit;
+                if next != 0 {
+                    self.custom_thinking_mask = next;
+                    self.clamp_thinking();
+                    changed = true;
+                }
+            }
+            return changed;
         }
-        // Send button at bottom-right
-        if lx >= ww - 68 && lx <= ww - 10 && ly >= wh - 34 && ly <= wh - 10 {
-            if self.key_editing {
-                self.key_editing = false;
-                changed = true;
+
+        // Bottom input / Send / Stop
+        if ly >= wh - 34 && ly <= wh - 10 {
+            if lx >= ww - 68 && lx <= ww - 10 {
+                if self.busy || self.cu_active {
+                    self.cu_active = false;
+                    self.cu_needs_capture = false;
+                    self.busy = false;
+                    self.rx = None;
+                    self.messages.push((false, String::from("[Stopped]")));
+                } else {
+                    self.begin_prompt();
+                }
             } else {
-                self.send_prompt();
+                self.edit_field = AiEditField::Prompt;
             }
         }
         changed
@@ -4479,28 +4945,32 @@ impl AiChatState {
         accent: u32,
         lang: Lang,
     ) {
-        let (model_label, _) = AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)];
-        // Header controls
-        canvas.draw_button(wx + 10, wy + 34, 200, 22, model_label, 0x1E293B, 0xE2E8F0, accent);
-        let key_lbl = if self.key_editing {
-            tr(lang, "Готово", "Done")
-        } else if self.api_key.is_empty() {
-            "Key (!)"
-        } else {
-            "Key"
-        };
+        let model_lbl = self.active_model_label();
+        canvas.draw_button(wx + 10, wy + 34, 168, 22, &model_lbl, 0x1E293B, 0xE2E8F0, accent);
+        let think_lbl = format!("Think:{}", self.thinking.label());
+        canvas.draw_button(wx + 182, wy + 34, 86, 22, &think_lbl, 0x1E293B, 0x38BDF8, accent);
+        let cu_lbl = if self.cu_enabled { "CU: ON" } else { "CU:OFF" };
         canvas.draw_button(
-            wx + ww - 72,
+            wx + 272,
             wy + 34,
-            62,
+            70,
             22,
-            key_lbl,
-            if self.key_editing { accent } else { 0x1E293B },
+            cu_lbl,
+            if self.cu_enabled { 0x059669 } else { 0x1E293B },
+            0xFFFFFF,
+            0x10B981,
+        );
+        canvas.draw_button(
+            wx + ww - 68,
+            wy + 34,
+            58,
+            22,
+            if self.cfg_open { "Chat" } else { "Cfg" },
+            if self.cfg_open { accent } else { 0x1E293B },
             0xFFFFFF,
             accent,
         );
 
-        // Chat area
         let cx = wx + 10;
         let cy = wy + 62;
         let cw = (ww - 20).max(80);
@@ -4508,75 +4978,258 @@ impl AiChatState {
         canvas.fill_rounded_rect(cx, cy, cw, ch, 8, 0x0B101B);
         canvas.draw_rounded_rect_alpha(cx, cy, cw, ch, 8, 0xFFFFFF, 20);
 
-        let mut lines: Vec<(bool, String)> = Vec::new();
-        let max_chars = ((cw - 20) / 7).max(16) as usize;
-        for (is_user, msg) in &self.messages {
-            for raw_line in msg.lines() {
-                let mut cur = String::new();
-                for word in raw_line.split_whitespace() {
-                    if cur.len() + word.len() + 1 > max_chars && !cur.is_empty() {
-                        lines.push((*is_user, cur));
-                        cur = String::new();
-                    }
-                    if !cur.is_empty() {
-                        cur.push(' ');
-                    }
-                    cur.push_str(word);
-                }
-                lines.push((*is_user, cur));
+        if self.cfg_open {
+            let bw = (ww - 28) / 3;
+            for (i, prov) in [AiProvider::Gemini, AiProvider::OpenAi, AiProvider::Anthropic]
+                .iter()
+                .enumerate()
+            {
+                let act = *prov == self.provider;
+                canvas.draw_button(
+                    cx + (i as i32) * (bw + 4),
+                    wy + 68,
+                    bw,
+                    22,
+                    prov.label(),
+                    if act { accent } else { 0x1E293B },
+                    0xFFFFFF,
+                    accent,
+                );
             }
-        }
-        if self.busy {
-            lines.push((false, String::from(tr(lang, "Думаю...", "Thinking..."))));
-        }
-
-        let max_vis = ((ch - 12) / 16).max(1) as usize;
-        let start = lines.len().saturating_sub(max_vis);
-        for (i, (is_user, line)) in lines[start..].iter().enumerate() {
-            let ly = cy + 8 + (i as i32) * 16;
-            let col = if *is_user { 0x38BDF8 } else { 0xE2E8F0 };
-            let prefix = if *is_user { "> " } else { "" };
-            canvas.draw_text_clipped(cx + 8, ly, cw - 16, &format!("{prefix}{line}"), col, 1);
+            let mut draw_field = |ly: i32, lbl: &str, val: &str, ph: &str, active: bool| {
+                canvas.fill_rounded_rect(cx + 4, ly, cw - 8, 24, 5, 0x0F172A);
+                canvas.draw_rounded_rect_alpha(
+                    cx + 4,
+                    ly,
+                    cw - 8,
+                    24,
+                    5,
+                    if active { 0xF59E0B } else { 0xFFFFFF },
+                    if active { 140 } else { 25 },
+                );
+                let txt = if val.is_empty() && !active {
+                    format!("{lbl}: {ph}")
+                } else if active {
+                    format!("{lbl}: {val}_")
+                } else {
+                    format!("{lbl}: {val}")
+                };
+                canvas.draw_text_clipped(
+                    cx + 10,
+                    ly + 5,
+                    cw - 20,
+                    &txt,
+                    if val.is_empty() && !active { 0x64748B } else { 0xE2E8F0 },
+                    1,
+                );
+            };
+            draw_field(
+                wy + 96,
+                "URL",
+                &self.base_url,
+                self.provider.default_base_url(),
+                self.edit_field == AiEditField::BaseUrl,
+            );
+            let masked_key = if self.edit_field == AiEditField::ApiKey {
+                self.api_key.clone()
+            } else if self.api_key.len() > 8 {
+                format!("{}...{}", &self.api_key[..4], &self.api_key[self.api_key.len() - 4..])
+            } else {
+                self.api_key.clone()
+            };
+            draw_field(
+                wy + 126,
+                "Key",
+                &masked_key,
+                "(click to type or Ctrl+V)",
+                self.edit_field == AiEditField::ApiKey,
+            );
+            draw_field(
+                wy + 156,
+                "Model",
+                &self.custom_model,
+                "(preset or custom ID)",
+                self.edit_field == AiEditField::CustomModel,
+            );
+            let chip_w = (cw / 6).max(36);
+            for (i, tl) in ALL_THINKING_LEVELS.iter().enumerate() {
+                let on = (self.custom_thinking_mask & tl.bit()) != 0;
+                canvas.draw_button(
+                    cx + (i as i32) * chip_w,
+                    wy + 188,
+                    chip_w - 4,
+                    22,
+                    tl.label(),
+                    if on { 0x1D4ED8 } else { 0x1E293B },
+                    0xFFFFFF,
+                    accent,
+                );
+            }
+            canvas.draw_text_clipped(
+                cx + 6,
+                wy + 218,
+                cw - 12,
+                tr(
+                    lang,
+                    "Чипы выше настраивают уровни раздумия для Custom Model.",
+                    "Chips above customize allowed thinking levels for Custom Model.",
+                ),
+                0x94A3B8,
+                1,
+            );
+        } else {
+            let mut lines: Vec<(bool, String)> = Vec::new();
+            let max_chars = ((cw - 20) / 7).max(16) as usize;
+            for (is_user, msg) in &self.messages {
+                for raw_line in msg.lines() {
+                    let mut cur = String::new();
+                    for word in raw_line.split_whitespace() {
+                        if cur.len() + word.len() + 1 > max_chars && !cur.is_empty() {
+                            lines.push((*is_user, cur));
+                            cur = String::new();
+                        }
+                        if !cur.is_empty() {
+                            cur.push(' ');
+                        }
+                        cur.push_str(word);
+                    }
+                    lines.push((*is_user, cur));
+                }
+            }
+            if self.busy {
+                let msg = if self.cu_active {
+                    format!("Computer Use step {}...", self.cu_steps)
+                } else {
+                    String::from(tr(lang, "Думаю...", "Thinking..."))
+                };
+                lines.push((false, msg));
+            }
+            let max_vis = ((ch - 12) / 16).max(1) as usize;
+            let start = lines.len().saturating_sub(max_vis);
+            for (i, (is_user, line)) in lines[start..].iter().enumerate() {
+                let ly = cy + 8 + (i as i32) * 16;
+                let col = if *is_user { 0x38BDF8 } else { 0xE2E8F0 };
+                let prefix = if *is_user { "> " } else { "" };
+                canvas.draw_text_clipped(cx + 8, ly, cw - 16, &format!("{prefix}{line}"), col, 1);
+            }
         }
 
         // Input bar
         let iy = wy + wh - 34;
         let iw = (ww - 84).max(60);
         canvas.fill_rounded_rect(wx + 10, iy, iw, 24, 6, 0x0F172A);
-        canvas.draw_rounded_rect_alpha(
-            wx + 10,
-            iy,
-            iw,
-            24,
-            6,
-            if self.key_editing { 0xF59E0B } else { accent },
-            90,
-        );
-        let disp = if self.key_editing {
-            format!("API Key: {}_", self.api_key)
-        } else if self.input.is_empty() {
-            String::from(tr(lang, "Спроси Gemini...", "Ask Gemini..."))
-        } else {
+        canvas.draw_rounded_rect_alpha(wx + 10, iy, iw, 24, 6, accent, 90);
+        let disp = if self.input.is_empty() {
+            String::from(if self.cu_enabled {
+                tr(lang, "Задача для Computer Use...", "Task for Computer Use...")
+            } else {
+                tr(lang, "Сообщение ИИ...", "Message AI...")
+            })
+        } else if self.edit_field == AiEditField::Prompt {
             format!("{}_", self.input)
-        };
-        let dcol = if !self.key_editing && self.input.is_empty() {
-            0x64748B
         } else {
-            0xF8FAFC
+            self.input.clone()
         };
+        let dcol = if self.input.is_empty() { 0x64748B } else { 0xF8FAFC };
         canvas.draw_text_clipped(wx + 16, iy + 5, iw - 12, &disp, dcol, 1);
         canvas.draw_button(
             wx + ww - 68,
             iy,
             58,
             24,
-            if self.key_editing { "OK" } else { ">" },
-            accent,
+            if self.busy || self.cu_active { "Stop" } else { ">" },
+            if self.busy || self.cu_active { 0xEF4444 } else { accent },
             0xFFFFFF,
             accent,
         );
     }
 }
+
+pub fn build_ai_request_json(
+    provider: AiProvider,
+    model_id: &str,
+    thinking: ThinkingLevel,
+    prompt: &str,
+    png_b64: Option<&str>,
+) -> String {
+    let ep = json_escape(prompt);
+    match provider {
+        AiProvider::Gemini => {
+            let parts = if let Some(b64) = png_b64 {
+                format!(
+                    "[{{\"text\":\"{ep}\"}},{{\"inlineData\":{{\"mimeType\":\"image/png\",\"data\":\"{b64}\"}}}}]"
+                )
+            } else {
+                format!("[{{\"text\":\"{ep}\"}}]")
+            };
+            let tcfg = if model_id.contains("2.5") {
+                let budget = match thinking {
+                    ThinkingLevel::Off => 0,
+                    ThinkingLevel::Low => 1024,
+                    ThinkingLevel::Medium => 8192,
+                    ThinkingLevel::High => 16384,
+                    ThinkingLevel::XHigh => 24576,
+                    ThinkingLevel::Max => 32768,
+                };
+                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":{budget}}}}}")
+            } else if thinking == ThinkingLevel::Off {
+                String::from(",\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":0}}")
+            } else {
+                let lvl = match thinking {
+                    ThinkingLevel::Low => "LOW",
+                    ThinkingLevel::Medium => "MEDIUM",
+                    ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => "HIGH",
+                    ThinkingLevel::Off => "LOW",
+                };
+                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\"}}}}")
+            };
+            format!("{{\"contents\":[{{\"parts\":{parts}}}]{tcfg}}}")
+        }
+        AiProvider::OpenAi => {
+            let content = if let Some(b64) = png_b64 {
+                format!(
+                    "[{{\"type\":\"text\",\"text\":\"{ep}\"}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{b64}\"}}}}]"
+                )
+            } else {
+                format!("\"{ep}\"")
+            };
+            let eff = match thinking {
+                ThinkingLevel::Off => String::new(),
+                ThinkingLevel::Low => String::from(",\"reasoning_effort\":\"low\""),
+                ThinkingLevel::Medium => String::from(",\"reasoning_effort\":\"medium\""),
+                ThinkingLevel::High => String::from(",\"reasoning_effort\":\"high\""),
+                ThinkingLevel::XHigh => String::from(",\"reasoning_effort\":\"xhigh\""),
+                ThinkingLevel::Max => String::from(",\"reasoning_effort\":\"max\""),
+            };
+            format!(
+                "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":{content}}}]{eff}}}",
+                json_escape(model_id)
+            )
+        }
+        AiProvider::Anthropic => {
+            let content = if let Some(b64) = png_b64 {
+                format!(
+                    "[{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"{b64}\"}}}},{{\"type\":\"text\",\"text\":\"{ep}\"}}]"
+                )
+            } else {
+                format!("\"{ep}\"")
+            };
+            let tcfg = match thinking {
+                ThinkingLevel::Off => String::new(),
+                ThinkingLevel::Low => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}"),
+                ThinkingLevel::Medium => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}"),
+                ThinkingLevel::High => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":10000}"),
+                ThinkingLevel::XHigh => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":16384}"),
+                ThinkingLevel::Max => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":24576}"),
+            };
+            format!(
+                "{{\"model\":\"{}\",\"max_tokens\":4096,\"messages\":[{{\"role\":\"user\",\"content\":{content}}}]{tcfg}}}",
+                json_escape(model_id)
+            )
+        }
+    }
+}
+
 
 
 // ---------------------------------------------------------------------------
@@ -4674,10 +5327,40 @@ pub fn normalize_address(raw: &str) -> String {
     format!("https://lite.duckduckgo.com/lite/?q={enc}")
 }
 
+pub fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((h << 4) | l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn resolve_url(base: &str, href: &str) -> String {
     let h = href.trim();
     if h.is_empty() || h.starts_with('#') || h.starts_with("javascript:") {
         return String::from(base);
+    }
+    if let Some(pos) = h.find("uddg=") {
+        let val = &h[pos + 5..];
+        let end = val.find('&').unwrap_or(val.len());
+        let decoded = percent_decode(&val[..end]);
+        if decoded.starts_with("http://") || decoded.starts_with("https://") {
+            return decoded;
+        }
     }
     if h.starts_with("https://") || h.starts_with("http://") || h.starts_with("about:") {
         return String::from(h);
@@ -4742,11 +5425,12 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
     while i < bytes.len() {
         if bytes[i] == b'<' {
             let text_chunk = &html[i..];
-            if text_chunk.starts_with("<!--")
-                && let Some(cend) = text_chunk.find("-->")
-            {
-                i += cend + 3;
-                continue;
+            if text_chunk.starts_with("<!--") {
+                if let Some(cend) = text_chunk.find("-->") {
+                    i += cend + 3;
+                    continue;
+                }
+                break;
             }
             if let Some(rel_end) = text_chunk.find('>') {
                 let raw_tag = &text_chunk[1..rel_end];
@@ -4760,19 +5444,27 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
                 let tag = name_raw[..name_end].to_ascii_lowercase();
                 let attrs = &name_raw[name_end..];
 
-                if let Some(sk) = skip_tag {
-                    if is_close && tag == sk {
-                        skip_tag = None;
-                    }
-                    continue;
-                }
                 if !is_close && matches!(tag.as_str(), "script" | "style" | "noscript" | "svg") {
+                    let close_pat = format!("</{tag}");
+                    let lower_tail = html[i..].to_ascii_lowercase();
+                    if let Some(cp) = lower_tail.find(&close_pat)
+                        && let Some(gt) = html[i + cp..].find('>')
+                    {
+                        i += cp + gt + 1;
+                        continue;
+                    }
                     skip_tag = Some(match tag.as_str() {
                         "script" => "script",
                         "style" => "style",
                         "noscript" => "noscript",
                         _ => "svg",
                     });
+                    continue;
+                }
+                if let Some(sk) = skip_tag {
+                    if is_close && tag == sk {
+                        skip_tag = None;
+                    }
                     continue;
                 }
                 match tag.as_str() {
@@ -4812,7 +5504,7 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
                             }
                         }
                     }
-                    "p" | "div" | "li" | "br" | "tr" | "section" | "article" | "header" | "footer" => {
+                    "p" | "div" | "li" | "br" | "tr" | "td" | "th" | "section" | "article" | "header" | "footer" | "blockquote" | "dd" | "dt" => {
                         if cur_href.is_none() {
                             push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
                         }
@@ -4825,7 +5517,11 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
                 continue;
             }
         }
-        let next_lt = html[i..].find('<').map(|p| i + p).unwrap_or(html.len());
+        let next_lt = if bytes[i] == b'<' {
+            html[i + 1..].find('<').map(|p| i + 1 + p).unwrap_or(html.len())
+        } else {
+            html[i..].find('<').map(|p| i + p).unwrap_or(html.len())
+        };
         let plain = decode_html_entities(&html[i..next_lt]);
         if in_title {
             title.push_str(&plain);
@@ -4834,7 +5530,7 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
         } else if !in_title && skip_tag.is_none() {
             text_buf.push_str(&plain);
         }
-        i = next_lt;
+        i = next_lt.max(i + 1);
     }
     push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
 
@@ -4865,30 +5561,95 @@ pub fn built_in_home_page() -> WebPage {
         blocks: vec![
             WebBlock::Heading(1, String::from("PizSurf Browser - pizdOS 2.1(00)")),
             WebBlock::Paragraph(String::from(
-                "Zero-deps Rust web reader with live HTTP/HTTPS fetch and clickable links.",
+                "Type a URL or search query in the address bar and press Enter.",
             )),
             WebBlock::Heading(2, String::from("Quick Bookmarks")),
             WebBlock::Link(
+                String::from("[HTTP] info.cern.ch (First Website)"),
+                String::from("http://info.cern.ch/"),
+            ),
+            WebBlock::Link(
+                String::from("[Test] example.com"),
+                String::from("https://example.com/"),
+            ),
+            WebBlock::Link(
                 String::from("[Search] DuckDuckGo Lite"),
-                String::from("https://lite.duckduckgo.com/lite/"),
+                String::from("https://lite.duckduckgo.com/lite/?q=pizdOS"),
+            ),
+            WebBlock::Link(
+                String::from("[News] NPR Text"),
+                String::from("https://text.npr.org/"),
             ),
             WebBlock::Link(
                 String::from("[News] Hacker News"),
                 String::from("https://news.ycombinator.com/"),
             ),
             WebBlock::Link(
-                String::from("[Wiki] Wikipedia Mobile"),
-                String::from("https://en.m.wikipedia.org/wiki/Main_Page"),
-            ),
-            WebBlock::Link(
                 String::from("[Weather] wttr.in"),
                 String::from("https://wttr.in/?format=4"),
             ),
-            WebBlock::Link(
-                String::from("[Test] example.com"),
-                String::from("https://example.com/"),
-            ),
         ],
+    }
+}
+
+fn fetch_http_get(url: &str) -> Result<String, String> {
+    const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+    let try_curl = |insecure: bool| {
+        let mut args = vec![
+            "-sSL",
+            "--max-time",
+            "15",
+            "-A",
+            UA,
+            "-H",
+            "Accept: text/html,application/xhtml+xml,text/plain,*/*",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+        ];
+        if insecure {
+            args.push("-k");
+        }
+        args.push(url);
+        Command::new("curl").args(&args).output()
+    };
+
+    match try_curl(false) {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+            return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
+        }
+        Ok(o) => {
+            // Retry with -k when live-ISO RTC/CA bundle rejects TLS certs
+            if let Ok(o2) = try_curl(true)
+                && o2.status.success()
+                && !o2.stdout.is_empty()
+            {
+                return Ok(String::from_utf8_lossy(&o2.stdout).into_owned());
+            }
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !err.is_empty() {
+                return Err(err);
+            }
+        }
+        Err(_) => {}
+    }
+
+    // Fallback to BusyBox / GNU wget if curl is absent
+    match Command::new("wget")
+        .args(["-qO-", "-T", "15", "-U", UA, url])
+        .output()
+    {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if err.is_empty() {
+                format!("HTTP fetch returned empty body ({})", o.status)
+            } else {
+                err
+            })
+        }
+        Err(e) => Err(format!("Network fetch needs curl or wget ({e})")),
     }
 }
 
@@ -4955,31 +5716,15 @@ impl BrowserState {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let out = Command::new("curl")
-                .args([
-                    "-sSL",
-                    "--max-time",
-                    "15",
-                    "-A",
-                    "PizSurf/2.1 (pizdOS)",
-                    &url,
-                ])
-                .output();
-            let res = match out {
-                Ok(o) if o.status.success() => {
-                    let html = String::from_utf8_lossy(&o.stdout);
-                    Ok(parse_html_page(&url, &html))
+            let res = fetch_http_get(&url).map(|html| {
+                let mut page = parse_html_page(&url, &html);
+                if page.blocks.is_empty() {
+                    page.blocks.push(WebBlock::Paragraph(String::from(
+                        "Page loaded but contained no readable text blocks.",
+                    )));
                 }
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    Err(if err.is_empty() {
-                        format!("HTTP fetch failed ({})", o.status)
-                    } else {
-                        err
-                    })
-                }
-                Err(e) => Err(format!("curl not found ({e}). Install: piz-get install curl")),
-            };
+                page
+            });
             let _ = tx.send(res);
         });
     }

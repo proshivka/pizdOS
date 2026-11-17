@@ -1351,10 +1351,85 @@ mod tests {
             String::from("https://example.com/next"),
         )));
 
+        // Malformed HTML with unclosed '<' and DuckDuckGo /l/?uddg= redirect must not hang
+        let ddg_html = "<script>if(a<b)x=1;</script><a href='//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&rut=1'>Rust</a><unclosed";
+        let ddg_page = parse_html_page("https://lite.duckduckgo.com/lite/", ddg_html);
+        assert!(ddg_page.blocks.contains(&WebBlock::Link(
+            String::from("Rust"),
+            String::from("https://rust-lang.org/"),
+        )));
+
         let mut br = BrowserState::new();
         assert_eq!(br.current_url, "about:pizdos");
         br.navigate("about:pizdos", true);
         let mut canvas = Canvas::new(800, 600);
         br.draw(&mut canvas, 100, 50, 480, 356, 0x0EA5E9, apps::Lang::Ru);
+    }
+
+    #[test]
+    fn test_piz_ai_providers_thinking_levels_and_computer_use() {
+        use crate::apps::{
+            AiChatState, AiProvider, CuAction, ThinkingLevel, build_ai_request_json,
+            extract_ai_response, parse_cu_action,
+        };
+
+        let mut settings = apps::SettingsState::new();
+        settings.ai_model_idx = 1; // Gemini 4 Hydrogen: Low, High, Max only
+        settings.ai_thinking_idx = 2; // Medium (disallowed -> clamped!)
+        let mut ai = AiChatState::new(&settings);
+        assert_eq!(
+            ai.supported_thinking(),
+            vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+        assert_ne!(ai.thinking, ThinkingLevel::Medium);
+
+        // Switching to GPT-5 (Low..=XHigh) clamps Max -> XHigh
+        ai.model_idx = 3;
+        ai.provider = AiProvider::OpenAi;
+        ai.thinking = ThinkingLevel::Max;
+        ai.clamp_thinking();
+        assert_eq!(ai.thinking, ThinkingLevel::XHigh);
+
+        // Request/response across Gemini, OpenAI, Anthropic + PNG Computer Use
+        let png = crate::gfx::encode_png_rgb(&[0x00FF0000; 16], 4, 4);
+        assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        let b64 = crate::gfx::encode_base64(&png);
+
+        let gj = build_ai_request_json(AiProvider::Gemini, "gemini-flash-latest", ThinkingLevel::High, "hi", Some(&b64));
+        assert!(gj.contains("inlineData") && gj.contains("\"thinkingLevel\":\"HIGH\""));
+        let oj = build_ai_request_json(AiProvider::OpenAi, "gpt-5", ThinkingLevel::XHigh, "hi", Some(&b64));
+        assert!(oj.contains("\"reasoning_effort\":\"xhigh\"") && oj.contains("data:image/png;base64,"));
+        let aj = build_ai_request_json(AiProvider::Anthropic, "claude-sonnet-4-5", ThinkingLevel::Max, "hi", Some(&b64));
+        assert!(aj.contains("\"budget_tokens\":24576") && aj.contains("\"media_type\":\"image/png\""));
+
+        assert_eq!(
+            extract_ai_response(AiProvider::OpenAi, r#"{"choices":[{"message":{"content":"hello"}}]}"#).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            parse_cu_action(r#"{"action":"click","x":186,"y":114}"#),
+            Some(CuAction::Click(186, 114))
+        );
+        assert_eq!(
+            parse_cu_action(r#"{"action":"done","summary":"Opened Browser"}"#),
+            Some(CuAction::Done(String::from("Opened Browser")))
+        );
+
+        // Config round-trip
+        let tmp = std::env::temp_dir().join("pizsoft_ai_cfg_test.conf");
+        settings.ai_provider = 1;
+        settings.ai_base_url = String::from("https://openrouter.ai/api/v1");
+        settings.ai_custom_model = String::from("openai/gpt-5");
+        settings.ai_thinking_idx = ThinkingLevel::XHigh.idx();
+        settings.ai_thinking_mask = 0b010010;
+        config::save_config_to(&tmp, &settings, 0, "");
+        let mut loaded = apps::SettingsState::new();
+        let _ = config::load_config_from(&tmp, &mut loaded);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded.ai_provider, 1);
+        assert_eq!(loaded.ai_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(loaded.ai_custom_model, "openai/gpt-5");
+        assert_eq!(loaded.ai_thinking_idx, ThinkingLevel::XHigh.idx());
+        assert_eq!(loaded.ai_thinking_mask, 0b010010);
     }
 }

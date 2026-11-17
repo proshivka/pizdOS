@@ -1287,3 +1287,98 @@ impl Canvas {
         Ok(())
     }
 }
+
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn push_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(payload);
+    let crc = png_crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+pub fn encode_png_rgb(pixels: &[u32], width: usize, height: usize) -> Vec<u8> {
+    if width == 0 || height == 0 || pixels.len() < width * height {
+        return Vec::new();
+    }
+    let row_bytes = 1 + width * 3;
+    let raw_len = row_bytes * height;
+    let mut raw = Vec::with_capacity(raw_len);
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for y in 0..height {
+        raw.push(0); // filter type None
+        s2 = (s2 + s1) % 65521;
+        let row = &pixels[y * width..(y + 1) * width];
+        for &px in row {
+            let r = ((px >> 16) & 0xFF) as u8;
+            let g = ((px >> 8) & 0xFF) as u8;
+            let b = (px & 0xFF) as u8;
+            raw.extend_from_slice(&[r, g, b]);
+            for byte in [r, g, b] {
+                s1 = (s1 + byte as u32) % 65521;
+                s2 = (s2 + s1) % 65521;
+            }
+        }
+    }
+
+    let mut zlib = Vec::with_capacity(raw.len() + (raw.len() / 65535 + 1) * 5 + 6);
+    zlib.extend_from_slice(&[0x78, 0x01]); // zlib header: deflate, 32K window, fastest
+    let mut off = 0usize;
+    while off < raw.len() {
+        let take = (raw.len() - off).min(65535);
+        let is_final = u8::from(off + take == raw.len());
+        zlib.push(is_final);
+        let len16 = take as u16;
+        zlib.extend_from_slice(&len16.to_le_bytes());
+        zlib.extend_from_slice(&(!len16).to_le_bytes());
+        zlib.extend_from_slice(&raw[off..off + take]);
+        off += take;
+    }
+    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = [0u8; 13];
+    ihdr[0..4].copy_from_slice(&(width as u32).to_be_bytes());
+    ihdr[4..8].copy_from_slice(&(height as u32).to_be_bytes());
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 2; // RGB
+    push_png_chunk(&mut png, b"IHDR", &ihdr);
+    push_png_chunk(&mut png, b"IDAT", &zlib);
+    push_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+        let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TBL[(n >> 18) & 63] as char);
+        out.push(TBL[(n >> 12) & 63] as char);
+        out.push(if chunk.len() > 1 { TBL[(n >> 6) & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TBL[n & 63] as char } else { '=' });
+    }
+    out
+}
+
+pub fn encode_png_base64(pixels: &[u32], width: usize, height: usize) -> String {
+    encode_base64(&encode_png_rgb(pixels, width, height))
+}
