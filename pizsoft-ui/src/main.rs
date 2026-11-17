@@ -1369,8 +1369,8 @@ mod tests {
     #[test]
     fn test_piz_ai_providers_thinking_levels_and_computer_use() {
         use crate::apps::{
-            AiChatState, AiProvider, CuAction, ThinkingLevel, build_ai_request_json,
-            extract_ai_response, parse_cu_action,
+            AiChatState, AiPopup, AiProvider, CuAction, ThinkingLevel, build_ai_request_json,
+            extract_ai_parts, parse_cu_response,
         };
 
         let mut settings = apps::SettingsState::new();
@@ -1388,54 +1388,73 @@ mod tests {
         );
         assert_eq!(ai.thinking, ThinkingLevel::XHigh);
 
-        // Custom OpenAI-compatible model respects custom thinking mask (e.g. Low + High + Max only)
-        ai.provider = AiProvider::OpenAi;
-        ai.custom_model = String::from("my-custom-model");
-        ai.custom_thinking_mask = ThinkingLevel::Low.bit() | ThinkingLevel::High.bit() | ThinkingLevel::Max.bit();
-        ai.thinking = ThinkingLevel::Medium;
-        ai.clamp_thinking();
-        assert_ne!(ai.thinking, ThinkingLevel::Medium);
+        // Popover state transitions: click bottom pill -> Effort slider -> click model header -> Select model -> back arrow
+        let (ww, wh) = (450, 350);
+        ai.on_click(ww - 150, wh - 20, ww, wh);
+        assert_eq!(ai.popup, AiPopup::Effort);
+        ai.on_click(ww - 130, wh - 164 + 38, ww, wh);
+        assert_eq!(ai.popup, AiPopup::Models);
+        ai.on_click(ww - 260 + 20, wh - 38 - 188 + 16, ww, wh);
+        assert_eq!(ai.popup, AiPopup::Effort);
+
+        // Thought separation: Gemini/OpenAI keep thought, Anthropic omits it
+        let g_parts = extract_ai_parts(
+            AiProvider::Gemini,
+            r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"checking screen"},{"text":"hi!"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(g_parts.thought.as_deref(), Some("checking screen"));
+        assert_eq!(g_parts.answer, "hi!");
+
+        let a_parts = extract_ai_parts(
+            AiProvider::Anthropic,
+            r#"{"content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"answer"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(a_parts.thought, None);
+        assert_eq!(a_parts.answer, "answer");
 
         // Request/response across Gemini, OpenAI, Anthropic + PNG Computer Use
         let png = crate::gfx::encode_png_rgb(&[0x00FF0000; 16], 4, 4);
         assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         let b64 = crate::gfx::encode_base64(&png);
 
-        let gj = build_ai_request_json(AiProvider::Gemini, "gemini-flash-latest", ThinkingLevel::XHigh, "hi", Some(&b64));
+        let gj = build_ai_request_json(AiProvider::Gemini, "gemini-flash-latest", ThinkingLevel::XHigh, "hi", Some(&b64), 0.7);
         assert!(gj.contains("inlineData") && gj.contains("\"thinkingLevel\":\"XHIGH\""));
-        let oj = build_ai_request_json(AiProvider::OpenAi, "my-custom-model", ThinkingLevel::XHigh, "hi", Some(&b64));
+        let oj = build_ai_request_json(AiProvider::OpenAi, "deepseek-v4-pro", ThinkingLevel::XHigh, "hi", Some(&b64), 0.7);
         assert!(oj.contains("\"reasoning_effort\":\"xhigh\"") && oj.contains("data:image/png;base64,"));
-        let aj = build_ai_request_json(AiProvider::Anthropic, "claude-opus-4-6", ThinkingLevel::Max, "hi", Some(&b64));
+        let aj = build_ai_request_json(AiProvider::Anthropic, "claude-opus-5-5", ThinkingLevel::Max, "hi", Some(&b64), 0.7);
         assert!(aj.contains("\"budget_tokens\":24576") && aj.contains("\"media_type\":\"image/png\""));
 
+        let cu = parse_cu_response(r#"{"action":"click","x":186,"y":114,"say":"Opening Browser..."}"#).unwrap();
+        assert_eq!(cu.action, CuAction::Click(186, 114));
+        assert_eq!(cu.say.as_deref(), Some("Opening Browser..."));
         assert_eq!(
-            extract_ai_response(AiProvider::OpenAi, r#"{"choices":[{"message":{"content":"hello"}}]}"#).unwrap(),
-            "hello"
-        );
-        assert_eq!(
-            parse_cu_action(r#"{"action":"click","x":186,"y":114}"#),
-            Some(CuAction::Click(186, 114))
-        );
-        assert_eq!(
-            parse_cu_action(r#"{"action":"done","summary":"Opened Browser"}"#),
+            parse_cu_response(r#"{"action":"done","summary":"Opened Browser"}"#).map(|r| r.action),
             Some(CuAction::Done(String::from("Opened Browser")))
         );
 
-        // Config round-trip
+        // Config round-trip including new PizAI settings
         let tmp = std::env::temp_dir().join("pizsoft_ai_cfg_test.conf");
         settings.ai_provider = 1;
         settings.ai_base_url = String::from("https://openrouter.ai/api/v1");
-        settings.ai_custom_model = String::from("openai/gpt-5");
+        settings.ai_custom_model = String::from("deepseek-v4-pro");
         settings.ai_thinking_idx = ThinkingLevel::XHigh.idx();
         settings.ai_thinking_mask = 0b010010;
+        settings.ai_show_full_thinking = true;
+        settings.ai_temp_idx = 2;
+        settings.ai_system_prompt = String::from("Be concise");
         config::save_config_to(&tmp, &settings, 0, "");
         let mut loaded = apps::SettingsState::new();
         let _ = config::load_config_from(&tmp, &mut loaded);
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(loaded.ai_provider, 1);
         assert_eq!(loaded.ai_base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(loaded.ai_custom_model, "openai/gpt-5");
+        assert_eq!(loaded.ai_custom_model, "deepseek-v4-pro");
         assert_eq!(loaded.ai_thinking_idx, ThinkingLevel::XHigh.idx());
         assert_eq!(loaded.ai_thinking_mask, 0b010010);
+        assert!(loaded.ai_show_full_thinking);
+        assert_eq!(loaded.ai_temp_idx, 2);
+        assert_eq!(loaded.ai_system_prompt, "Be concise");
     }
 }

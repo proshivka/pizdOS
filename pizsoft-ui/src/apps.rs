@@ -1681,6 +1681,9 @@ pub struct SettingsState {
     pub ai_custom_model: String,
     pub ai_thinking_idx: usize,
     pub ai_thinking_mask: u8,
+    pub ai_show_full_thinking: bool,
+    pub ai_temp_idx: u8,
+    pub ai_system_prompt: String,
     pub crosshair_cursor: bool,
     pub show_clock: bool,
     pub persistent_island: bool,
@@ -1727,6 +1730,9 @@ impl SettingsState {
             ai_custom_model: String::new(),
             ai_thinking_idx: 2,
             ai_thinking_mask: 0b0011_1111,
+            ai_show_full_thinking: false,
+            ai_temp_idx: 1,
+            ai_system_prompt: String::new(),
             crosshair_cursor: false,
             show_clock: true,
             persistent_island: false,
@@ -4473,18 +4479,117 @@ fn extract_json_int(json: &str, key: &str) -> Option<i32> {
     num.parse::<i32>().ok()
 }
 
-pub fn extract_ai_response(provider: AiProvider, json: &str) -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiReply {
+    pub answer: String,
+    pub thought: Option<String>,
+}
+
+fn split_gemini_parts(json: &str) -> (String, Option<String>) {
+    let Some(pos) = json.find("\"parts\"") else {
+        return (
+            extract_json_field_all(json, "text").into_iter().last().unwrap_or_default(),
+            None,
+        );
+    };
+    let tail = &json[pos..];
+    let Some(arr_s) = tail.find('[') else {
+        return (
+            extract_json_field_all(json, "text").into_iter().last().unwrap_or_default(),
+            None,
+        );
+    };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut obj_start: Option<usize> = None;
+    let mut thoughts = Vec::new();
+    let mut answers = Vec::new();
+    for (idx, &b) in tail.as_bytes()[arr_s..].iter().enumerate() {
+        let abs = arr_s + idx;
+        if esc {
+            esc = false;
+            continue;
+        }
+        if in_str {
+            if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' if depth == 0 => depth = 1,
+            b']' if depth == 1 => break,
+            b'{' => {
+                if depth == 1 {
+                    obj_start = Some(abs);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 1
+                    && let Some(os) = obj_start.take()
+                {
+                    let slice = &tail[os..=abs];
+                    if let Some(t) = extract_json_field(slice, "text")
+                        && !t.trim().is_empty()
+                    {
+                        let is_thought = slice.contains("\"thought\":true") || slice.contains("\"thought\": true");
+                        if is_thought {
+                            thoughts.push(t);
+                        } else {
+                            answers.push(t);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let thought = if thoughts.is_empty() {
+        None
+    } else {
+        Some(thoughts.join("\n"))
+    };
+    let answer = if answers.is_empty() {
+        extract_json_field_all(json, "text").into_iter().last().unwrap_or_default()
+    } else {
+        answers.join("")
+    };
+    (answer, thought)
+}
+
+pub fn extract_ai_parts(provider: AiProvider, json: &str) -> Result<AiReply, String> {
     if json.contains("\"error\"")
         && let Some(err_msg) = extract_json_field(json, "message")
     {
         return Err(err_msg);
     }
-    let text = match provider {
-        AiProvider::Gemini => extract_json_field_all(json, "text").into_iter().last(),
-        AiProvider::OpenAi => extract_json_field(json, "content"),
-        AiProvider::Anthropic => extract_json_field_all(json, "text").into_iter().last(),
+    let (answer, thought) = match provider {
+        AiProvider::Gemini => split_gemini_parts(json),
+        AiProvider::OpenAi => {
+            let th = extract_json_field(json, "reasoning_content")
+                .or_else(|| extract_json_field(json, "reasoning"));
+            let ans = extract_json_field(json, "content").unwrap_or_default();
+            (ans, th)
+        }
+        AiProvider::Anthropic => {
+            // Never expose Anthropic thinking per policy/preference
+            let ans = extract_json_field_all(json, "text")
+                .into_iter()
+                .last()
+                .unwrap_or_default();
+            (ans, None)
+        }
     };
-    text.ok_or_else(|| String::from("Empty or invalid response from API"))
+    if answer.is_empty() && thought.is_none() {
+        return Err(String::from("Empty or invalid response from API"));
+    }
+    Ok(AiReply { answer, thought })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4496,6 +4601,12 @@ pub enum CuAction {
     Key(String),
     Wait,
     Done(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuResponse {
+    pub action: CuAction,
+    pub say: Option<String>,
 }
 
 fn find_action_json_slice(reply: &str) -> Option<&str> {
@@ -4533,36 +4644,40 @@ fn find_action_json_slice(reply: &str) -> Option<&str> {
     None
 }
 
-pub fn parse_cu_action(reply: &str) -> Option<CuAction> {
+pub fn parse_cu_response(reply: &str) -> Option<CuResponse> {
     let obj = find_action_json_slice(reply).or_else(|| {
         let s = reply.find('{')?;
         let e = reply.rfind('}')?;
         (e > s).then_some(&reply[s..=e])
     })?;
+    let say = extract_json_field(obj, "say")
+        .or_else(|| extract_json_field(obj, "note"))
+        .filter(|s| !s.trim().is_empty());
     let act = extract_json_field(obj, "action")?.to_ascii_lowercase();
-    match act.as_str() {
-        "click" | "left_click" | "tap" => Some(CuAction::Click(
+    let action = match act.as_str() {
+        "click" | "left_click" | "tap" => CuAction::Click(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
-        )),
-        "double_click" => Some(CuAction::DoubleClick(
+        ),
+        "double_click" => CuAction::DoubleClick(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
-        )),
-        "move" | "mouse_move" => Some(CuAction::Move(
+        ),
+        "move" | "mouse_move" => CuAction::Move(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
-        )),
-        "type" | "input" | "write" => extract_json_field(obj, "text").map(CuAction::Type),
-        "key" | "press" => extract_json_field(obj, "name")
-            .or_else(|| extract_json_field(obj, "key"))
-            .map(CuAction::Key),
-        "wait" => Some(CuAction::Wait),
-        "done" | "finish" => Some(CuAction::Done(
+        ),
+        "type" | "input" | "write" => CuAction::Type(extract_json_field(obj, "text")?),
+        "key" | "press" => CuAction::Key(
+            extract_json_field(obj, "name").or_else(|| extract_json_field(obj, "key"))?,
+        ),
+        "wait" => CuAction::Wait,
+        "done" | "finish" => CuAction::Done(
             extract_json_field(obj, "summary").unwrap_or_else(|| String::from("Done.")),
-        )),
-        _ => None,
-    }
+        ),
+        _ => return None,
+    };
+    Some(CuResponse { action, say })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4571,17 +4686,47 @@ pub enum AiEditField {
     ApiKey,
     BaseUrl,
     CustomModel,
+    SystemPrompt,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiPopup {
+    None,
+    Effort,
+    Models,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiMsgKind {
+    User,
+    Assistant,
+    Thought,
+    CuStep,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiMsg {
+    pub kind: AiMsgKind,
+    pub text: String,
+}
+
+const AI_TEMPS: [f32; 3] = [0.2, 0.7, 1.0];
 
 pub struct AiChatState {
     pub provider: AiProvider,
     pub api_key: String,
     pub base_url: String,
     pub custom_model: String,
+    pub system_prompt: String,
     pub model_idx: usize,
     pub thinking: ThinkingLevel,
     pub custom_thinking_mask: u8,
+    pub show_full_thinking: bool,
+    pub temp_idx: u8,
+    pub key_visible: bool,
     pub cfg_open: bool,
+    pub popup: AiPopup,
+    pub model_scroll: usize,
     pub edit_field: AiEditField,
     pub cu_enabled: bool,
     pub cu_active: bool,
@@ -4591,9 +4736,10 @@ pub struct AiChatState {
     pub cu_wait_ticks: u8,
     pub cu_needs_capture: bool,
     pub input: String,
-    pub messages: Vec<(bool, String)>,
+    pub messages: Vec<AiMsg>,
     pub busy: bool,
-    rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub spin_tick: u64,
+    rx: Option<std::sync::mpsc::Receiver<Result<AiReply, String>>>,
 }
 
 impl AiChatState {
@@ -4605,6 +4751,7 @@ impl AiChatState {
             api_key: settings.ai_api_key.clone(),
             base_url: settings.ai_base_url.clone(),
             custom_model: settings.ai_custom_model.clone(),
+            system_prompt: settings.ai_system_prompt.clone(),
             model_idx,
             thinking: ThinkingLevel::from_idx(settings.ai_thinking_idx),
             custom_thinking_mask: if settings.ai_thinking_mask == 0 {
@@ -4612,7 +4759,12 @@ impl AiChatState {
             } else {
                 settings.ai_thinking_mask & 0x3F
             },
+            show_full_thinking: settings.ai_show_full_thinking,
+            temp_idx: settings.ai_temp_idx.min(2),
+            key_visible: false,
             cfg_open: false,
+            popup: AiPopup::None,
+            model_scroll: 0,
             edit_field: AiEditField::Prompt,
             cu_enabled: false,
             cu_active: false,
@@ -4622,17 +4774,25 @@ impl AiChatState {
             cu_wait_ticks: 0,
             cu_needs_capture: false,
             input: String::new(),
-            messages: vec![(
-                false,
-                String::from(
-                    "PizAI (Google AI Studio / OpenAI / Anthropic + Computer Use). Нажми Cfg для ключа/API и CU для управления ОС!",
+            messages: vec![AiMsg {
+                kind: AiMsgKind::Assistant,
+                text: String::from(
+                    "PizAI (Google AI Studio / OpenAI / Anthropic + Computer Use). Жми пилюлю модели снизу или Opts!",
                 ),
-            )],
+            }],
             busy: false,
+            spin_tick: 0,
             rx: None,
         };
         s.clamp_thinking();
         s
+    }
+
+    pub fn push_msg(&mut self, kind: AiMsgKind, text: impl Into<String>) {
+        self.messages.push(AiMsg {
+            kind,
+            text: text.into(),
+        });
     }
 
     pub fn active_model_id(&self) -> String {
@@ -4679,23 +4839,15 @@ impl AiChatState {
         }
     }
 
-    pub fn cycle_thinking(&mut self) {
-        let allowed = self.supported_thinking();
-        if allowed.is_empty() {
-            return;
-        }
-        let pos = allowed.iter().position(|t| *t == self.thinking).unwrap_or(0);
-        self.thinking = allowed[(pos + 1) % allowed.len()];
-    }
-
-    pub fn cycle_model(&mut self) {
-        self.model_idx = (self.model_idx + 1) % AI_MODELS.len();
+    pub fn select_model(&mut self, idx: usize) {
+        self.model_idx = idx.min(AI_MODELS.len() - 1);
         self.provider = AI_MODELS[self.model_idx].provider;
         self.custom_model.clear();
         self.clamp_thinking();
     }
 
     pub fn poll(&mut self) -> Option<String> {
+        self.spin_tick = self.spin_tick.wrapping_add(1);
         let rx = self.rx.as_ref()?;
         match rx.try_recv() {
             Ok(res) => {
@@ -4703,14 +4855,20 @@ impl AiChatState {
                 self.rx = None;
                 match res {
                     Ok(reply) => {
-                        if !self.cu_active {
-                            self.messages.push((false, reply.clone()));
+                        if let Some(th) = reply.thought
+                            && self.provider != AiProvider::Anthropic
+                            && !th.trim().is_empty()
+                        {
+                            self.push_msg(AiMsgKind::Thought, th);
                         }
-                        Some(reply)
+                        if !self.cu_active && !reply.answer.is_empty() {
+                            self.push_msg(AiMsgKind::Assistant, reply.answer.clone());
+                        }
+                        Some(reply.answer)
                     }
                     Err(err) => {
                         self.cu_active = false;
-                        self.messages.push((false, format!("[ERR] {err}")));
+                        self.push_msg(AiMsgKind::Assistant, format!("[ERR] {err}"));
                         None
                     }
                 }
@@ -4720,7 +4878,7 @@ impl AiChatState {
                 self.busy = false;
                 self.cu_active = false;
                 self.rx = None;
-                self.messages.push((false, String::from("[ERR] Worker disconnected")));
+                self.push_msg(AiMsgKind::Assistant, "[ERR] Worker disconnected");
                 None
             }
         }
@@ -4732,16 +4890,16 @@ impl AiChatState {
             return;
         }
         if self.api_key.trim().is_empty() && self.base_url.trim().is_empty() {
-            self.messages.push((
-                false,
-                String::from("Сначала введи API Key (кнопка Cfg -> Key)."),
-            ));
+            self.push_msg(AiMsgKind::Assistant, "Сначала введи API Key в Opts.");
             self.cfg_open = true;
+            self.popup = AiPopup::None;
             self.edit_field = AiEditField::ApiKey;
             return;
         }
+        self.popup = AiPopup::None;
+        self.cfg_open = false;
         self.input.clear();
-        self.messages.push((true, prompt.clone()));
+        self.push_msg(AiMsgKind::User, prompt.clone());
         if self.cu_enabled {
             self.cu_active = true;
             self.cu_goal = prompt;
@@ -4751,7 +4909,13 @@ impl AiChatState {
             self.cu_needs_capture = true;
             self.busy = true;
         } else {
-            self.dispatch_api(&prompt, None);
+            let sys = self.system_prompt.trim().to_string();
+            let full = if sys.is_empty() {
+                prompt
+            } else {
+                format!("{sys}\n\n{prompt}")
+            };
+            self.dispatch_api(&full, None);
         }
     }
 
@@ -4768,9 +4932,10 @@ impl AiChatState {
              Desktop icons open with a SINGLE click. {ui_hint}\n\
              Goal: {}\n\
              Previous steps ({}/10): {hist}\n\
-             Inspect the attached PNG screenshot and output ONLY ONE JSON object (no markdown):\n\
-             {{\"action\":\"click\",\"x\":100,\"y\":200}} OR {{\"action\":\"type\",\"text\":\"...\"}} OR \
-             {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}",
+             Inspect the attached PNG screenshot and output ONLY ONE JSON object (no markdown). \
+             Optionally include \"say\":\"brief note to user\" to comment on what you are doing right now:\n\
+             {{\"action\":\"click\",\"x\":100,\"y\":200,\"say\":\"Opening...\"}} OR {{\"action\":\"type\",\"text\":\"...\",\"say\":\"Typing...\"}} OR \
+             {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\",\"say\":\"Waiting...\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}",
             self.cu_goal, self.cu_steps
         );
         self.dispatch_api(&prompt, Some(png_b64));
@@ -4787,8 +4952,9 @@ impl AiChatState {
         };
         let model_id = self.active_model_id();
         let thinking = self.thinking;
+        let temp = AI_TEMPS[self.temp_idx.min(2) as usize];
 
-        let body = build_ai_request_json(provider, &model_id, thinking, prompt, png_b64);
+        let body = build_ai_request_json(provider, &model_id, thinking, prompt, png_b64, temp);
         let url = match provider {
             AiProvider::Gemini => format!("{base}/models/{model_id}:generateContent?key={key}"),
             AiProvider::OpenAi => format!("{base}/chat/completions"),
@@ -4834,7 +5000,7 @@ impl AiChatState {
             let res = match out {
                 Ok(o) if o.status.success() => {
                     let s = String::from_utf8_lossy(&o.stdout);
-                    extract_ai_response(provider, &s)
+                    extract_ai_parts(provider, &s)
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -4861,6 +5027,7 @@ impl AiChatState {
                 self.custom_model.push(ch);
                 self.clamp_thinking();
             }
+            AiEditField::SystemPrompt if self.system_prompt.len() < 320 => self.system_prompt.push(ch),
             AiEditField::Prompt if self.input.len() < 512 => self.input.push(ch),
             _ => {}
         }
@@ -4877,6 +5044,9 @@ impl AiChatState {
             AiEditField::CustomModel => {
                 self.custom_model.pop();
                 self.clamp_thinking();
+            }
+            AiEditField::SystemPrompt => {
+                self.system_prompt.pop();
             }
             AiEditField::Prompt => {
                 self.input.pop();
@@ -4899,27 +5069,88 @@ impl AiChatState {
         }
     }
 
+    fn popover_rect(&self, ww: i32, wh: i32) -> (i32, i32, i32, i32) {
+        let pw = 250.min(ww - 20).max(200);
+        let ph = match self.popup {
+            AiPopup::Models => 188,
+            _ => 126,
+        };
+        let px = (ww - pw - 10).max(10);
+        let py = (wh - 38 - ph).max(58);
+        (px, py, pw, ph)
+    }
+
     pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) -> bool {
         let mut changed = false;
-        // Header row (34..56)
+
+        if self.popup != AiPopup::None {
+            let (px, py, pw, ph) = self.popover_rect(ww, wh);
+            if lx >= px && lx <= px + pw && ly >= py && ly <= py + ph {
+                match self.popup {
+                    AiPopup::Effort => {
+                        if ly >= py + 28 && ly <= py + 56 {
+                            self.popup = AiPopup::Models;
+                            return false;
+                        }
+                        if ly >= py + 58 && ly <= py + 104 {
+                            let allowed = self.supported_thinking();
+                            if !allowed.is_empty() {
+                                let tx0 = px + 14;
+                                let tw = (pw - 28).max(40);
+                                if allowed.len() == 1 {
+                                    self.thinking = allowed[0];
+                                } else {
+                                    let rel = (lx - tx0).clamp(0, tw) as f32 / tw as f32;
+                                    let idx = (rel * (allowed.len() - 1) as f32).round() as usize;
+                                    self.thinking = allowed[idx.min(allowed.len() - 1)];
+                                }
+                                changed = true;
+                            }
+                        }
+                        return changed;
+                    }
+                    AiPopup::Models => {
+                        if ly <= py + 32 {
+                            if lx <= px + 46 {
+                                self.popup = AiPopup::Effort;
+                            }
+                            return false;
+                        }
+                        let row_y = ly - (py + 34);
+                        if row_y >= 0 {
+                            if lx >= px + pw - 26 {
+                                if row_y < 70 {
+                                    self.model_scroll = self.model_scroll.saturating_sub(1);
+                                } else if self.model_scroll + 5 < AI_MODELS.len() {
+                                    self.model_scroll += 1;
+                                }
+                                return false;
+                            }
+                            let idx = self.model_scroll + (row_y / 28) as usize;
+                            if idx < AI_MODELS.len() {
+                                self.select_model(idx);
+                                self.popup = AiPopup::Effort;
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    AiPopup::None => {}
+                }
+            }
+        }
+
         if (34..=56).contains(&ly) {
-            if (10..=178).contains(&lx) {
-                self.cycle_model();
-                return true;
-            }
-            if (182..=268).contains(&lx) {
-                self.cycle_thinking();
-                return true;
-            }
-            if (272..=342).contains(&lx) {
+            if lx >= ww - 144 && lx <= ww - 82 {
                 self.cu_enabled = !self.cu_enabled;
                 if !self.cu_enabled {
                     self.cu_active = false;
                 }
                 return false;
             }
-            if lx >= ww - 68 && lx <= ww - 10 {
+            if lx >= ww - 76 && lx <= ww - 10 {
                 self.cfg_open = !self.cfg_open;
+                self.popup = AiPopup::None;
                 if !self.cfg_open {
                     self.edit_field = AiEditField::Prompt;
                     changed = true;
@@ -4929,10 +5160,11 @@ impl AiChatState {
         }
 
         if self.cfg_open && ly >= 62 && ly <= wh - 42 {
-            // Provider tabs at ly 68..90
+            let cx = 10;
+            let cw = (ww - 20).max(80);
             if (68..=90).contains(&ly) {
-                let bw = (ww - 28) / 3;
-                let idx = ((lx - 10) / (bw + 4)).clamp(0, 2) as u8;
+                let bw = (cw - 8) / 3;
+                let idx = ((lx - cx) / (bw + 4)).clamp(0, 2) as u8;
                 self.provider = AiProvider::from_u8(idx);
                 if let Some((mi, _)) = AI_MODELS
                     .iter()
@@ -4945,14 +5177,37 @@ impl AiChatState {
                 return true;
             }
             if (96..=120).contains(&ly) {
+                if lx >= cx + cw - 44 {
+                    self.base_url.clear();
+                    return true;
+                }
                 self.edit_field = AiEditField::BaseUrl;
-            } else if (126..=150).contains(&ly) {
+            } else if (124..=148).contains(&ly) {
+                if lx >= cx + cw - 44 {
+                    self.key_visible = !self.key_visible;
+                    return false;
+                }
                 self.edit_field = AiEditField::ApiKey;
-            } else if (156..=180).contains(&ly) {
+            } else if (152..=176).contains(&ly) {
+                if lx >= cx + cw - 44 {
+                    self.custom_model.clear();
+                    self.clamp_thinking();
+                    return true;
+                }
                 self.edit_field = AiEditField::CustomModel;
-            } else if (188..=212).contains(&ly) {
-                let cw = ((ww - 20) / 6).max(36);
-                let ti = ((lx - 10) / cw).clamp(0, 5) as usize;
+            } else if (180..=204).contains(&ly) {
+                self.edit_field = AiEditField::SystemPrompt;
+            } else if (210..=232).contains(&ly) {
+                if lx < cx + cw / 2 {
+                    self.temp_idx = (self.temp_idx + 1) % 3;
+                    return true;
+                } else if self.provider != AiProvider::Anthropic {
+                    self.show_full_thinking = !self.show_full_thinking;
+                    return true;
+                }
+            } else if (238..=260).contains(&ly) {
+                let chip_w = (cw / 6).max(36);
+                let ti = ((lx - cx) / chip_w).clamp(0, 5) as usize;
                 let bit = ALL_THINKING_LEVELS[ti].bit();
                 let next = self.custom_thinking_mask ^ bit;
                 if next != 0 {
@@ -4964,22 +5219,32 @@ impl AiChatState {
             return changed;
         }
 
-        // Bottom input / Send / Stop
         if ly >= wh - 34 && ly <= wh - 10 {
-            if lx >= ww - 68 && lx <= ww - 10 {
+            let send_x = ww - 58;
+            let pill_x = ww - 224;
+            if lx >= send_x && lx <= ww - 10 {
                 if self.busy || self.cu_active {
                     self.cu_active = false;
                     self.cu_needs_capture = false;
                     self.busy = false;
                     self.rx = None;
-                    self.messages.push((false, String::from("[Stopped]")));
+                    self.push_msg(AiMsgKind::Assistant, "[Stopped]");
                 } else {
                     self.begin_prompt();
                 }
+            } else if lx >= pill_x && lx < send_x - 4 {
+                self.popup = match self.popup {
+                    AiPopup::None => AiPopup::Effort,
+                    AiPopup::Effort | AiPopup::Models => AiPopup::None,
+                };
             } else {
+                self.popup = AiPopup::None;
                 self.edit_field = AiEditField::Prompt;
             }
+            return changed;
         }
+
+        self.popup = AiPopup::None;
         changed
     }
 
@@ -4994,15 +5259,19 @@ impl AiChatState {
         accent: u32,
         lang: Lang,
     ) {
-        let model_lbl = self.active_model_label();
-        canvas.draw_button(wx + 10, wy + 34, 168, 22, &model_lbl, 0x1E293B, 0xE2E8F0, accent);
-        let think_lbl = format!("Think:{}", self.thinking.label());
-        canvas.draw_button(wx + 182, wy + 34, 86, 22, &think_lbl, 0x1E293B, 0x38BDF8, accent);
+        canvas.draw_text_clipped(
+            wx + 12,
+            wy + 37,
+            ww - 160,
+            &format!("PizAI · {}", self.provider.label()),
+            0x94A3B8,
+            1,
+        );
         let cu_lbl = if self.cu_enabled { "CU: ON" } else { "CU:OFF" };
         canvas.draw_button(
-            wx + 272,
+            wx + ww - 144,
             wy + 34,
-            70,
+            62,
             22,
             cu_lbl,
             if self.cu_enabled { 0x059669 } else { 0x1E293B },
@@ -5010,11 +5279,11 @@ impl AiChatState {
             0x10B981,
         );
         canvas.draw_button(
-            wx + ww - 68,
+            wx + ww - 76,
             wy + 34,
-            58,
+            66,
             22,
-            if self.cfg_open { "Chat" } else { "Cfg" },
+            if self.cfg_open { tr(lang, "Чат", "Chat") } else { tr(lang, "Опции", "Opts") },
             if self.cfg_open { accent } else { 0x1E293B },
             0xFFFFFF,
             accent,
@@ -5028,151 +5297,21 @@ impl AiChatState {
         canvas.draw_rounded_rect_alpha(cx, cy, cw, ch, 8, 0xFFFFFF, 20);
 
         if self.cfg_open {
-            let bw = (ww - 28) / 3;
-            for (i, prov) in [AiProvider::Gemini, AiProvider::OpenAi, AiProvider::Anthropic]
-                .iter()
-                .enumerate()
-            {
-                let act = *prov == self.provider;
-                canvas.draw_button(
-                    cx + (i as i32) * (bw + 4),
-                    wy + 68,
-                    bw,
-                    22,
-                    prov.label(),
-                    if act { accent } else { 0x1E293B },
-                    0xFFFFFF,
-                    accent,
-                );
-            }
-            let mut draw_field = |ly: i32, lbl: &str, val: &str, ph: &str, active: bool| {
-                canvas.fill_rounded_rect(cx + 4, ly, cw - 8, 24, 5, 0x0F172A);
-                canvas.draw_rounded_rect_alpha(
-                    cx + 4,
-                    ly,
-                    cw - 8,
-                    24,
-                    5,
-                    if active { 0xF59E0B } else { 0xFFFFFF },
-                    if active { 140 } else { 25 },
-                );
-                let txt = if val.is_empty() && !active {
-                    format!("{lbl}: {ph}")
-                } else if active {
-                    format!("{lbl}: {val}_")
-                } else {
-                    format!("{lbl}: {val}")
-                };
-                canvas.draw_text_clipped(
-                    cx + 10,
-                    ly + 5,
-                    cw - 20,
-                    &txt,
-                    if val.is_empty() && !active { 0x64748B } else { 0xE2E8F0 },
-                    1,
-                );
-            };
-            draw_field(
-                wy + 96,
-                "URL",
-                &self.base_url,
-                self.provider.default_base_url(),
-                self.edit_field == AiEditField::BaseUrl,
-            );
-            let masked_key = if self.edit_field == AiEditField::ApiKey {
-                self.api_key.clone()
-            } else if self.api_key.len() > 8 {
-                format!("{}...{}", &self.api_key[..4], &self.api_key[self.api_key.len() - 4..])
-            } else {
-                self.api_key.clone()
-            };
-            draw_field(
-                wy + 126,
-                "Key",
-                &masked_key,
-                "(click to type or Ctrl+V)",
-                self.edit_field == AiEditField::ApiKey,
-            );
-            draw_field(
-                wy + 156,
-                "Model",
-                &self.custom_model,
-                "(preset or custom ID)",
-                self.edit_field == AiEditField::CustomModel,
-            );
-            let chip_w = (cw / 6).max(36);
-            for (i, tl) in ALL_THINKING_LEVELS.iter().enumerate() {
-                let on = (self.custom_thinking_mask & tl.bit()) != 0;
-                canvas.draw_button(
-                    cx + (i as i32) * chip_w,
-                    wy + 188,
-                    chip_w - 4,
-                    22,
-                    tl.label(),
-                    if on { 0x1D4ED8 } else { 0x1E293B },
-                    0xFFFFFF,
-                    accent,
-                );
-            }
-            canvas.draw_text_clipped(
-                cx + 6,
-                wy + 218,
-                cw - 12,
-                tr(
-                    lang,
-                    "Чипы выше настраивают уровни раздумия для Custom Model.",
-                    "Chips above customize allowed thinking levels for Custom Model.",
-                ),
-                0x94A3B8,
-                1,
-            );
+            self.draw_settings(canvas, cx, wy, cw, accent, lang);
         } else {
-            let mut lines: Vec<(bool, String)> = Vec::new();
-            let max_chars = ((cw - 20) / 7).max(16) as usize;
-            for (is_user, msg) in &self.messages {
-                for raw_line in msg.lines() {
-                    let mut cur = String::new();
-                    for word in raw_line.split_whitespace() {
-                        if cur.len() + word.len() + 1 > max_chars && !cur.is_empty() {
-                            lines.push((*is_user, cur));
-                            cur = String::new();
-                        }
-                        if !cur.is_empty() {
-                            cur.push(' ');
-                        }
-                        cur.push_str(word);
-                    }
-                    lines.push((*is_user, cur));
-                }
-            }
-            if self.busy {
-                let msg = if self.cu_active {
-                    format!("Computer Use step {}...", self.cu_steps)
-                } else {
-                    String::from(tr(lang, "Думаю...", "Thinking..."))
-                };
-                lines.push((false, msg));
-            }
-            let max_vis = ((ch - 12) / 16).max(1) as usize;
-            let start = lines.len().saturating_sub(max_vis);
-            for (i, (is_user, line)) in lines[start..].iter().enumerate() {
-                let ly = cy + 8 + (i as i32) * 16;
-                let col = if *is_user { 0x38BDF8 } else { 0xE2E8F0 };
-                let prefix = if *is_user { "> " } else { "" };
-                canvas.draw_text_clipped(cx + 8, ly, cw - 16, &format!("{prefix}{line}"), col, 1);
-            }
+            self.draw_chat_history(canvas, cx, cy, cw, ch, lang);
         }
 
-        // Input bar
         let iy = wy + wh - 34;
-        let iw = (ww - 84).max(60);
+        let pill_x = wx + ww - 224;
+        let iw = (ww - 238).max(40);
         canvas.fill_rounded_rect(wx + 10, iy, iw, 24, 6, 0x0F172A);
-        canvas.draw_rounded_rect_alpha(wx + 10, iy, iw, 24, 6, accent, 90);
+        canvas.draw_rounded_rect_alpha(wx + 10, iy, iw, 24, 6, accent, 80);
         let disp = if self.input.is_empty() {
             String::from(if self.cu_enabled {
-                tr(lang, "Задача для Computer Use...", "Task for Computer Use...")
+                tr(lang, "Задача для CU...", "Task for CU...")
             } else {
-                tr(lang, "Сообщение ИИ...", "Message AI...")
+                tr(lang, "Сообщение...", "Ask AI...")
             })
         } else if self.edit_field == AiEditField::Prompt {
             format!("{}_", self.input)
@@ -5181,16 +5320,282 @@ impl AiChatState {
         };
         let dcol = if self.input.is_empty() { 0x64748B } else { 0xF8FAFC };
         canvas.draw_text_clipped(wx + 16, iy + 5, iw - 12, &disp, dcol, 1);
+
+        let pill_lbl = format!("{} · {}", self.active_model_label(), self.thinking.label());
         canvas.draw_button(
-            wx + ww - 68,
+            pill_x,
             iy,
-            58,
+            160,
+            24,
+            &pill_lbl,
+            if self.popup != AiPopup::None { accent } else { 0x1E293B },
+            0xE2E8F0,
+            accent,
+        );
+        canvas.draw_button(
+            wx + ww - 58,
+            iy,
+            48,
             24,
             if self.busy || self.cu_active { "Stop" } else { ">" },
             if self.busy || self.cu_active { 0xEF4444 } else { accent },
             0xFFFFFF,
             accent,
         );
+
+        if self.popup != AiPopup::None {
+            self.draw_popover(canvas, wx, wy, ww, wh, accent);
+        }
+    }
+
+    fn draw_chat_history(&self, canvas: &mut Canvas, cx: i32, cy: i32, cw: i32, ch: i32, lang: Lang) {
+        let spin = ['-', '\\', '|', '/'][(self.spin_tick / 5) as usize % 4];
+        let mut lines: Vec<(u32, String)> = Vec::new();
+        let max_chars = ((cw - 20) / 7).max(16) as usize;
+        for m in &self.messages {
+            match m.kind {
+                AiMsgKind::Thought => {
+                    if self.provider == AiProvider::Anthropic {
+                        continue;
+                    }
+                    if self.show_full_thinking {
+                        for (idx, raw_line) in m.text.lines().enumerate() {
+                            let pre = if idx == 0 { "[~] " } else { "    " };
+                            Self::push_wrapped(&mut lines, 0x94A3B8, pre, raw_line, max_chars);
+                        }
+                    } else {
+                        let first = m.text.lines().next().unwrap_or("Thought");
+                        Self::push_wrapped(&mut lines, 0x94A3B8, "[~] ", first, max_chars);
+                    }
+                }
+                AiMsgKind::User => Self::push_wrapped(&mut lines, 0x38BDF8, "> ", &m.text, max_chars),
+                AiMsgKind::CuStep => Self::push_wrapped(&mut lines, 0x34D399, "* ", &m.text, max_chars),
+                AiMsgKind::Assistant => Self::push_wrapped(&mut lines, 0xE2E8F0, "", &m.text, max_chars),
+            }
+        }
+        if self.busy {
+            let status = if self.cu_active {
+                format!("[{spin}] Thinking & acting (step {})...", self.cu_steps.max(1))
+            } else {
+                format!(
+                    "[{spin}] {} ({})...",
+                    tr(lang, "Размышляю", "Thinking"),
+                    self.thinking.label()
+                )
+            };
+            lines.push((0x94A3B8, status));
+        }
+
+        let max_vis = ((ch - 12) / 16).max(1) as usize;
+        let start = lines.len().saturating_sub(max_vis);
+        for (i, (col, line)) in lines[start..].iter().enumerate() {
+            let ly = cy + 8 + (i as i32) * 16;
+            canvas.draw_text_clipped(cx + 8, ly, cw - 16, line, *col, 1);
+        }
+    }
+
+    fn push_wrapped(out: &mut Vec<(u32, String)>, col: u32, prefix: &str, text: &str, max_chars: usize) {
+        for (li, raw_line) in text.lines().enumerate() {
+            let mut cur = if li == 0 {
+                String::from(prefix)
+            } else {
+                String::new()
+            };
+            for word in raw_line.split_whitespace() {
+                if cur.len() + word.len() + 1 > max_chars && !cur.is_empty() {
+                    out.push((col, cur));
+                    cur = String::new();
+                }
+                if !cur.is_empty() && !cur.ends_with(' ') {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+            }
+            out.push((col, cur));
+        }
+    }
+
+    fn draw_settings(&self, canvas: &mut Canvas, cx: i32, wy: i32, cw: i32, accent: u32, lang: Lang) {
+        let bw = (cw - 8) / 3;
+        for (i, prov) in [AiProvider::Gemini, AiProvider::OpenAi, AiProvider::Anthropic]
+            .iter()
+            .enumerate()
+        {
+            let act = *prov == self.provider;
+            canvas.draw_button(
+                cx + (i as i32) * (bw + 4),
+                wy + 68,
+                bw,
+                22,
+                prov.label(),
+                if act { accent } else { 0x1E293B },
+                0xFFFFFF,
+                accent,
+            );
+        }
+        let mut draw_field = |ly: i32, lbl: &str, val: &str, ph: &str, active: bool, btn: Option<&str>| {
+            let fw = if btn.is_some() { cw - 48 } else { cw - 4 };
+            canvas.fill_rounded_rect(cx + 2, ly, fw, 22, 5, 0x0F172A);
+            canvas.draw_rounded_rect_alpha(
+                cx + 2,
+                ly,
+                fw,
+                22,
+                5,
+                if active { 0xF59E0B } else { 0xFFFFFF },
+                if active { 140 } else { 25 },
+            );
+            let txt = if val.is_empty() && !active {
+                format!("{lbl}: {ph}")
+            } else if active {
+                format!("{lbl}: {val}_")
+            } else {
+                format!("{lbl}: {val}")
+            };
+            canvas.draw_text_clipped(
+                cx + 8,
+                ly + 4,
+                fw - 12,
+                &txt,
+                if val.is_empty() && !active { 0x64748B } else { 0xE2E8F0 },
+                1,
+            );
+            if let Some(bl) = btn {
+                canvas.draw_button(cx + cw - 42, ly, 40, 22, bl, 0x1E293B, 0x94A3B8, accent);
+            }
+        };
+
+        draw_field(wy + 96, "URL", &self.base_url, self.provider.default_base_url(), self.edit_field == AiEditField::BaseUrl, Some("Def"));
+        let key_disp = if self.key_visible || self.edit_field == AiEditField::ApiKey {
+            self.api_key.clone()
+        } else if self.api_key.len() > 8 {
+            format!("{}...{}", &self.api_key[..4], &self.api_key[self.api_key.len() - 4..])
+        } else {
+            self.api_key.clone()
+        };
+        draw_field(wy + 124, "Key", &key_disp, "(click + Ctrl+V)", self.edit_field == AiEditField::ApiKey, Some("Eye"));
+        draw_field(wy + 152, "Model", &self.custom_model, "(preset or custom ID)", self.edit_field == AiEditField::CustomModel, Some("Clr"));
+        draw_field(wy + 180, "Sys", &self.system_prompt, "(optional system prompt)", self.edit_field == AiEditField::SystemPrompt, None);
+
+        let half = (cw - 6) / 2;
+        let temp_lbl = format!("Temp: {:.1}", AI_TEMPS[self.temp_idx.min(2) as usize]);
+        canvas.draw_button(cx + 2, wy + 210, half, 22, &temp_lbl, 0x1E293B, 0xE2E8F0, accent);
+
+        let (ft_lbl, ft_col) = if self.provider == AiProvider::Anthropic {
+            ("Think: Brief (Anth.)", 0x111827)
+        } else if self.show_full_thinking {
+            ("Full Think: ON", accent)
+        } else {
+            ("Full Think: Brief", 0x1E293B)
+        };
+        canvas.draw_button(cx + half + 6, wy + 210, cw - half - 8, 22, ft_lbl, ft_col, 0xFFFFFF, accent);
+
+        let chip_w = (cw / 6).max(36);
+        for (i, tl) in ALL_THINKING_LEVELS.iter().enumerate() {
+            let on = (self.custom_thinking_mask & tl.bit()) != 0;
+            canvas.draw_button(
+                cx + (i as i32) * chip_w,
+                wy + 238,
+                chip_w - 4,
+                22,
+                tl.label(),
+                if on { 0x1D4ED8 } else { 0x1E293B },
+                0xFFFFFF,
+                accent,
+            );
+        }
+        let hint = tr(
+            lang,
+            "Чипы: доступные уровни раздумия для Custom/OpenAI/Anthropic.",
+            "Chips: allowed thinking levels for Custom/OpenAI/Anthropic.",
+        );
+        canvas.draw_text_clipped(cx + 4, wy + 264, cw - 8, hint, 0x64748B, 1);
+    }
+
+    fn draw_popover(&self, canvas: &mut Canvas, wx: i32, wy: i32, ww: i32, wh: i32, accent: u32) {
+        let (rx, ry, pw, ph) = self.popover_rect(ww, wh);
+        let px = wx + rx;
+        let py = wy + ry;
+        canvas.fill_rounded_rect(px - 2, py - 2, pw + 4, ph + 4, 14, 0x020617);
+        canvas.fill_rounded_rect(px, py, pw, ph, 12, 0x0F172A);
+        canvas.draw_rounded_rect_alpha(px, py, pw, ph, 12, 0xFFFFFF, 45);
+
+        match self.popup {
+            AiPopup::Effort => {
+                let lvl_txt = self.thinking.label();
+                let lw = canvas.measure_text(lvl_txt, 2);
+                canvas.draw_text_clipped(px + (pw - lw) / 2, py + 8, pw - 16, lvl_txt, 0xA855F7, 2);
+
+                let mod_txt = format!("{} >", self.active_model_label());
+                let mw = canvas.measure_text(&mod_txt, 1);
+                canvas.draw_text_clipped(px + (pw - mw) / 2, py + 36, pw - 20, &mod_txt, 0xCBD5E1, 1);
+
+                canvas.draw_text_clipped(px + 14, py + 54, 60, "Faster", 0x64748B, 1);
+                canvas.draw_text_clipped(px + pw - 64, py + 54, 54, "Smarter", 0x64748B, 1);
+
+                let tx = px + 14;
+                let ty = py + 74;
+                let tw = (pw - 28).max(40);
+                let th = 18;
+                let allowed = self.supported_thinking();
+                let pos_idx = allowed.iter().position(|t| *t == self.thinking).unwrap_or(0);
+                let frac = if allowed.len() <= 1 {
+                    1.0
+                } else {
+                    pos_idx as f32 / (allowed.len() - 1) as f32
+                };
+                let fill_w = ((tw as f32) * frac).round().max(10.0) as i32;
+
+                canvas.fill_rounded_rect(tx, ty, tw, th, 9, 0x1E293B);
+                for col_x in 0..fill_w {
+                    let c = lerp_rgb(0x2563EB, 0xA855F7, col_x as u32, tw.max(1) as u32);
+                    canvas.fill_rect(tx + col_x, ty + 1, 1, th - 2, c);
+                }
+                for s in 0..8i32 {
+                    let sx = tx + ((s * 31 + 11) % fill_w.max(12));
+                    let sy = ty + 3 + ((s * 17) % 12);
+                    canvas.fill_rect(sx, sy, 2, 2, 0xE9D5FF);
+                }
+                for i in 0..allowed.len() {
+                    let df = if allowed.len() <= 1 { 0.5 } else { i as f32 / (allowed.len() - 1) as f32 };
+                    let dx = tx + (tw as f32 * df).round() as i32;
+                    canvas.fill_aa_circle(dx as f32, (ty + th / 2) as f32, 2.0, 0xCBD5E1, 190);
+                }
+                let knob_x = tx + ((tw - 14) as f32 * frac).round() as i32;
+                canvas.fill_aa_circle((knob_x + 7) as f32, (ty + th / 2) as f32, 10.0, 0xFFFFFF, 255);
+                canvas.draw_text_clipped(px + 14, py + 102, pw - 28, "Click track to set reasoning depth", 0x64748B, 1);
+            }
+            AiPopup::Models => {
+                canvas.draw_button(px + 8, py + 6, 28, 22, "<-", 0x1E293B, 0xE2E8F0, accent);
+                let title = "Select model";
+                let tw = canvas.measure_text(title, 1);
+                canvas.draw_text_clipped(px + (pw - tw) / 2, py + 10, pw - 76, title, 0x94A3B8, 1);
+                canvas.fill_rect(px + 8, py + 31, pw - 16, 1, 0x1E293B);
+
+                let visible = 5usize;
+                for (row, idx) in (self.model_scroll..AI_MODELS.len()).take(visible).enumerate() {
+                    let ry_row = py + 36 + (row as i32) * 28;
+                    let active = self.custom_model.trim().is_empty() && self.model_idx == idx;
+                    if active {
+                        canvas.fill_rounded_rect(px + 8, ry_row, pw - 36, 24, 6, 0x1E293B);
+                    }
+                    canvas.draw_text_clipped(
+                        px + 14,
+                        ry_row + 4,
+                        pw - 56,
+                        AI_MODELS[idx].label,
+                        if active { 0xFFFFFF } else { 0xCBD5E1 },
+                        1,
+                    );
+                    if active {
+                        canvas.draw_text_clipped(px + pw - 44, ry_row + 4, 16, "v", accent, 1);
+                    }
+                }
+                canvas.draw_text_clipped(px + pw - 20, py + 40, 14, "^", 0x64748B, 1);
+                canvas.draw_text_clipped(px + pw - 20, py + ph - 22, 14, "v", 0x64748B, 1);
+            }
+            AiPopup::None => {}
+        }
     }
 }
 
@@ -5200,6 +5605,7 @@ pub fn build_ai_request_json(
     thinking: ThinkingLevel,
     prompt: &str,
     png_b64: Option<&str>,
+    temp: f32,
 ) -> String {
     let ep = json_escape(prompt);
     match provider {
@@ -5225,9 +5631,14 @@ pub fn build_ai_request_json(
                     ThinkingLevel::XHigh => 24576,
                     ThinkingLevel::Max => 32768,
                 };
-                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":{budget}}}{mime}}}")
+                let inc = if thinking == ThinkingLevel::Off { "" } else { ",\"includeThoughts\":true" };
+                format!(
+                    ",\"generationConfig\":{{\"temperature\":{temp:.1},\"thinkingConfig\":{{\"thinkingBudget\":{budget}{inc}}}{mime}}}"
+                )
             } else if thinking == ThinkingLevel::Off {
-                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":0}}{mime}}}")
+                format!(
+                    ",\"generationConfig\":{{\"temperature\":{temp:.1},\"thinkingConfig\":{{\"thinkingBudget\":0}}{mime}}}"
+                )
             } else {
                 let lvl = match thinking {
                     ThinkingLevel::Low => "LOW",
@@ -5237,7 +5648,9 @@ pub fn build_ai_request_json(
                     ThinkingLevel::Max => "MAX",
                     ThinkingLevel::Off => "LOW",
                 };
-                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\"}}{mime}}}")
+                format!(
+                    ",\"generationConfig\":{{\"temperature\":{temp:.1},\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\",\"includeThoughts\":true}}{mime}}}"
+                )
             };
             format!("{{\"contents\":[{{\"parts\":{parts}}}]{tcfg}}}")
         }
@@ -5258,7 +5671,7 @@ pub fn build_ai_request_json(
                 ThinkingLevel::Max => String::from(",\"reasoning_effort\":\"max\""),
             };
             format!(
-                "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":{content}}}]{eff}}}",
+                "{{\"model\":\"{}\",\"temperature\":{temp:.1},\"messages\":[{{\"role\":\"user\",\"content\":{content}}}]{eff}}}",
                 json_escape(model_id)
             )
         }
@@ -5271,7 +5684,7 @@ pub fn build_ai_request_json(
                 format!("\"{ep}\"")
             };
             let tcfg = match thinking {
-                ThinkingLevel::Off => String::new(),
+                ThinkingLevel::Off => format!(",\"temperature\":{temp:.1}"),
                 ThinkingLevel::Low => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}"),
                 ThinkingLevel::Medium => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}"),
                 ThinkingLevel::High => String::from(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":10000}"),

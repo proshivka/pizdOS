@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::apps::{
-    AiChatState, BrowserState, CalcState, CuAction, Game2048State, KeyEvent, Lang, MatrixState,
-    MinesweeperState, NotepadState, PaintAction, PaintState, PizViewState, SettingsAction,
-    SettingsState, SnakeEvent, SnakeState, TermAction, TerminalState, ThemePreset, UI_SCALES,
-    parse_cu_action, tr,
+    AiChatState, AiMsgKind, BrowserState, CalcState, CuAction, Game2048State, KeyEvent, Lang,
+    MatrixState, MinesweeperState, NotepadState, PaintAction, PaintState, PizViewState,
+    SettingsAction, SettingsState, SnakeEvent, SnakeState, TermAction, TerminalState, ThemePreset,
+    UI_SCALES, parse_cu_response, tr,
 };
 use crate::display_srv::{DisplayServer, GuestProto};
 use crate::gfx::Canvas;
@@ -614,7 +614,7 @@ impl Desktop {
                 Window::new(AppId::Game2048, 340, 80, 276, 336, false),
                 Window::new(AppId::PizView, 220, 86, 360, 300, false),
                 Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
-                Window::new(AppId::Ai, 272, 42, 440, 340, false),
+                Window::new(AppId::Ai, 272, 42, 450, 350, false),
                 Window::new(AppId::Browser, 170, 52, 480, 356, false),
                 Window::new(AppId::System, (width - 610).clamp(16, 190), 26, 330, 268, true),
                 Window::new(AppId::Settings, (width - 540).clamp(16, 370), 90, 520, 344, true),
@@ -1225,6 +1225,9 @@ impl Desktop {
         self.settings.ai_model_idx = self.ai.model_idx;
         self.settings.ai_thinking_idx = self.ai.thinking.idx();
         self.settings.ai_thinking_mask = self.ai.custom_thinking_mask;
+        self.settings.ai_show_full_thinking = self.ai.show_full_thinking;
+        self.settings.ai_temp_idx = self.ai.temp_idx;
+        self.settings.ai_system_prompt = self.ai.system_prompt.clone();
         crate::config::save_config(&self.settings, self.snake.best_score, &self.sticky_note);
     }
 
@@ -1236,7 +1239,10 @@ impl Desktop {
         (b64, cap.width as i32, cap.height as i32)
     }
 
-    fn execute_cu_action(&mut self, act: CuAction) -> bool {
+    fn execute_cu_action(&mut self, act: CuAction, say: Option<String>) -> bool {
+        if let Some(msg) = say {
+            self.ai.push_msg(AiMsgKind::Assistant, msg);
+        }
         let (cw, ch) = self.last_canvas_size;
         let log_line = match &act {
             CuAction::Move(x, y) => format!("move({x},{y})"),
@@ -1254,7 +1260,7 @@ impl Desktop {
         match act {
             CuAction::Move(x, y) => {
                 self.on_mouse_move(x, y, cw, ch);
-                self.ai.messages.push((false, format!("[CU] move({x}, {y})")));
+                self.ai.push_msg(AiMsgKind::CuStep, format!("move({x}, {y})"));
                 false
             }
             CuAction::Click(x, y) => {
@@ -1262,7 +1268,7 @@ impl Desktop {
                 self.on_mouse_down(x, y, cw, ch);
                 self.on_mouse_up();
                 self.push_toast(format!("PizAI -> click({x}, {y})"), 0x10B981);
-                self.ai.messages.push((false, format!("[CU] click({x}, {y})")));
+                self.ai.push_msg(AiMsgKind::CuStep, format!("click({x}, {y})"));
                 false
             }
             CuAction::DoubleClick(x, y) => {
@@ -1272,14 +1278,14 @@ impl Desktop {
                 self.on_mouse_down(x, y, cw, ch);
                 self.on_mouse_up();
                 self.push_toast(format!("PizAI -> dblclick({x}, {y})"), 0x10B981);
-                self.ai.messages.push((false, format!("[CU] double_click({x}, {y})")));
+                self.ai.push_msg(AiMsgKind::CuStep, format!("double_click({x}, {y})"));
                 false
             }
             CuAction::Type(txt) => {
                 for ch_in in txt.chars() {
                     self.on_key(KeyEvent::Char(ch_in));
                 }
-                self.ai.messages.push((false, format!("[CU] type({txt})")));
+                self.ai.push_msg(AiMsgKind::CuStep, format!("type({txt})"));
                 false
             }
             CuAction::Key(name) => {
@@ -1297,15 +1303,15 @@ impl Desktop {
                 if let Some(k) = ev {
                     self.on_key(k);
                 }
-                self.ai.messages.push((false, format!("[CU] key({name})")));
+                self.ai.push_msg(AiMsgKind::CuStep, format!("key({name})"));
                 false
             }
             CuAction::Wait => {
-                self.ai.messages.push((false, String::from("[CU] wait")));
+                self.ai.push_msg(AiMsgKind::CuStep, "wait");
                 false
             }
             CuAction::Done(summary) => {
-                self.ai.messages.push((false, summary));
+                self.ai.push_msg(AiMsgKind::Assistant, summary);
                 true
             }
         }
@@ -1328,15 +1334,15 @@ impl Desktop {
         if let Some(reply) = self.ai.poll()
             && self.ai.cu_active
         {
-            if let Some(act) = parse_cu_action(&reply) {
-                let done = self.execute_cu_action(act);
+            if let Some(resp) = parse_cu_response(&reply) {
+                let done = self.execute_cu_action(resp.action, resp.say);
                 if done || self.ai.cu_steps >= 10 {
                     self.ai.cu_active = false;
                 } else {
                     self.ai.cu_wait_ticks = 12;
                 }
             } else {
-                self.ai.messages.push((false, reply));
+                self.ai.push_msg(AiMsgKind::Assistant, reply);
                 self.ai.cu_active = false;
             }
         }

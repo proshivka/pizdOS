@@ -128,6 +128,17 @@ pub fn load_config_from(path: &std::path::Path, settings: &mut SettingsState) ->
                     settings.ai_thinking_mask = mk & 0x3F;
                 }
             }
+            "ai_show_full_thinking" => {
+                settings.ai_show_full_thinking = v == "1";
+            }
+            "ai_temp_idx" => {
+                if let Ok(t) = v.parse::<u8>() {
+                    settings.ai_temp_idx = t.min(2);
+                }
+            }
+            "ai_system_prompt" => {
+                settings.ai_system_prompt = v.replace("\\n", "\n");
+            }
             _ => {}
         }
     }
@@ -187,7 +198,10 @@ pub fn save_config_to(
          ai_base_url={}\n\
          ai_custom_model={}\n\
          ai_thinking_idx={}\n\
-         ai_thinking_mask={}\n",
+         ai_thinking_mask={}\n\
+         ai_show_full_thinking={}\n\
+         ai_temp_idx={}\n\
+         ai_system_prompt={}\n",
         settings.accent_idx,
         b(settings.show_grid),
         b(settings.show_icons),
@@ -212,6 +226,9 @@ pub fn save_config_to(
         settings.ai_custom_model.replace(['\r', '\n'], ""),
         settings.ai_thinking_idx.min(5),
         settings.ai_thinking_mask & 0x3F,
+        b(settings.ai_show_full_thinking),
+        settings.ai_temp_idx.min(2),
+        settings.ai_system_prompt.replace('\r', "").replace('\n', "\\n"),
     );
     let _ = fs::write(path, out);
 }
