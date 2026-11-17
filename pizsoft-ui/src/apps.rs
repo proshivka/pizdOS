@@ -4594,6 +4594,8 @@ pub fn extract_ai_parts(provider: AiProvider, json: &str) -> Result<AiReply, Str
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CuAction {
+    Screenshot,
+    OpenApp(String),
     Move(i32, i32),
     Click(i32, i32),
     DoubleClick(i32, i32),
@@ -4655,6 +4657,12 @@ pub fn parse_cu_response(reply: &str) -> Option<CuResponse> {
         .filter(|s| !s.trim().is_empty());
     let act = extract_json_field(obj, "action")?.to_ascii_lowercase();
     let action = match act.as_str() {
+        "screenshot" | "capture" | "screen" => CuAction::Screenshot,
+        "open_app" | "launch" | "open" => CuAction::OpenApp(
+            extract_json_field(obj, "app")
+                .or_else(|| extract_json_field(obj, "name"))
+                .unwrap_or_default(),
+        ),
         "click" | "left_click" | "tap" => CuAction::Click(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
@@ -4728,13 +4736,15 @@ pub struct AiChatState {
     pub popup: AiPopup,
     pub model_scroll: usize,
     pub edit_field: AiEditField,
-    pub cu_enabled: bool,
     pub cu_active: bool,
     pub cu_goal: String,
+    pub cu_action_text: String,
+    pub cu_last_click: Option<(i32, i32)>,
     pub cu_history: Vec<String>,
     pub cu_steps: u8,
     pub cu_wait_ticks: u8,
     pub cu_needs_capture: bool,
+    pub screen_size: (i32, i32),
     pub input: String,
     pub messages: Vec<AiMsg>,
     pub busy: bool,
@@ -4766,18 +4776,20 @@ impl AiChatState {
             popup: AiPopup::None,
             model_scroll: 0,
             edit_field: AiEditField::Prompt,
-            cu_enabled: false,
             cu_active: false,
             cu_goal: String::new(),
+            cu_action_text: String::new(),
+            cu_last_click: None,
             cu_history: Vec::new(),
             cu_steps: 0,
             cu_wait_ticks: 0,
             cu_needs_capture: false,
+            screen_size: (800, 600),
             input: String::new(),
             messages: vec![AiMsg {
                 kind: AiMsgKind::Assistant,
                 text: String::from(
-                    "PizAI (Google AI Studio / OpenAI / Anthropic + Computer Use). Жми пилюлю модели снизу или Opts!",
+                    "PizAI готова! Могу просто общаться или управлять ПК (напиши что сделать на экране).",
                 ),
             }],
             busy: false,
@@ -4900,23 +4912,29 @@ impl AiChatState {
         self.cfg_open = false;
         self.input.clear();
         self.push_msg(AiMsgKind::User, prompt.clone());
-        if self.cu_enabled {
-            self.cu_active = true;
-            self.cu_goal = prompt;
-            self.cu_history.clear();
-            self.cu_steps = 0;
-            self.cu_wait_ticks = 0;
-            self.cu_needs_capture = true;
-            self.busy = true;
+        self.cu_goal = prompt.clone();
+        self.cu_history.clear();
+        self.cu_steps = 0;
+        self.cu_wait_ticks = 0;
+        self.cu_last_click = None;
+
+        let (sw, sh) = self.screen_size;
+        let sys = self.system_prompt.trim();
+        let sys_prefix = if sys.is_empty() {
+            String::new()
         } else {
-            let sys = self.system_prompt.trim().to_string();
-            let full = if sys.is_empty() {
-                prompt
-            } else {
-                format!("{sys}\n\n{prompt}")
-            };
-            self.dispatch_api(&full, None);
-        }
+            format!("{sys}\n\n")
+        };
+        let tool_prompt = format!(
+            "{sys_prefix}You are PizAI inside pizdOS ({sw}x{sh} px). \
+             For normal chat/questions, reply in plain text. \
+             ONLY if the user asks to interact with the OS, open/use an app, click, type, or inspect the desktop, \
+             use the Computer Use tool by replying with ONE JSON object ONLY (no markdown): \
+             {{\"action\":\"screenshot\",\"say\":\"Смотрю на экран...\"}} (to inspect pixels before clicking) OR \
+             {{\"action\":\"open_app\",\"app\":\"Browser|Calc|Terminal|Files|Settings|Paint|Notepad|Snake|2048|Minesweeper|Matrix|PizGet|System\",\"say\":\"...\"}} OR \
+             {{\"action\":\"click\",\"x\":100,\"y\":200,\"say\":\"...\"}}.\n\nUser: {prompt}"
+        );
+        self.dispatch_api(&tool_prompt, None);
     }
 
     pub fn dispatch_cu_screen(&mut self, png_b64: &str, sw: i32, sh: i32, ui_hint: &str) {
@@ -4928,14 +4946,17 @@ impl AiChatState {
             self.cu_history.join("; ")
         };
         let prompt = format!(
-            "You control pizdOS desktop ({sw}x{sh} px). Coordinates MUST be exact pixel values in x=0..{sw}, y=0..{sh} (NOT 0..1000). \
-             Desktop icons open with a SINGLE click. {ui_hint}\n\
+            "You are controlling pizdOS desktop ({sw}x{sh} px). The attached PNG has a labeled 100px coordinate grid \
+             (numbers mark x/y pixels from top-left 0,0) and a red crosshair at your last click. {ui_hint}\n\
              Goal: {}\n\
-             Previous steps ({}/10): {hist}\n\
-             Inspect the attached PNG screenshot and output ONLY ONE JSON object (no markdown). \
-             Optionally include \"say\":\"brief note to user\" to comment on what you are doing right now:\n\
-             {{\"action\":\"click\",\"x\":100,\"y\":200,\"say\":\"Opening...\"}} OR {{\"action\":\"type\",\"text\":\"...\",\"say\":\"Typing...\"}} OR \
-             {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\",\"say\":\"Waiting...\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}",
+             Previous steps ({}/12): {hist}\n\
+             Output ONLY ONE JSON object (no markdown). Always include a short \"say\" describing what you are doing right now:\n\
+             {{\"action\":\"open_app\",\"app\":\"Calc\",\"say\":\"Opening Calc...\"}} OR \
+             {{\"action\":\"click\",\"x\":133,\"y\":70,\"say\":\"Clicking Calc...\"}} OR \
+             {{\"action\":\"type\",\"text\":\"...\",\"say\":\"Typing...\"}} OR \
+             {{\"action\":\"key\",\"name\":\"enter\",\"say\":\"Pressing Enter...\"}} OR \
+             {{\"action\":\"wait\",\"say\":\"Waiting...\"}} OR \
+             {{\"action\":\"done\",\"summary\":\"...\"}}",
             self.cu_goal, self.cu_steps
         );
         self.dispatch_api(&prompt, Some(png_b64));
@@ -5140,23 +5161,14 @@ impl AiChatState {
             }
         }
 
-        if (34..=56).contains(&ly) {
-            if lx >= ww - 144 && lx <= ww - 82 {
-                self.cu_enabled = !self.cu_enabled;
-                if !self.cu_enabled {
-                    self.cu_active = false;
-                }
-                return false;
+        if (34..=56).contains(&ly) && lx >= ww - 76 && lx <= ww - 10 {
+            self.cfg_open = !self.cfg_open;
+            self.popup = AiPopup::None;
+            if !self.cfg_open {
+                self.edit_field = AiEditField::Prompt;
+                changed = true;
             }
-            if lx >= ww - 76 && lx <= ww - 10 {
-                self.cfg_open = !self.cfg_open;
-                self.popup = AiPopup::None;
-                if !self.cfg_open {
-                    self.edit_field = AiEditField::Prompt;
-                    changed = true;
-                }
-                return changed;
-            }
+            return changed;
         }
 
         if self.cfg_open && ly >= 62 && ly <= wh - 42 {
@@ -5262,21 +5274,10 @@ impl AiChatState {
         canvas.draw_text_clipped(
             wx + 12,
             wy + 37,
-            ww - 160,
+            ww - 96,
             &format!("PizAI · {}", self.provider.label()),
             0x94A3B8,
             1,
-        );
-        let cu_lbl = if self.cu_enabled { "CU: ON" } else { "CU:OFF" };
-        canvas.draw_button(
-            wx + ww - 144,
-            wy + 34,
-            62,
-            22,
-            cu_lbl,
-            if self.cu_enabled { 0x059669 } else { 0x1E293B },
-            0xFFFFFF,
-            0x10B981,
         );
         canvas.draw_button(
             wx + ww - 76,
@@ -5308,11 +5309,7 @@ impl AiChatState {
         canvas.fill_rounded_rect(wx + 10, iy, iw, 24, 6, 0x0F172A);
         canvas.draw_rounded_rect_alpha(wx + 10, iy, iw, 24, 6, accent, 80);
         let disp = if self.input.is_empty() {
-            String::from(if self.cu_enabled {
-                tr(lang, "Задача для CU...", "Task for CU...")
-            } else {
-                tr(lang, "Сообщение...", "Ask AI...")
-            })
+            String::from(tr(lang, "Спроси или дай задачу для ПК...", "Ask or give a PC task..."))
         } else if self.edit_field == AiEditField::Prompt {
             format!("{}_", self.input)
         } else {
@@ -5546,23 +5543,44 @@ impl AiChatState {
                 };
                 let fill_w = ((tw as f32) * frac).round().max(10.0) as i32;
 
-                canvas.fill_rounded_rect(tx, ty, tw, th, 9, 0x1E293B);
+                canvas.fill_rounded_rect(tx, ty, tw, th, 9, 0x131B2E);
+                canvas.draw_rounded_rect_alpha(tx, ty, tw, th, 9, 0xFFFFFF, 28);
                 for col_x in 0..fill_w {
-                    let c = lerp_rgb(0x2563EB, 0xA855F7, col_x as u32, tw.max(1) as u32);
+                    let half = (tw / 2).max(1);
+                    let c = if col_x < half {
+                        lerp_rgb(0x1D4ED8, 0x7C3AED, col_x as u32, half as u32)
+                    } else {
+                        lerp_rgb(0x7C3AED, 0xEC4899, (col_x - half) as u32, half as u32)
+                    };
                     canvas.fill_rect(tx + col_x, ty + 1, 1, th - 2, c);
                 }
-                for s in 0..8i32 {
-                    let sx = tx + ((s * 31 + 11) % fill_w.max(12));
-                    let sy = ty + 3 + ((s * 17) % 12);
-                    canvas.fill_rect(sx, sy, 2, 2, 0xE9D5FF);
+                // Animated twinkling drifting stars across the reasoning track
+                let phase_t = (self.spin_tick as f32) * 0.14;
+                for s in 0..12i32 {
+                    let drift = ((self.spin_tick as i32 / 2) + s * 29) % fill_w.max(18);
+                    let sx = tx + 4 + drift.min((fill_w - 6).max(4));
+                    let sy = ty + 4 + ((s * 7 + (s % 3) * 4) % (th - 8).max(2));
+                    let twinkle = 0.5 + 0.5 * (phase_t + (s as f32) * 0.95).sin();
+                    let a_glow = (45.0 + 95.0 * twinkle) as u8;
+                    let a_core = (130.0 + 125.0 * twinkle) as u8;
+                    let star_col = if s % 3 == 0 { 0xFDE68A } else if s % 3 == 1 { 0xE9D5FF } else { 0xBAE6FD };
+                    canvas.fill_aa_circle(sx as f32, sy as f32, 2.8 + twinkle * 1.4, star_col, a_glow);
+                    if twinkle > 0.55 {
+                        canvas.fill_rect(sx - 2, sy, 5, 1, 0xFFFFFF);
+                        canvas.fill_rect(sx, sy - 2, 1, 5, 0xFFFFFF);
+                    }
+                    canvas.fill_aa_circle(sx as f32, sy as f32, 1.3, 0xFFFFFF, a_core);
                 }
                 for i in 0..allowed.len() {
                     let df = if allowed.len() <= 1 { 0.5 } else { i as f32 / (allowed.len() - 1) as f32 };
                     let dx = tx + (tw as f32 * df).round() as i32;
-                    canvas.fill_aa_circle(dx as f32, (ty + th / 2) as f32, 2.0, 0xCBD5E1, 190);
+                    canvas.fill_aa_circle(dx as f32, (ty + th / 2) as f32, 2.2, 0xE2E8F0, 195);
                 }
                 let knob_x = tx + ((tw - 14) as f32 * frac).round() as i32;
-                canvas.fill_aa_circle((knob_x + 7) as f32, (ty + th / 2) as f32, 10.0, 0xFFFFFF, 255);
+                let kcx = (knob_x + 7) as f32;
+                let kcy = (ty + th / 2) as f32;
+                canvas.fill_aa_circle(kcx, kcy, 12.5, 0xC084FC, 65);
+                canvas.fill_aa_circle(kcx, kcy, 9.5, 0xFFFFFF, 255);
                 canvas.draw_text_clipped(px + 14, py + 102, pw - 28, "Click track to set reasoning depth", 0x64748B, 1);
             }
             AiPopup::Models => {

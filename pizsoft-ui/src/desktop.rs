@@ -342,6 +342,8 @@ pub struct Desktop {
     pub toast: Option<Toast>,
     pub island_anim: f32,
     pub island_vel: f32,
+    pub cu_mini_anim: f32,
+    pub cu_mini_vel: f32,
     pub ripples: Vec<ClickRipple>,
     stars: Vec<AeroStar>,
     pub sticky_note: String,
@@ -570,6 +572,8 @@ impl Desktop {
             toast: None,
             island_anim: if settings.persistent_island { 1.0 } else { 0.0 },
             island_vel: 0.0,
+            cu_mini_anim: 0.0,
+            cu_mini_vel: 0.0,
             ripples: Vec::with_capacity(8),
             stars,
             sticky_note: persisted.sticky_note,
@@ -1233,18 +1237,117 @@ impl Desktop {
 
     pub fn capture_screen_png_base64(&self) -> (String, i32, i32) {
         let (w, h) = self.last_canvas_size;
-        let mut cap = Canvas::new(w.max(320) as usize, h.max(240) as usize);
+        let cw = w.max(320);
+        let ch = h.max(240);
+        let mut cap = Canvas::new(cw as usize, ch as usize);
         self.render(&mut cap);
+        // Overlay crisp 100px labeled grid + last click reticle ONLY on the screenshot sent to VLM
+        let mut gx = 100;
+        while gx < cw {
+            cap.blend_rect(gx, 0, 1, ch, 0x38BDF8, 55);
+            cap.draw_text_micro_clipped(gx + 2, 2, 32, &format!("{gx}"), 0xF8FAFC);
+            gx += 100;
+        }
+        let mut gy = 100;
+        while gy < ch {
+            cap.blend_rect(0, gy, cw, 1, 0x38BDF8, 55);
+            cap.draw_text_micro_clipped(2, gy + 2, 32, &format!("{gy}"), 0xF8FAFC);
+            gy += 100;
+        }
+        if let Some((lx, ly)) = self.ai.cu_last_click {
+            cap.fill_aa_circle(lx as f32, ly as f32, 6.0, 0xEF4444, 170);
+            cap.fill_rect(lx - 8, ly, 17, 1, 0xFFFFFF);
+            cap.fill_rect(lx, ly - 8, 1, 17, 0xFFFFFF);
+        }
         let b64 = crate::gfx::encode_png_base64(&cap.pixels, cap.width, cap.height);
         (b64, cap.width as i32, cap.height as i32)
     }
 
+    fn build_cu_ui_hint(&self) -> String {
+        let (cw, ch) = self.last_canvas_size;
+        let ws = self.active_workspace;
+        let icons: Vec<String> = DESKTOP_ICONS
+            .iter()
+            .map(|&(id, ix, iy, _)| format!("{}({},{})", id.title(crate::apps::Lang::En), ix + 32, iy + 28))
+            .collect();
+        let mut wins = Vec::new();
+        for win in &self.windows {
+            if win.open && !win.minimized && win.workspace == ws {
+                let extra = match win.id {
+                    AppId::Browser => format!(
+                        ",url_bar=({},{}),go=({},{})",
+                        win.x + 200,
+                        win.y + 44,
+                        win.x + win.w - 26,
+                        win.y + 44
+                    ),
+                    AppId::Terminal => format!(",input=({},{})", win.x + 120, win.y + win.h - 24),
+                    AppId::Ai => format!(",self_input=({},{})", win.x + 80, win.y + win.h - 22),
+                    _ => String::new(),
+                };
+                wins.push(format!(
+                    "{}[x={}..{},y={}..{},close=({},{}){}]",
+                    self.win_title(win.id),
+                    win.x,
+                    win.x + win.w,
+                    win.y,
+                    win.y + win.h,
+                    win.x + win.w - 16,
+                    win.y + 14,
+                    extra
+                ));
+            }
+        }
+        let task_y = if self.settings.taskbar_top { 22 } else { ch - 22 };
+        format!(
+            "Screen={cw}x{ch}. StartBtn=(45,{task_y}). DesktopIcons(center x,y): {}. OpenWindows: {}",
+            icons.join(", "),
+            wins.join(", ")
+        )
+    }
+
+    fn match_app_by_name(raw: &str) -> Option<AppId> {
+        let q = raw.trim().to_ascii_lowercase();
+        if q.contains("browser") || q.contains("брауз") || q.contains("surf") {
+            Some(AppId::Browser)
+        } else if q.contains("calc") || q.contains("кальк") {
+            Some(AppId::Calc)
+        } else if q.contains("term") || q.contains("терм") || q.contains("shell") {
+            Some(AppId::Terminal)
+        } else if q.contains("file") || q.contains("файл") {
+            Some(AppId::Files)
+        } else if q.contains("sett") || q.contains("настр") {
+            Some(AppId::Settings)
+        } else if q.contains("paint") || q.contains("рис") {
+            Some(AppId::Paint)
+        } else if q.contains("note") || q.contains("блокн") {
+            Some(AppId::Notepad)
+        } else if q.contains("snake") || q.contains("змей") {
+            Some(AppId::Snake)
+        } else if q.contains("2048") {
+            Some(AppId::Game2048)
+        } else if q.contains("mine") || q.contains("сап") {
+            Some(AppId::Minesweeper)
+        } else if q.contains("matrix") || q.contains("матр") {
+            Some(AppId::Matrix)
+        } else if q.contains("get") || q.contains("пак") {
+            Some(AppId::PizGet)
+        } else if q.contains("sys") || q.contains("сист") {
+            Some(AppId::System)
+        } else {
+            None
+        }
+    }
+
     fn execute_cu_action(&mut self, act: CuAction, say: Option<String>) -> bool {
-        if let Some(msg) = say {
-            self.ai.push_msg(AiMsgKind::Assistant, msg);
+        if let Some(ref msg) = say {
+            self.ai.cu_action_text = msg.clone();
+            self.ai.push_msg(AiMsgKind::Assistant, msg.clone());
         }
         let (cw, ch) = self.last_canvas_size;
         let log_line = match &act {
+            CuAction::Screenshot => String::from("screenshot"),
+            CuAction::OpenApp(name) => format!("open_app({name})"),
             CuAction::Move(x, y) => format!("move({x},{y})"),
             CuAction::Click(x, y) => format!("click({x},{y})"),
             CuAction::DoubleClick(x, y) => format!("double_click({x},{y})"),
@@ -1253,31 +1356,46 @@ impl Desktop {
             CuAction::Wait => String::from("wait"),
             CuAction::Done(_) => String::from("done"),
         };
+        if say.is_none() && !matches!(act, CuAction::Done(_)) {
+            self.ai.cu_action_text = log_line.clone();
+        }
         if self.ai.cu_history.len() >= 8 {
             self.ai.cu_history.remove(0);
         }
         self.ai.cu_history.push(log_line);
         match act {
+            CuAction::Screenshot => {
+                self.ai.cu_needs_capture = true;
+                false
+            }
+            CuAction::OpenApp(name) => {
+                if let Some(id) = Self::match_app_by_name(&name) {
+                    self.focus_or_open(id);
+                }
+                self.ai.push_msg(AiMsgKind::CuStep, format!("open_app({name})"));
+                false
+            }
             CuAction::Move(x, y) => {
+                self.ai.cu_last_click = Some((x, y));
                 self.on_mouse_move(x, y, cw, ch);
                 self.ai.push_msg(AiMsgKind::CuStep, format!("move({x}, {y})"));
                 false
             }
             CuAction::Click(x, y) => {
+                self.ai.cu_last_click = Some((x, y));
                 self.on_mouse_move(x, y, cw, ch);
                 self.on_mouse_down(x, y, cw, ch);
                 self.on_mouse_up();
-                self.push_toast(format!("PizAI -> click({x}, {y})"), 0x10B981);
                 self.ai.push_msg(AiMsgKind::CuStep, format!("click({x}, {y})"));
                 false
             }
             CuAction::DoubleClick(x, y) => {
+                self.ai.cu_last_click = Some((x, y));
                 self.on_mouse_move(x, y, cw, ch);
                 self.on_mouse_down(x, y, cw, ch);
                 self.on_mouse_up();
                 self.on_mouse_down(x, y, cw, ch);
                 self.on_mouse_up();
-                self.push_toast(format!("PizAI -> dblclick({x}, {y})"), 0x10B981);
                 self.ai.push_msg(AiMsgKind::CuStep, format!("double_click({x}, {y})"));
                 false
             }
@@ -1311,6 +1429,7 @@ impl Desktop {
                 false
             }
             CuAction::Done(summary) => {
+                self.ai.cu_action_text = summary.clone();
                 self.ai.push_msg(AiMsgKind::Assistant, summary);
                 true
             }
@@ -1320,28 +1439,29 @@ impl Desktop {
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.poll_display_server();
+        self.ai.screen_size = self.last_canvas_size;
         if self.ai.cu_needs_capture && self.ai.cu_active {
             let (b64, w, h) = self.capture_screen_png_base64();
-            let wins: Vec<String> = self
-                .windows
-                .iter()
-                .filter(|win| win.open && !win.minimized && win.workspace == self.active_workspace)
-                .map(|win| format!("{}[{},{},{}x{}]", self.win_title(win.id), win.x, win.y, win.w, win.h))
-                .collect();
-            let ui_hint = format!("Open windows: {}", wins.join(", "));
+            let ui_hint = self.build_cu_ui_hint();
             self.ai.dispatch_cu_screen(&b64, w, h, &ui_hint);
         }
-        if let Some(reply) = self.ai.poll()
-            && self.ai.cu_active
-        {
+        if let Some(reply) = self.ai.poll() {
             if let Some(resp) = parse_cu_response(&reply) {
-                let done = self.execute_cu_action(resp.action, resp.say);
-                if done || self.ai.cu_steps >= 10 {
-                    self.ai.cu_active = false;
-                } else {
-                    self.ai.cu_wait_ticks = 12;
+                if !self.ai.cu_active {
+                    // Replace raw JSON tool call just appended by poll() with live CU execution
+                    if matches!(self.ai.messages.last(), Some(m) if m.kind == AiMsgKind::Assistant && m.text.trim_start().starts_with('{')) {
+                        self.ai.messages.pop();
+                    }
+                    self.ai.cu_active = true;
                 }
-            } else {
+                let is_shot = matches!(resp.action, CuAction::Screenshot);
+                let done = self.execute_cu_action(resp.action, resp.say);
+                if done || self.ai.cu_steps >= 12 {
+                    self.ai.cu_active = false;
+                } else if !is_shot {
+                    self.ai.cu_wait_ticks = 10;
+                }
+            } else if self.ai.cu_active {
                 self.ai.push_msg(AiMsgKind::Assistant, reply);
                 self.ai.cu_active = false;
             }
@@ -1362,7 +1482,12 @@ impl Desktop {
         let launch_tgt = if self.launcher_open { 1.0 } else { 0.0 };
         let dock_tgt = if self.settings.floating_dock { 1.0 } else { 0.0 };
         let snap_tgt = if self.snap_zone.is_some() { 1.0 } else { 0.0 };
-        let island_tgt = if self.settings.persistent_island { 1.0 } else { 0.0 };
+        let island_tgt = if self.settings.persistent_island || self.ai.cu_active {
+            1.0
+        } else {
+            0.0
+        };
+        let mini_tgt = if self.ai.cu_active { 1.0 } else { 0.0 };
         let genie_step = if self.settings.genie_minimize { 0.070 } else { 0.095 };
 
         if !self.settings.animations {
@@ -1377,6 +1502,8 @@ impl Desktop {
             self.dock_float_vel = 0.0;
             self.island_anim = island_tgt;
             self.island_vel = 0.0;
+            self.cu_mini_anim = mini_tgt;
+            self.cu_mini_vel = 0.0;
             self.snap_anim = snap_tgt;
             if self.ctx_menu.is_none() {
                 self.last_ctx_menu = None;
@@ -1435,9 +1562,17 @@ impl Desktop {
                 &mut self.island_anim,
                 &mut self.island_vel,
                 island_tgt,
-                0.36,
-                0.54,
-                0.008,
+                0.28,
+                0.44,
+                0.005,
+            );
+            Canvas::step_spring(
+                &mut self.cu_mini_anim,
+                &mut self.cu_mini_vel,
+                mini_tgt,
+                0.26,
+                0.42,
+                0.005,
             );
 
             let cd = ctx_tgt - self.ctx_anim;
@@ -3393,7 +3528,10 @@ impl Desktop {
         if let Some((cx, cy)) = self.ctx_menu.or(anim_ctx) {
             self.draw_context_menu(canvas, cx, cy, accent);
         }
-        if self.settings.persistent_island || (anim && self.island_anim > 0.03) {
+        if self.settings.persistent_island
+            || self.ai.cu_active
+            || (anim && (self.island_anim > 0.02 || self.cu_mini_anim > 0.02))
+        {
             self.draw_idle_island(canvas, w, h, accent);
         }
         if let Some(toast) = self.toast.as_ref() {
@@ -3956,91 +4094,196 @@ impl Desktop {
     }
 
     fn draw_idle_island(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
-        let t = if self.settings.animations {
-            self.island_anim.clamp(0.0, 1.0)
-        } else if self.settings.persistent_island {
+        let cu_on = self.ai.cu_active || self.cu_mini_anim > 0.04;
+        let t_raw = if self.settings.animations {
+            self.island_anim
+        } else if self.settings.persistent_island || cu_on {
             1.0
         } else {
             0.0
         };
+        let t = t_raw.clamp(0.0, 1.0);
         if t <= 0.02 {
             return;
         }
-        let txt = self.idle_island_text();
-        let (tx, base_y, tw, th) = self.idle_island_rect(w, h, &txt);
-        let slide = ((1.0 - t) * 26.0).round() as i32;
-        let ty = if self.settings.taskbar_top {
-            base_y + slide
+        let txt = if cu_on {
+            String::from("PizAI is using your computer")
         } else {
-            base_y - slide
+            self.idle_island_text()
         };
+        let (_, base_y, full_tw, th) = self.idle_island_rect(w, h, &txt);
+
+        // Liquid jelly morph: emerges stretched out of y=0 (or bottom edge if taskbar_top)
+        let stretch = t_raw.clamp(0.0, 1.12);
+        let eff_w = (full_tw as f32 * (0.36 + 0.64 * (stretch * stretch).min(1.08)))
+            .round()
+            .clamp(56.0, (w - 20) as f32) as i32;
+        let eff_h = (th as f32 * (0.58 + 0.42 * stretch)).round().clamp(14.0, 34.0) as i32;
+        let tx = (w - eff_w) / 2;
+        let ty = if self.settings.taskbar_top {
+            let from_edge = (h as f32 - base_y as f32) * (1.0 - stretch);
+            (base_y as f32 + from_edge).round() as i32
+        } else {
+            ((base_y as f32 + eff_h as f32 * 0.45) * stretch - eff_h as f32 * 0.45)
+                .round()
+                .max(0.0) as i32
+        };
+
+        // Liquid neck bridge connecting the top edge to the emerging jelly pill
+        if !self.settings.taskbar_top && t < 0.80 && ty > 0 {
+            let neck_f = 1.0 - (t / 0.80);
+            let neck_w = (eff_w as f32 * (0.45 + 0.35 * neck_f)).round().max(26.0) as i32;
+            let neck_x = (w - neck_w) / 2;
+            canvas.blend_rounded_rect(neck_x, -4, neck_w, ty + eff_h / 2 + 6, 10, 0x090D16, (230.0 * t) as u8);
+            let flare_w = (neck_w + (24.0 * neck_f) as i32).min(eff_w + 16);
+            canvas.blend_rounded_rect((w - flare_w) / 2, -6, flare_w, 12, 6, 0x090D16, (220.0 * t) as u8);
+        }
+
         let hov = self.settings.persistent_island
             && self.toast.is_none()
             && self.mouse_x >= tx
-            && self.mouse_x <= tx + tw
+            && self.mouse_x <= tx + eff_w
             && self.mouse_y >= ty
-            && self.mouse_y <= ty + th;
+            && self.mouse_y <= ty + eff_h;
 
-        if t > 0.5 {
-            canvas.draw_soft_shadow(tx, ty, tw, th, 13);
+        if t > 0.45 {
+            canvas.draw_soft_shadow(tx, ty, eff_w, eff_h, 13);
         }
-        canvas.blend_rounded_rect(tx, ty, tw, th, 13, 0x090D16, (236.0 * t) as u8);
-        let border_col = if hov { accent } else { 0xFFFFFF };
-        let border_a = if hov {
+        canvas.blend_rounded_rect(tx, ty, eff_w, eff_h, 13, 0x090D16, (238.0 * t) as u8);
+        let border_col = if cu_on {
+            0xA855F7
+        } else if hov {
+            accent
+        } else {
+            0xFFFFFF
+        };
+        let border_a = if cu_on {
+            (180.0 * t) as u8
+        } else if hov {
             (165.0 * t) as u8
         } else {
             (48.0 * t) as u8
         };
-        canvas.draw_rounded_rect_alpha(tx, ty, tw, th, 13, border_col, border_a);
-        canvas.blend_rect(tx + 16, ty + 1, (tw - 32).max(0), 1, 0xFFFFFF, (30.0 * t) as u8);
+        canvas.draw_rounded_rect_alpha(tx, ty, eff_w, eff_h, 13, border_col, border_a);
+        canvas.blend_rect(tx + 16, ty + 1, (eff_w - 32).max(0), 1, 0xFFFFFF, (30.0 * t) as u8);
 
         let pulse = if self.settings.animations {
             (205.0 + 50.0 * ((self.tick as f32) * 0.08).sin()).clamp(150.0, 255.0)
         } else {
             255.0
         };
-        match self.island_mode {
-            IslandMode::Music => {
-                let cols = [0x22C55E, 0x38BDF8, 0xA855F7, 0xEC4899, 0xF59E0B];
-                for (b, &col) in cols.iter().enumerate() {
-                    let phase = ((self.tick as f32) * 0.24 + (b as f32) * 1.15).sin();
-                    let bh = if self.settings.animations {
-                        ((5.0 + 6.0 * (0.5 + 0.5 * phase)) * t).round() as i32
-                    } else {
-                        7
+        if cu_on {
+            canvas.fill_aa_circle((tx + 14) as f32, (ty + eff_h / 2) as f32, 5.2, 0xA855F7, (65.0 * t) as u8);
+            canvas.fill_aa_circle((tx + 14) as f32, (ty + eff_h / 2) as f32, 2.8, 0xC084FC, (pulse * t) as u8);
+        } else {
+            match self.island_mode {
+                IslandMode::Music => {
+                    let cols = [0x22C55E, 0x38BDF8, 0xA855F7, 0xEC4899, 0xF59E0B];
+                    for (b, &col) in cols.iter().enumerate() {
+                        let phase = ((self.tick as f32) * 0.24 + (b as f32) * 1.15).sin();
+                        let bh = if self.settings.animations {
+                            ((5.0 + 6.0 * (0.5 + 0.5 * phase)) * t).round() as i32
+                        } else {
+                            7
+                        }
+                        .max(2);
+                        canvas.fill_rect(tx + 11 + (b as i32) * 3, ty + 18 - bh, 2, bh, col);
                     }
-                    .max(2);
-                    canvas.fill_rect(tx + 11 + (b as i32) * 3, ty + 18 - bh, 2, bh, col);
                 }
-            }
-            IslandMode::Pomodoro => {
-                let col = 0xF97316;
-                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, col, (55.0 * t) as u8);
-                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, col, (pulse * t) as u8);
-                let total = (25 * 60 * 30) as f32;
-                let frac = 1.0 - (self.pomo_ticks as f32 / total).clamp(0.0, 1.0);
-                let pw = (((tw - 30) as f32) * frac.max(0.04)).round() as i32;
-                canvas.blend_rect(tx + 15, ty + th - 3, pw, 1, col, (190.0 * t) as u8);
-            }
-            IslandMode::Status => {
-                let dot_col = if self.dnd { 0xA855F7 } else { 0x3FB950 };
-                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, dot_col, (55.0 * t) as u8);
-                canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, dot_col, (pulse * t) as u8);
+                IslandMode::Pomodoro => {
+                    let col = 0xF97316;
+                    canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, col, (55.0 * t) as u8);
+                    canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, col, (pulse * t) as u8);
+                    let total = (25 * 60 * 30) as f32;
+                    let frac = 1.0 - (self.pomo_ticks as f32 / total).clamp(0.0, 1.0);
+                    let pw = (((eff_w - 30) as f32) * frac.max(0.04)).round() as i32;
+                    canvas.blend_rect(tx + 15, ty + eff_h - 3, pw, 1, col, (190.0 * t) as u8);
+                }
+                IslandMode::Status => {
+                    let dot_col = if self.dnd { 0xA855F7 } else { 0x3FB950 };
+                    canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 4.8, dot_col, (55.0 * t) as u8);
+                    canvas.fill_aa_circle((tx + 14) as f32, (ty + 13) as f32, 2.7, dot_col, (pulse * t) as u8);
+                }
             }
         }
         if t > 0.35 {
-            let text_x = if self.island_mode == IslandMode::Music { tx + 31 } else { tx + 24 };
-            canvas.draw_text_clipped(text_x, ty + 6, tw - 66, &txt, 0xE2E8F0, 1);
-            let mode_idx = match self.island_mode {
-                IslandMode::Status => 0,
-                IslandMode::Music => 1,
-                IslandMode::Pomodoro => 2,
+            let text_x = if !cu_on && self.island_mode == IslandMode::Music {
+                tx + 31
+            } else {
+                tx + 24
             };
-            canvas.blend_rounded_rect(tx + tw - 34, ty + 5, 26, 16, 8, 0xFFFFFF, (22.0 * t) as u8);
-            for d in 0..3 {
-                let col = if d == mode_idx { accent } else { 0x64748B };
-                let rad = if d == mode_idx { 2.3 } else { 1.5 };
-                canvas.fill_aa_circle((tx + tw - 28 + d * 7) as f32, (ty + 13) as f32, rad, col, (220.0 * t) as u8);
+            let right_pad = if cu_on { 32 } else { 66 };
+            canvas.draw_text_clipped(text_x, ty + 6, (eff_w - right_pad).max(10), &txt, 0xE2E8F0, 1);
+            if !cu_on {
+                let mode_idx = match self.island_mode {
+                    IslandMode::Status => 0,
+                    IslandMode::Music => 1,
+                    IslandMode::Pomodoro => 2,
+                };
+                canvas.blend_rounded_rect(tx + eff_w - 34, ty + 5, 26, 16, 8, 0xFFFFFF, (22.0 * t) as u8);
+                for d in 0..3 {
+                    let col = if d == mode_idx { accent } else { 0x64748B };
+                    let rad = if d == mode_idx { 2.3 } else { 1.5 };
+                    canvas.fill_aa_circle(
+                        (tx + eff_w - 28 + d * 7) as f32,
+                        (ty + 13) as f32,
+                        rad,
+                        col,
+                        (220.0 * t) as u8,
+                    );
+                }
+            }
+        }
+
+        // Liquid Mini Dynamic Island dripping right below main island during AI Computer Use
+        let mt_raw = if self.settings.animations {
+            self.cu_mini_anim
+        } else if self.ai.cu_active {
+            1.0
+        } else {
+            0.0
+        };
+        let mt = mt_raw.clamp(0.0, 1.0);
+        if mt > 0.03 {
+            let mtxt = if self.ai.cu_action_text.is_empty() {
+                "Thinking..."
+            } else {
+                self.ai.cu_action_text.as_str()
+            };
+            let tw_micro = canvas.measure_text_micro(mtxt);
+            let full_mw = (tw_micro + 28).clamp(104, (w - 36).max(104));
+            let mh = 18;
+            let mw = (full_mw as f32 * (0.35 + 0.65 * mt_raw.clamp(0.0, 1.08)))
+                .round()
+                .max(36.0) as i32;
+            let mx = (w - mw) / 2;
+            let my = if self.settings.taskbar_top {
+                (ty as f32 - (mh + 5) as f32 * mt_raw.clamp(0.0, 1.08)).round() as i32
+            } else {
+                ty + eff_h - mh / 2 + ((mh / 2 + 5) as f32 * mt_raw.clamp(0.0, 1.08)).round() as i32
+            };
+
+            // Gooey droplet neck bridging main island <-> mini island while emerging
+            if !self.settings.taskbar_top && mt < 0.82 {
+                let neck_w = (mw as f32 * 0.42).round().max(16.0) as i32;
+                canvas.blend_rounded_rect(
+                    (w - neck_w) / 2,
+                    ty + eff_h - 4,
+                    neck_w,
+                    (my - (ty + eff_h) + mh / 2 + 4).max(6),
+                    6,
+                    0x090D16,
+                    (225.0 * mt) as u8,
+                );
+            }
+            if mt > 0.45 {
+                canvas.draw_soft_shadow(mx, my, mw, mh, 9);
+            }
+            canvas.blend_rounded_rect(mx, my, mw, mh, 9, 0x090D16, (234.0 * mt) as u8);
+            canvas.draw_rounded_rect_alpha(mx, my, mw, mh, 9, 0x34D399, (150.0 * mt) as u8);
+            if mt > 0.35 {
+                canvas.fill_aa_circle((mx + 10) as f32, (my + 9) as f32, 2.3, 0x34D399, (pulse * mt) as u8);
+                canvas.draw_text_micro_clipped(mx + 17, my + 4, (mw - 24).max(10), mtxt, 0xCBD5E1);
             }
         }
     }

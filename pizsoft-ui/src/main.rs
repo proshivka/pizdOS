@@ -1430,9 +1430,30 @@ mod tests {
         assert_eq!(cu.action, CuAction::Click(186, 114));
         assert_eq!(cu.say.as_deref(), Some("Opening Browser..."));
         assert_eq!(
+            parse_cu_response(r#"{"action":"screenshot"}"#).map(|r| r.action),
+            Some(CuAction::Screenshot)
+        );
+        assert_eq!(
+            parse_cu_response(r#"{"action":"open_app","app":"Calc"}"#).map(|r| r.action),
+            Some(CuAction::OpenApp(String::from("Calc")))
+        );
+        assert_eq!(
             parse_cu_response(r#"{"action":"done","summary":"Opened Browser"}"#).map(|r| r.action),
             Some(CuAction::Done(String::from("Opened Browser")))
         );
+
+        // Starry Effort slider & Liquid Dynamic Island + Mini Island render test
+        let mut desktop = desktop::Desktop::new(800, 600);
+        desktop.ai.popup = AiPopup::Effort;
+        desktop.ai.spin_tick = 17;
+        desktop.ai.cu_active = true;
+        desktop.ai.cu_action_text = String::from("Opening Browser...");
+        for _ in 0..12 {
+            desktop.on_tick();
+        }
+        assert!(desktop.island_anim > 0.4 && desktop.cu_mini_anim > 0.4);
+        let mut canvas = Canvas::new(800, 600);
+        desktop.render(&mut canvas);
 
         // Config round-trip including new PizAI settings
         let tmp = std::env::temp_dir().join("pizsoft_ai_cfg_test.conf");

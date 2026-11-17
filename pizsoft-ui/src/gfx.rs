@@ -893,6 +893,28 @@ impl Canvas {
         }
     }
 
+    pub fn measure_text_micro(&self, text: &str) -> i32 {
+        crate::font::measure_text_scaled(text, 1, 0.78)
+    }
+
+    pub fn draw_text_micro_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, color: u32) {
+        if max_w <= 0 {
+            return;
+        }
+        let eff_scale = self.ui_scale * 0.78;
+        let limit_phys = self.sx(x + max_w) as f32;
+        let mut cx_f = self.sf(x as f32);
+        let py = self.sx(y);
+        for ch in text.chars() {
+            let g = rasterize_scaled_cached(ch, 1, eff_scale);
+            if cx_f + g.advance_f > limit_phys {
+                break;
+            }
+            self.draw_glyph_phys(cx_f.round() as i32, py, g, color);
+            cx_f += g.advance_f;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw_progress_bar(
         &mut self,
