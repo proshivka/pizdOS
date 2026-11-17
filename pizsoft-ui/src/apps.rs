@@ -4317,7 +4317,7 @@ pub struct AiModelSpec {
     pub thinking: &'static [ThinkingLevel],
 }
 
-pub const AI_MODELS: [AiModelSpec; 4] = [
+pub const AI_MODELS: [AiModelSpec; 9] = [
     AiModelSpec {
         label: "Gemini 3.5 Flash-Lite",
         model_id: "gemini-flash-lite-latest",
@@ -4331,16 +4331,46 @@ pub const AI_MODELS: [AiModelSpec; 4] = [
         thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh],
     },
     AiModelSpec {
-        label: "OpenAI-compat (Custom)",
-        model_id: "gpt-4o",
+        label: "DeepSeek V4.1 Flash",
+        model_id: "deepseek-flash",
         provider: AiProvider::OpenAi,
-        thinking: &[],
+        thinking: &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
     },
     AiModelSpec {
-        label: "Anthropic-compat (Custom)",
-        model_id: "claude-sonnet-4-5",
+        label: "DeepSeek V4 Pro",
+        model_id: "deepseek-v4-pro",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Max],
+    },
+    AiModelSpec {
+        label: "Kimi K3.1 Pro",
+        model_id: "kimi-k3.1-pro",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "GLM-5.3",
+        model_id: "GLM-5.3",
+        provider: AiProvider::OpenAi,
+        thinking: &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "Claude Opus 5.5",
+        model_id: "claude-opus-5-5",
         provider: AiProvider::Anthropic,
-        thinking: &[],
+        thinking: &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Max],
+    },
+    AiModelSpec {
+        label: "Claude Sonnet 5.5",
+        model_id: "claude-sonnet-5-5",
+        provider: AiProvider::Anthropic,
+        thinking: &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+    },
+    AiModelSpec {
+        label: "Claude Fable 5.2",
+        model_id: "claude-fable-5-2",
+        provider: AiProvider::Anthropic,
+        thinking: &[ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max],
     },
 ];
 
@@ -4468,16 +4498,50 @@ pub enum CuAction {
     Done(String),
 }
 
-pub fn parse_cu_action(reply: &str) -> Option<CuAction> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    if end <= start {
-        return None;
+fn find_action_json_slice(reply: &str) -> Option<&str> {
+    let act_pos = reply.find("\"action\"")?;
+    let start = reply[..act_pos].rfind('{')?;
+    let bytes = reply.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (rel, &b) in bytes[start..].iter().enumerate() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if in_str {
+            if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&reply[start..=start + rel]);
+                }
+            }
+            _ => {}
+        }
     }
-    let obj = &reply[start..=end];
+    None
+}
+
+pub fn parse_cu_action(reply: &str) -> Option<CuAction> {
+    let obj = find_action_json_slice(reply).or_else(|| {
+        let s = reply.find('{')?;
+        let e = reply.rfind('}')?;
+        (e > s).then_some(&reply[s..=e])
+    })?;
     let act = extract_json_field(obj, "action")?.to_ascii_lowercase();
     match act.as_str() {
-        "click" => Some(CuAction::Click(
+        "click" | "left_click" | "tap" => Some(CuAction::Click(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
         )),
@@ -4485,16 +4549,16 @@ pub fn parse_cu_action(reply: &str) -> Option<CuAction> {
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
         )),
-        "move" => Some(CuAction::Move(
+        "move" | "mouse_move" => Some(CuAction::Move(
             extract_json_int(obj, "x").unwrap_or(0),
             extract_json_int(obj, "y").unwrap_or(0),
         )),
-        "type" => extract_json_field(obj, "text").map(CuAction::Type),
-        "key" => extract_json_field(obj, "name")
+        "type" | "input" | "write" => extract_json_field(obj, "text").map(CuAction::Type),
+        "key" | "press" => extract_json_field(obj, "name")
             .or_else(|| extract_json_field(obj, "key"))
             .map(CuAction::Key),
         "wait" => Some(CuAction::Wait),
-        "done" => Some(CuAction::Done(
+        "done" | "finish" => Some(CuAction::Done(
             extract_json_field(obj, "summary").unwrap_or_else(|| String::from("Done.")),
         )),
         _ => None,
@@ -4522,6 +4586,7 @@ pub struct AiChatState {
     pub cu_enabled: bool,
     pub cu_active: bool,
     pub cu_goal: String,
+    pub cu_history: Vec<String>,
     pub cu_steps: u8,
     pub cu_wait_ticks: u8,
     pub cu_needs_capture: bool,
@@ -4552,6 +4617,7 @@ impl AiChatState {
             cu_enabled: false,
             cu_active: false,
             cu_goal: String::new(),
+            cu_history: Vec::new(),
             cu_steps: 0,
             cu_wait_ticks: 0,
             cu_needs_capture: false,
@@ -4679,6 +4745,7 @@ impl AiChatState {
         if self.cu_enabled {
             self.cu_active = true;
             self.cu_goal = prompt;
+            self.cu_history.clear();
             self.cu_steps = 0;
             self.cu_wait_ticks = 0;
             self.cu_needs_capture = true;
@@ -4688,15 +4755,22 @@ impl AiChatState {
         }
     }
 
-    pub fn dispatch_cu_screen(&mut self, png_b64: &str, sw: i32, sh: i32) {
+    pub fn dispatch_cu_screen(&mut self, png_b64: &str, sw: i32, sh: i32, ui_hint: &str) {
         self.cu_needs_capture = false;
         self.cu_steps += 1;
+        let hist = if self.cu_history.is_empty() {
+            String::from("none")
+        } else {
+            self.cu_history.join("; ")
+        };
         let prompt = format!(
-            "You are controlling pizdOS ({sw}x{sh} px). Goal: {}. Step {}/10. \
-             Look at the attached desktop PNG screenshot and return ONLY one JSON object for the next action: \
-             {{\"action\":\"click\",\"x\":100,\"y\":200}} OR {{\"action\":\"double_click\",\"x\":100,\"y\":200}} \
-             OR {{\"action\":\"move\",\"x\":100,\"y\":200}} OR {{\"action\":\"type\",\"text\":\"abc\"}} \
-             OR {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}.",
+            "You control pizdOS desktop ({sw}x{sh} px). Coordinates MUST be exact pixel values in x=0..{sw}, y=0..{sh} (NOT 0..1000). \
+             Desktop icons open with a SINGLE click. {ui_hint}\n\
+             Goal: {}\n\
+             Previous steps ({}/10): {hist}\n\
+             Inspect the attached PNG screenshot and output ONLY ONE JSON object (no markdown):\n\
+             {{\"action\":\"click\",\"x\":100,\"y\":200}} OR {{\"action\":\"type\",\"text\":\"...\"}} OR \
+             {{\"action\":\"key\",\"name\":\"enter\"}} OR {{\"action\":\"wait\"}} OR {{\"action\":\"done\",\"summary\":\"...\"}}",
             self.cu_goal, self.cu_steps
         );
         self.dispatch_api(&prompt, Some(png_b64));
@@ -5137,6 +5211,11 @@ pub fn build_ai_request_json(
             } else {
                 format!("[{{\"text\":\"{ep}\"}}]")
             };
+            let mime = if png_b64.is_some() {
+                ",\"responseMimeType\":\"application/json\""
+            } else {
+                ""
+            };
             let tcfg = if model_id.contains("2.5") {
                 let budget = match thinking {
                     ThinkingLevel::Off => 0,
@@ -5146,9 +5225,9 @@ pub fn build_ai_request_json(
                     ThinkingLevel::XHigh => 24576,
                     ThinkingLevel::Max => 32768,
                 };
-                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":{budget}}}}}")
+                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":{budget}}}{mime}}}")
             } else if thinking == ThinkingLevel::Off {
-                String::from(",\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":0}}")
+                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingBudget\":0}}{mime}}}")
             } else {
                 let lvl = match thinking {
                     ThinkingLevel::Low => "LOW",
@@ -5158,7 +5237,7 @@ pub fn build_ai_request_json(
                     ThinkingLevel::Max => "MAX",
                     ThinkingLevel::Off => "LOW",
                 };
-                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\"}}}}")
+                format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\"}}{mime}}}")
             };
             format!("{{\"contents\":[{{\"parts\":{parts}}}]{tcfg}}}")
         }

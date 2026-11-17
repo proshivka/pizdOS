@@ -614,7 +614,7 @@ impl Desktop {
                 Window::new(AppId::Game2048, 340, 80, 276, 336, false),
                 Window::new(AppId::PizView, 220, 86, 360, 300, false),
                 Window::new(AppId::Minesweeper, 310, 76, 284, 332, false),
-                Window::new(AppId::Ai, 210, 64, 430, 340, false),
+                Window::new(AppId::Ai, 272, 42, 440, 340, false),
                 Window::new(AppId::Browser, 170, 52, 480, 356, false),
                 Window::new(AppId::System, (width - 610).clamp(16, 190), 26, 330, 268, true),
                 Window::new(AppId::Settings, (width - 540).clamp(16, 370), 90, 520, 344, true),
@@ -1238,6 +1238,19 @@ impl Desktop {
 
     fn execute_cu_action(&mut self, act: CuAction) -> bool {
         let (cw, ch) = self.last_canvas_size;
+        let log_line = match &act {
+            CuAction::Move(x, y) => format!("move({x},{y})"),
+            CuAction::Click(x, y) => format!("click({x},{y})"),
+            CuAction::DoubleClick(x, y) => format!("double_click({x},{y})"),
+            CuAction::Type(t) => format!("type({t})"),
+            CuAction::Key(k) => format!("key({k})"),
+            CuAction::Wait => String::from("wait"),
+            CuAction::Done(_) => String::from("done"),
+        };
+        if self.ai.cu_history.len() >= 8 {
+            self.ai.cu_history.remove(0);
+        }
+        self.ai.cu_history.push(log_line);
         match act {
             CuAction::Move(x, y) => {
                 self.on_mouse_move(x, y, cw, ch);
@@ -1303,7 +1316,14 @@ impl Desktop {
         self.poll_display_server();
         if self.ai.cu_needs_capture && self.ai.cu_active {
             let (b64, w, h) = self.capture_screen_png_base64();
-            self.ai.dispatch_cu_screen(&b64, w, h);
+            let wins: Vec<String> = self
+                .windows
+                .iter()
+                .filter(|win| win.open && !win.minimized && win.workspace == self.active_workspace)
+                .map(|win| format!("{}[{},{},{}x{}]", self.win_title(win.id), win.x, win.y, win.w, win.h))
+                .collect();
+            let ui_hint = format!("Open windows: {}", wins.join(", "));
+            self.ai.dispatch_cu_screen(&b64, w, h, &ui_hint);
         }
         if let Some(reply) = self.ai.poll()
             && self.ai.cu_active
