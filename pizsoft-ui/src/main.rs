@@ -1374,32 +1374,38 @@ mod tests {
         };
 
         let mut settings = apps::SettingsState::new();
-        settings.ai_model_idx = 1; // Gemini 4 Hydrogen: Low, High, Max only
-        settings.ai_thinking_idx = 2; // Medium (disallowed -> clamped!)
+        settings.ai_model_idx = 1; // Gemini 4 Hydrogen: Low..=XHigh
+        settings.ai_thinking_idx = ThinkingLevel::Max.idx(); // Max disallowed -> clamped to XHigh!
         let mut ai = AiChatState::new(&settings);
         assert_eq!(
             ai.supported_thinking(),
-            vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+            vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
         );
-        assert_ne!(ai.thinking, ThinkingLevel::Medium);
-
-        // Switching to GPT-5 (Low..=XHigh) clamps Max -> XHigh
-        ai.model_idx = 3;
-        ai.provider = AiProvider::OpenAi;
-        ai.thinking = ThinkingLevel::Max;
-        ai.clamp_thinking();
         assert_eq!(ai.thinking, ThinkingLevel::XHigh);
+
+        // Custom OpenAI-compatible model respects custom thinking mask (e.g. Low + High + Max only)
+        ai.provider = AiProvider::OpenAi;
+        ai.custom_model = String::from("my-custom-model");
+        ai.custom_thinking_mask = ThinkingLevel::Low.bit() | ThinkingLevel::High.bit() | ThinkingLevel::Max.bit();
+        ai.thinking = ThinkingLevel::Medium;
+        ai.clamp_thinking();
+        assert_ne!(ai.thinking, ThinkingLevel::Medium);
 
         // Request/response across Gemini, OpenAI, Anthropic + PNG Computer Use
         let png = crate::gfx::encode_png_rgb(&[0x00FF0000; 16], 4, 4);
         assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         let b64 = crate::gfx::encode_base64(&png);
 
-        let gj = build_ai_request_json(AiProvider::Gemini, "gemini-flash-latest", ThinkingLevel::High, "hi", Some(&b64));
-        assert!(gj.contains("inlineData") && gj.contains("\"thinkingLevel\":\"HIGH\""));
-        let oj = build_ai_request_json(AiProvider::OpenAi, "gpt-5", ThinkingLevel::XHigh, "hi", Some(&b64));
+        let gj = build_ai_request_json(AiProvider::Gemini, "gemini-flash-latest", ThinkingLevel::XHigh, "hi", Some(&b64));
+        assert!(gj.contains("inlineData") && gj.contains("\"thinkingLevel\":\"XHIGH\""));
+        let oj = build_ai_request_json(AiProvider::OpenAi, "my-custom-model", ThinkingLevel::XHigh, "hi", Some(&b64));
         assert!(oj.contains("\"reasoning_effort\":\"xhigh\"") && oj.contains("data:image/png;base64,"));
-        let aj = build_ai_request_json(AiProvider::Anthropic, "claude-sonnet-4-5", ThinkingLevel::Max, "hi", Some(&b64));
+        let aj = build_ai_request_json(AiProvider::Anthropic, "claude-opus-4-6", ThinkingLevel::Max, "hi", Some(&b64));
         assert!(aj.contains("\"budget_tokens\":24576") && aj.contains("\"media_type\":\"image/png\""));
 
         assert_eq!(

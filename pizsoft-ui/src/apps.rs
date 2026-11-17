@@ -4317,7 +4317,7 @@ pub struct AiModelSpec {
     pub thinking: &'static [ThinkingLevel],
 }
 
-pub const AI_MODELS: [AiModelSpec; 7] = [
+pub const AI_MODELS: [AiModelSpec; 4] = [
     AiModelSpec {
         label: "Gemini 3.5 Flash-Lite",
         model_id: "gemini-flash-lite-latest",
@@ -4328,43 +4328,19 @@ pub const AI_MODELS: [AiModelSpec; 7] = [
         label: "Gemini 4 Hydrogen",
         model_id: "gemini-flash-latest",
         provider: AiProvider::Gemini,
-        thinking: &[ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max],
-    },
-    AiModelSpec {
-        label: "Gemini 2.5 Pro",
-        model_id: "gemini-2.5-pro",
-        provider: AiProvider::Gemini,
-        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Max],
-    },
-    AiModelSpec {
-        label: "GPT-5 (OpenAI)",
-        model_id: "gpt-5",
-        provider: AiProvider::OpenAi,
         thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh],
     },
     AiModelSpec {
-        label: "o4-mini (OpenAI)",
-        model_id: "o4-mini",
+        label: "OpenAI-compat (Custom)",
+        model_id: "gpt-4o",
         provider: AiProvider::OpenAi,
-        thinking: &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High],
+        thinking: &[],
     },
     AiModelSpec {
-        label: "DeepSeek R1",
-        model_id: "deepseek-reasoner",
-        provider: AiProvider::OpenAi,
-        thinking: &[ThinkingLevel::Low, ThinkingLevel::High],
-    },
-    AiModelSpec {
-        label: "Claude Sonnet 4.5",
+        label: "Anthropic-compat (Custom)",
         model_id: "claude-sonnet-4-5",
         provider: AiProvider::Anthropic,
-        thinking: &[
-            ThinkingLevel::Off,
-            ThinkingLevel::Low,
-            ThinkingLevel::Medium,
-            ThinkingLevel::High,
-            ThinkingLevel::Max,
-        ],
+        thinking: &[],
     },
 ];
 
@@ -4612,7 +4588,8 @@ impl AiChatState {
     }
 
     pub fn supported_thinking(&self) -> Vec<ThinkingLevel> {
-        if !self.custom_model.trim().is_empty() {
+        let preset = AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)].thinking;
+        if !self.custom_model.trim().is_empty() || preset.is_empty() {
             let list: Vec<ThinkingLevel> = ALL_THINKING_LEVELS
                 .iter()
                 .copied()
@@ -4623,9 +4600,7 @@ impl AiChatState {
             }
             return vec![ThinkingLevel::Low, ThinkingLevel::High];
         }
-        AI_MODELS[self.model_idx.min(AI_MODELS.len() - 1)]
-            .thinking
-            .to_vec()
+        preset.to_vec()
     }
 
     pub fn clamp_thinking(&mut self) {
@@ -5178,7 +5153,9 @@ pub fn build_ai_request_json(
                 let lvl = match thinking {
                     ThinkingLevel::Low => "LOW",
                     ThinkingLevel::Medium => "MEDIUM",
-                    ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => "HIGH",
+                    ThinkingLevel::High => "HIGH",
+                    ThinkingLevel::XHigh => "XHIGH",
+                    ThinkingLevel::Max => "MAX",
                     ThinkingLevel::Off => "LOW",
                 };
                 format!(",\"generationConfig\":{{\"thinkingConfig\":{{\"thinkingLevel\":\"{lvl}\"}}}}")
