@@ -539,14 +539,16 @@ impl Desktop {
         let mut stars = Vec::with_capacity(28);
         for i in 0..28 {
             let ang = (i as f32) * 2.399_963;
-            let spd = 0.35 + ((i % 5) as f32) * 0.14;
+            let spd = 0.45 + ((i % 5) as f32) * 0.14;
+            let fx = ((i * 37 + 13) % 89) as f32 / 89.0;
+            let fy = ((i * 61 + 29) % 83) as f32 / 83.0;
             stars.push(AeroStar {
-                x: 0.5 + ang.cos() * 0.12 * ((i % 4) as f32 + 1.0),
-                y: 0.5 + ang.sin() * 0.12 * ((i % 4) as f32 + 1.0),
-                vx: ang.cos() * spd * 0.0045,
-                vy: ang.sin() * spd * 0.0045,
+                x: 0.04 + fx * 0.92,
+                y: 0.04 + fy * 0.92,
+                vx: ang.cos() * spd * 0.00065,
+                vy: ang.sin() * spd * 0.00065,
                 life: (i as f32) / 28.0,
-                size: 1.4 + ((i % 3) as f32) * 0.9,
+                size: 1.5 + ((i % 3) as f32) * 0.75,
             });
         }
 
@@ -1616,19 +1618,19 @@ impl Desktop {
             self.ripples.retain(|r| r.t < 1.0);
 
             if self.settings.aero_stars {
-                for (i, s) in self.stars.iter_mut().enumerate() {
-                    s.x += s.vx * (0.7 + s.life);
-                    s.y += s.vy * (0.7 + s.life);
-                    s.life += 0.0085;
-                    if s.life >= 1.0 || s.x < -0.05 || s.x > 1.05 || s.y < -0.05 || s.y > 1.05 {
-                        let ang = ((self.tick as f32) * 0.37 + (i as f32) * 2.399_963)
-                            % core::f32::consts::TAU;
-                        let spd = 0.35 + ((i % 5) as f32) * 0.14;
-                        s.x = 0.5 + ang.cos() * 0.04;
-                        s.y = 0.5 + ang.sin() * 0.04;
-                        s.vx = ang.cos() * spd * 0.0045;
-                        s.vy = ang.sin() * spd * 0.0045;
-                        s.life = 0.0;
+                for s in &mut self.stars {
+                    s.x += s.vx;
+                    s.y += s.vy;
+                    s.life = (s.life + 0.0045) % 1.0;
+                    if s.x < -0.04 {
+                        s.x = 1.04;
+                    } else if s.x > 1.04 {
+                        s.x = -0.04;
+                    }
+                    if s.y < -0.04 {
+                        s.y = 1.04;
+                    } else if s.y > 1.04 {
+                        s.y = -0.04;
                     }
                 }
             }
@@ -3616,43 +3618,25 @@ impl Desktop {
     fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, _accent: u32) {
         let wf = w as f32;
         let hf = h as f32;
-        let cx = wf * 0.5;
-        let cy = hf * 0.5;
 
         // Windows Longhorn 4074 (MILDesktop) Aero Stars:
-        // 3D radial starfield flying outward from screen center with subtle motion trails.
+        // Calm, softly glowing stars drifting gently across the desktop.
         for (i, s) in self.stars.iter().enumerate() {
-            let fade = if s.life < 0.18 {
-                s.life / 0.18
-            } else {
-                (1.0 - s.life) / 0.82
-            }
-            .clamp(0.0, 1.0);
-            let a = (fade * 225.0) as u8;
+            let pulse = 0.65 + 0.35 * (s.life * core::f32::consts::TAU).sin();
+            let a = (pulse * 185.0) as u8;
             if a < 4 {
                 continue;
             }
             let sx = s.x * wf;
             let sy = s.y * hf;
-            let dx = sx - cx;
-            let dy = sy - cy;
-            let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-
-            // Subtle radial motion trail pointing back toward center
-            let trail_len = (s.life * 26.0 + 3.0).min(dist * 0.35);
-            let tx = sx - (dx / dist) * trail_len;
-            let ty = sy - (dy / dist) * trail_len;
             let col = if i % 4 == 0 { 0xBAE6FD } else { 0xFFFFFF };
-            canvas.draw_aa_line(tx, ty, sx, sy, 1.0 + s.life * 0.8, 0xBAE6FD, a / 3);
+            let r = s.size * (0.88 + pulse * 0.22);
 
-            // Soft Aero glow + crisp white star core
-            let r = s.size * (0.45 + s.life * 1.15);
-            canvas.fill_aa_circle(sx, sy, r * 2.6, 0xBAE6FD, a / 5);
+            // Soft Aero halo + crisp star core + gentle 4-point flare
+            canvas.fill_aa_circle(sx, sy, r * 2.8, 0xBAE6FD, a / 5);
             canvas.fill_aa_circle(sx, sy, r, col, a);
-
-            // 4-point star flare on closer/larger stars
-            if r > 1.55 {
-                let arm = r * 2.4;
+            if r > 1.65 {
+                let arm = r * 2.5;
                 canvas.draw_aa_line(sx - arm, sy, sx + arm, sy, 0.85, 0xFFFFFF, a / 2);
                 canvas.draw_aa_line(sx, sy - arm, sx, sy + arm, 0.85, 0xFFFFFF, a / 2);
             }
