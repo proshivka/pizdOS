@@ -3613,70 +3613,48 @@ impl Desktop {
         }
     }
 
-    fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
+    fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, _accent: u32) {
         let wf = w as f32;
         let hf = h as f32;
-        let t = (self.tick as f32) * 0.045;
+        let cx = wf * 0.5;
+        let cy = hf * 0.5;
 
-        // 1. Deep parallax starfield (soft twinkling background stars)
-        for i in 0..36usize {
-            let hx = ((i * 73 + 19) % 97) as f32 / 97.0;
-            let hy = ((i * 137 + 43) % 89) as f32 / 89.0;
-            let tw = 0.45 + 0.55 * (t + (i as f32) * 0.83).sin();
-            let a = (28.0 + 78.0 * tw) as u8;
-            let sx = hx * wf;
-            let sy = hy * hf;
-            let col = match i % 4 {
-                0 => 0xBAE6FD,
-                1 => 0xE9D5FF,
-                2 => 0xFDE68A,
-                _ => 0xFFFFFF,
-            };
-            canvas.fill_aa_circle(sx, sy, 0.9 + tw * 0.7, col, a);
-        }
-
-        // 2. Occasional shooting star across the upper sky
-        let cycle = self.tick % 240;
-        if cycle < 26 {
-            let p = cycle as f32 / 26.0;
-            let sx = wf * (0.18 + p * 0.52);
-            let sy = hf * (0.10 + p * 0.24);
-            let tx = sx - 42.0 * (1.0 - p * 0.3);
-            let ty = sy - 19.0 * (1.0 - p * 0.3);
-            let fade = if p < 0.2 { p / 0.2 } else { (1.0 - p) / 0.8 }.clamp(0.0, 1.0);
-            let a = (fade * 210.0) as u8;
-            canvas.draw_aa_line(tx, ty, sx, sy, 1.4, 0xBAE6FD, a / 2);
-            canvas.fill_aa_circle(sx, sy, 2.8, 0xFFFFFF, a);
-        }
-
-        // 3. Foreground Aero Stars with soft glow and diffraction spikes
+        // Windows Longhorn 4074 (MILDesktop) Aero Stars:
+        // 3D radial starfield flying outward from screen center with subtle motion trails.
         for (i, s) in self.stars.iter().enumerate() {
-            let fade = if s.life < 0.25 {
-                s.life / 0.25
+            let fade = if s.life < 0.18 {
+                s.life / 0.18
             } else {
-                (1.0 - s.life) / 0.75
+                (1.0 - s.life) / 0.82
             }
             .clamp(0.0, 1.0);
-            let a = (fade * 195.0) as u8;
+            let a = (fade * 225.0) as u8;
             if a < 4 {
                 continue;
             }
             let sx = s.x * wf;
             let sy = s.y * hf;
-            let col = if i % 3 == 0 {
-                accent
-            } else if i % 2 == 0 {
-                0xBAE6FD
-            } else {
-                0xFFFFFF
-            };
-            let r = s.size * (0.70 + s.life * 0.80);
-            canvas.fill_aa_circle(sx, sy, r * 3.0, col, a / 5);
+            let dx = sx - cx;
+            let dy = sy - cy;
+            let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+
+            // Subtle radial motion trail pointing back toward center
+            let trail_len = (s.life * 26.0 + 3.0).min(dist * 0.35);
+            let tx = sx - (dx / dist) * trail_len;
+            let ty = sy - (dy / dist) * trail_len;
+            let col = if i % 4 == 0 { 0xBAE6FD } else { 0xFFFFFF };
+            canvas.draw_aa_line(tx, ty, sx, sy, 1.0 + s.life * 0.8, 0xBAE6FD, a / 3);
+
+            // Soft Aero glow + crisp white star core
+            let r = s.size * (0.45 + s.life * 1.15);
+            canvas.fill_aa_circle(sx, sy, r * 2.6, 0xBAE6FD, a / 5);
             canvas.fill_aa_circle(sx, sy, r, col, a);
-            if r > 1.65 {
-                let arm = r * 2.3;
-                canvas.draw_aa_line(sx - arm, sy, sx + arm, sy, 0.9, 0xFFFFFF, a / 2);
-                canvas.draw_aa_line(sx, sy - arm, sx, sy + arm, 0.9, 0xFFFFFF, a / 2);
+
+            // 4-point star flare on closer/larger stars
+            if r > 1.55 {
+                let arm = r * 2.4;
+                canvas.draw_aa_line(sx - arm, sy, sx + arm, sy, 0.85, 0xFFFFFF, a / 2);
+                canvas.draw_aa_line(sx, sy - arm, sx, sy + arm, 0.85, 0xFFFFFF, a / 2);
             }
         }
     }
