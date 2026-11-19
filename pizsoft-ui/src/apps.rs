@@ -5728,6 +5728,8 @@ pub enum WebBlock {
     Paragraph(String),
     Link(String, String),
     Code(String),
+    ImageAlt(String),
+    Rule,
 }
 
 #[derive(Debug, Clone)]
@@ -5991,7 +5993,27 @@ pub fn parse_html_page(url: &str, html: &str) -> WebPage {
                             }
                         }
                     }
-                    "p" | "div" | "li" | "br" | "tr" | "td" | "th" | "section" | "article" | "header" | "footer" | "blockquote" | "dd" | "dt" => {
+                    "hr" => {
+                        push_clean_block(&mut blocks, &mut text_buf, heading.take(), in_pre);
+                        blocks.push(WebBlock::Rule);
+                    }
+                    "img" => {
+                        if let Some(alt) = extract_attr(attrs, "alt") {
+                            let clean = alt.split_whitespace().collect::<Vec<_>>().join(" ");
+                            if !clean.is_empty() && cur_href.is_none() {
+                                push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
+                                blocks.push(WebBlock::ImageAlt(clean));
+                            }
+                        }
+                    }
+                    "td" | "th" => {
+                        if !is_close && !text_buf.trim().is_empty() && cur_href.is_none() {
+                            text_buf.push_str(" | ");
+                        } else if is_close && cur_href.is_none() {
+                            text_buf.push(' ');
+                        }
+                    }
+                    "p" | "div" | "li" | "br" | "tr" | "section" | "article" | "header" | "footer" | "blockquote" | "dd" | "dt" => {
                         if cur_href.is_none() {
                             push_clean_block(&mut blocks, &mut text_buf, heading, in_pre);
                         }
@@ -6081,7 +6103,7 @@ pub fn built_in_home_page() -> WebPage {
 
 fn fetch_http_get(url: &str) -> Result<String, String> {
     const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
-    let try_curl = |insecure: bool| {
+    let try_curl = |insecure: bool, http11: bool| {
         let mut args = vec![
             "-sSL",
             "--max-time",
@@ -6092,7 +6114,12 @@ fn fetch_http_get(url: &str) -> Result<String, String> {
             "Accept: text/html,application/xhtml+xml,text/plain,*/*",
             "-H",
             "Accept-Language: en-US,en;q=0.9",
+            "-H",
+            "Accept-Encoding: identity",
         ];
+        if http11 {
+            args.push("--http1.1");
+        }
         if insecure {
             args.push("-k");
         }
@@ -6100,24 +6127,13 @@ fn fetch_http_get(url: &str) -> Result<String, String> {
         Command::new("curl").args(&args).output()
     };
 
-    match try_curl(false) {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+    for (insecure, http11) in [(false, false), (false, true), (true, false), (true, true)] {
+        if let Ok(o) = try_curl(insecure, http11)
+            && o.status.success()
+            && !o.stdout.is_empty()
+        {
             return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
         }
-        Ok(o) => {
-            // Retry with -k when live-ISO RTC/CA bundle rejects TLS certs
-            if let Ok(o2) = try_curl(true)
-                && o2.status.success()
-                && !o2.stdout.is_empty()
-            {
-                return Ok(String::from_utf8_lossy(&o2.stdout).into_owned());
-            }
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            if !err.is_empty() {
-                return Err(err);
-            }
-        }
-        Err(_) => {}
     }
 
     // Fallback to BusyBox / GNU wget if curl is absent
@@ -6142,6 +6158,29 @@ fn fetch_http_get(url: &str) -> Result<String, String> {
 
 type LinkHitbox = (i32, i32, i32, i32, String);
 
+struct BrowserTab {
+    url_input: String,
+    current_url: String,
+    history: Vec<String>,
+    history_pos: usize,
+    page: WebPage,
+    scroll: usize,
+}
+
+impl BrowserTab {
+    fn home() -> Self {
+        let page = built_in_home_page();
+        Self {
+            url_input: page.url.clone(),
+            current_url: page.url.clone(),
+            history: vec![page.url.clone()],
+            history_pos: 0,
+            page,
+            scroll: 0,
+        }
+    }
+}
+
 pub struct BrowserState {
     pub url_input: String,
     pub url_focused: bool,
@@ -6153,6 +6192,8 @@ pub struct BrowserState {
     pub loading: bool,
     rx: Option<std::sync::mpsc::Receiver<Result<WebPage, String>>>,
     rendered_links: RefCell<Vec<LinkHitbox>>,
+    tabs: Vec<BrowserTab>,
+    active_tab: usize,
 }
 
 impl Default for BrowserState {
@@ -6175,7 +6216,65 @@ impl BrowserState {
             loading: false,
             rx: None,
             rendered_links: RefCell::new(Vec::new()),
+            tabs: vec![BrowserTab::home()],
+            active_tab: 0,
         }
+    }
+
+    fn save_active_tab(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active_tab) {
+            t.url_input = self.url_input.clone();
+            t.current_url = self.current_url.clone();
+            t.history = self.history.clone();
+            t.history_pos = self.history_pos;
+            t.page = self.page.clone();
+            t.scroll = self.scroll;
+        }
+    }
+
+    fn load_active_tab(&mut self) {
+        if let Some(t) = self.tabs.get(self.active_tab) {
+            self.url_input = t.url_input.clone();
+            self.current_url = t.current_url.clone();
+            self.history = t.history.clone();
+            self.history_pos = t.history_pos;
+            self.page = t.page.clone();
+            self.scroll = t.scroll;
+            self.loading = false;
+            self.rx = None;
+            self.url_focused = false;
+        }
+    }
+
+    pub fn new_tab(&mut self) {
+        self.save_active_tab();
+        if self.tabs.len() < 5 {
+            self.tabs.push(BrowserTab::home());
+            self.active_tab = self.tabs.len() - 1;
+            self.load_active_tab();
+        }
+    }
+
+    pub fn switch_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() && idx != self.active_tab {
+            self.save_active_tab();
+            self.active_tab = idx;
+            self.load_active_tab();
+        }
+    }
+
+    pub fn close_tab(&mut self, idx: usize) {
+        if self.tabs.len() <= 1 || idx >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        self.tabs.remove(idx);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if idx < self.active_tab {
+            self.active_tab -= 1;
+        }
+        self.load_active_tab();
     }
 
     pub fn navigate(&mut self, raw: &str, push_hist: bool) {
@@ -6309,8 +6408,29 @@ impl BrowserState {
     }
 
     pub fn on_click(&mut self, lx: i32, ly: i32, ww: i32, wh: i32) {
-        // Toolbar row (32..56)
-        if (32..=56).contains(&ly) {
+        // Tab bar row (30..48)
+        if (30..=48).contains(&ly) {
+            let max_tabs = self.tabs.len().min(5);
+            let tab_w = ((ww - 48) / (max_tabs as i32).max(1)).clamp(64, 130);
+            for i in 0..max_tabs {
+                let tx = 8 + (i as i32) * (tab_w + 4);
+                if lx >= tx && lx <= tx + tab_w {
+                    if self.tabs.len() > 1 && lx >= tx + tab_w - 18 {
+                        self.close_tab(i);
+                    } else {
+                        self.switch_tab(i);
+                    }
+                    return;
+                }
+            }
+            let plus_x = 8 + (max_tabs as i32) * (tab_w + 4);
+            if lx >= plus_x && lx <= plus_x + 22 {
+                self.new_tab();
+                return;
+            }
+        }
+        // Toolbar row (52..76)
+        if (52..=76).contains(&ly) {
             if (8..=34).contains(&lx) {
                 self.back();
                 return;
@@ -6336,8 +6456,8 @@ impl BrowserState {
         }
         self.url_focused = false;
         // Scroll buttons at right edge of viewport
-        if lx >= ww - 28 && ly >= 62 && ly <= wh - 10 {
-            if ly < (62 + wh - 10) / 2 {
+        if lx >= ww - 28 && ly >= 82 && ly <= wh - 10 {
+            if ly < (82 + wh - 10) / 2 {
                 self.scroll = self.scroll.saturating_sub(4);
             } else {
                 self.scroll = self.scroll.saturating_add(4);
@@ -6367,10 +6487,36 @@ impl BrowserState {
         accent: u32,
         lang: Lang,
     ) {
-        // Toolbar
+        // Tab bar (wy + 30..48)
+        let max_tabs = self.tabs.len().min(5);
+        let tab_w = ((ww - 48) / (max_tabs as i32).max(1)).clamp(64, 130);
+        for i in 0..max_tabs {
+            let tx = wx + 8 + (i as i32) * (tab_w + 4);
+            let active = i == self.active_tab;
+            let title = if active {
+                self.page.title.as_str()
+            } else {
+                self.tabs[i].page.title.as_str()
+            };
+            canvas.fill_rounded_rect(tx, wy + 30, tab_w, 18, 5, if active { 0x1E293B } else { 0x0F172A });
+            if active {
+                canvas.draw_rounded_rect_alpha(tx, wy + 30, tab_w, 18, 5, accent, 140);
+            }
+            let lbl_w = if self.tabs.len() > 1 { tab_w - 22 } else { tab_w - 10 };
+            canvas.draw_text_clipped(tx + 6, wy + 32, lbl_w, title, if active { 0xF8FAFC } else { 0x94A3B8 }, 1);
+            if self.tabs.len() > 1 {
+                canvas.draw_text_clipped(tx + tab_w - 14, wy + 32, 12, "x", 0x94A3B8, 1);
+            }
+        }
+        let plus_x = wx + 8 + (max_tabs as i32) * (tab_w + 4);
+        if self.tabs.len() < 5 {
+            canvas.draw_button(plus_x, wy + 30, 22, 18, "+", 0x1E293B, 0xE2E8F0, accent);
+        }
+
+        // Toolbar (wy + 52..76)
         canvas.draw_button(
             wx + 8,
-            wy + 32,
+            wy + 52,
             26,
             24,
             "<",
@@ -6380,7 +6526,7 @@ impl BrowserState {
         );
         canvas.draw_button(
             wx + 38,
-            wy + 32,
+            wy + 52,
             26,
             24,
             ">",
@@ -6388,13 +6534,13 @@ impl BrowserState {
             if self.history_pos + 1 < self.history.len() { 0xE2E8F0 } else { 0x475569 },
             accent,
         );
-        canvas.draw_button(wx + 68, wy + 32, 26, 24, "R", 0x1E293B, 0xE2E8F0, accent);
+        canvas.draw_button(wx + 68, wy + 52, 26, 24, "R", 0x1E293B, 0xE2E8F0, accent);
 
         let bar_w = (ww - 152).max(60);
-        canvas.fill_rounded_rect(wx + 98, wy + 32, bar_w, 24, 6, 0x0B101B);
+        canvas.fill_rounded_rect(wx + 98, wy + 52, bar_w, 24, 6, 0x0B101B);
         canvas.draw_rounded_rect_alpha(
             wx + 98,
-            wy + 32,
+            wy + 52,
             bar_w,
             24,
             6,
@@ -6406,14 +6552,14 @@ impl BrowserState {
         } else {
             self.url_input.clone()
         };
-        canvas.draw_text_clipped(wx + 104, wy + 37, bar_w - 12, &url_txt, 0xE2E8F0, 1);
-        canvas.draw_button(wx + ww - 44, wy + 32, 36, 24, "Go", accent, 0xFFFFFF, accent);
+        canvas.draw_text_clipped(wx + 104, wy + 57, bar_w - 12, &url_txt, 0xE2E8F0, 1);
+        canvas.draw_button(wx + ww - 44, wy + 52, 36, 24, "Go", accent, 0xFFFFFF, accent);
 
-        // Viewport
+        // Viewport (wy + 82..)
         let vx = wx + 8;
-        let vy = wy + 62;
+        let vy = wy + 82;
         let vw = (ww - 16).max(80);
-        let vh = (wh - 70).max(60);
+        let vh = (wh - 90).max(60);
         canvas.fill_rounded_rect(vx, vy, vw, vh, 8, 0x090D16);
         canvas.draw_rounded_rect_alpha(vx, vy, vw, vh, 8, 0xFFFFFF, 20);
 
@@ -6433,6 +6579,7 @@ impl BrowserState {
         enum VisRow {
             Text { text: String, col: u32, scale: i32, bg: Option<u32> },
             Link { text: String, href: String },
+            Rule,
         }
         let max_c1 = ((vw - 36) / 7).max(16) as usize;
         let mut rows: Vec<VisRow> = Vec::new();
@@ -6488,6 +6635,17 @@ impl BrowserState {
                         href: href.clone(),
                     });
                 }
+                WebBlock::ImageAlt(alt) => {
+                    rows.push(VisRow::Text {
+                        text: format!("[IMG: {alt}]"),
+                        col: 0xC4B5FD,
+                        scale: 1,
+                        bg: Some(0x1E1B4B),
+                    });
+                }
+                WebBlock::Rule => {
+                    rows.push(VisRow::Rule);
+                }
             }
         }
 
@@ -6499,6 +6657,7 @@ impl BrowserState {
         for row in &rows[start..] {
             let rh = match row {
                 VisRow::Text { scale: 2, .. } => 26,
+                VisRow::Rule => 10,
                 _ => 18,
             };
             if cy + rh > max_y {
@@ -6516,6 +6675,9 @@ impl BrowserState {
                     canvas.draw_text_clipped(vx + 12, cy, vw - 38, text, 0x38BDF8, 1);
                     canvas.fill_rect(vx + 12, cy + 14, tw, 1, 0x38BDF8);
                     hit_links.push((20, cy - wy, tw + 8, 17, href.clone()));
+                }
+                VisRow::Rule => {
+                    canvas.fill_rect(vx + 12, cy + 4, vw - 38, 1, 0x334155);
                 }
             }
             cy += rh;

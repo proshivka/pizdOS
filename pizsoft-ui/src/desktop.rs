@@ -379,6 +379,7 @@ pub struct Desktop {
     // System metrics
     pub cpu_pct: u8,
     pub cpu_history: [u8; 32],
+    pub ram_history: [u8; 32],
     pub last_cpu: Option<CpuSample>,
     pub mem: MemInfo,
     pub uptime: String,
@@ -630,6 +631,7 @@ impl Desktop {
 
             cpu_pct: 12,
             cpu_history: [8, 12, 10, 14, 18, 15, 11, 9, 13, 16, 20, 14, 10, 12, 15, 18, 14, 11, 9, 13, 15, 12, 10, 14, 17, 13, 11, 10, 12, 15, 14, 12],
+            ram_history: [28; 32],
             last_cpu: read_cpu_sample(),
             mem: read_meminfo(),
             uptime: read_uptime_str(),
@@ -1116,6 +1118,8 @@ impl Desktop {
         self.cpu_history[31] = self.cpu_pct;
 
         self.mem = read_meminfo();
+        self.ram_history.rotate_left(1);
+        self.ram_history[31] = self.mem.percent;
         self.uptime = read_uptime_str();
         self.clock_str = read_local_clock_str();
         self.loadavg = read_loadavg();
@@ -3615,9 +3619,26 @@ impl Desktop {
         }
     }
 
-    fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, _accent: u32) {
+    fn draw_aero_stars(&self, canvas: &mut Canvas, w: i32, h: i32, accent: u32) {
         let wf = w as f32;
         let hf = h as f32;
+        let t = (self.tick as f32) * 0.018;
+
+        // Longhorn Aurora gentle translucent ribbons
+        let steps = 18i32;
+        let step_w = (w / steps).max(16);
+        for band in 0..2 {
+            let base_y = hf * if band == 0 { 0.72 } else { 0.78 };
+            let col = if band == 0 { 0x38BDF8 } else { accent };
+            for i in 0..steps {
+                let x0 = i * step_w;
+                let phase = (i as f32) * 0.36 + t * (1.0 + band as f32 * 0.35);
+                let y0 = base_y + phase.sin() * 14.0;
+                let y1 = base_y + (phase + 0.36).sin() * 14.0;
+                let a = (11.0 + 7.0 * (phase * 0.5).cos().abs()) as u8;
+                canvas.draw_aa_line(x0 as f32, y0, (x0 + step_w) as f32, y1, 18.0, col, a);
+            }
+        }
 
         // Windows Longhorn 4074 (MILDesktop) Aero Stars:
         // Calm, softly glowing stars drifting gently across the desktop.
@@ -4686,6 +4707,12 @@ impl Desktop {
             (0x151A25, 0x121621)
         };
         canvas.fill_vgradient_top_rounded_rect(win.x + 1, win.y + 1, win.w - 2, 26, 11, tb_top, tb_bot);
+        if focused {
+            // Longhorn Aero Glass upper-half sheen + diagonal specular streak
+            canvas.blend_rect(win.x + 10, win.y + 2, (win.w - 20).max(0), 11, 0xFFFFFF, 10);
+            let sx = (win.x + (win.w / 3)).min(win.x + win.w - 40);
+            canvas.draw_aa_line(sx as f32, (win.y + 2) as f32, (sx + 26) as f32, (win.y + 25) as f32, 8.0, 0xFFFFFF, 12);
+        }
         canvas.blend_rect(win.x + 14, win.y + 1, (win.w - 28).max(0), 1, 0xFFFFFF, if focused { 40 } else { 14 });
         if focused {
             canvas.blend_rect(win.x + 24, win.y, (win.w - 48).max(0), 1, accent, 82);
@@ -4945,19 +4972,38 @@ impl Desktop {
             0x0A0F16,
             0x30363D,
         );
+        let rgy = y + 154;
+        let rgh = 26;
+        canvas.fill_rounded_rect(x, rgy, iw, rgh, 6, 0x0A0F16);
+        canvas.draw_rounded_rect_alpha(x, rgy, iw, rgh, 6, 0xFFFFFF, 20);
+        for (i, &val) in self.ram_history.iter().enumerate() {
+            let bh = (((val as i32) * (rgh - 4)) / 100).max(2);
+            let bx = x + 2 + (i as i32) * bar_w;
+            if bx + bar_w < x + iw {
+                canvas.fill_vgradient_rounded_rect(
+                    bx,
+                    rgy + rgh - 2 - bh,
+                    (bar_w - 1).max(1),
+                    bh,
+                    1,
+                    0xFBBF24,
+                    0x78350F,
+                );
+            }
+        }
 
         canvas.draw_text_clipped(
             x,
-            y + 158,
+            y + 186,
             iw,
             &format!("{}: {}", tr(lang, "Процессы", "Processes"), self.procs.len()),
             0x8B949E,
             1,
         );
-        for (i, p) in self.procs.iter().take(3).enumerate() {
+        for (i, p) in self.procs.iter().take(2).enumerate() {
             canvas.draw_text_clipped(
                 x,
-                y + 174 + (i as i32) * 14,
+                y + 202 + (i as i32) * 14,
                 iw,
                 &format!("{:<5} {} {:>5}K {}", p.pid, p.state, p.mem_kb, p.name),
                 0xC9D1D9,
